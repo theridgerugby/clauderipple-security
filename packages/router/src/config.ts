@@ -13,7 +13,7 @@ import { migrateSecretFile } from "./locked-file.ts";
 import { PRESETS } from "./presets.ts";
 import { hostProblem, portProblem } from "./remote-host.ts";
 import { ingressOnly } from "./targets.ts";
-import { PERSONAL_SECURITY_DEFAULTS, personalPolicyProblems, type PersonalSecurityPolicy } from "./personal-policy.ts";
+import { PERSONAL_SECURITY_DEFAULTS, personalPolicyProblems, personalProviderHeaderProblem, type PersonalSecurityPolicy } from "./personal-policy.ts";
 
 export type ProcessPriority = "below-normal" | "normal" | "above-normal" | "high";
 export const PROCESS_PRIORITIES: readonly ProcessPriority[] = ["below-normal", "normal", "above-normal", "high"];
@@ -934,6 +934,25 @@ export function validate(c: Config): string[] {
     if (!c.providers[d.provider]) errors.push(`direct ${d.prefix}: unknown provider "${d.provider}"`);
   }
   for (const [name, p] of Object.entries(c.providers)) {
+    if (c.security) {
+      const headers = (p as { headers?: unknown }).headers;
+      if (headers !== undefined && (!headers || typeof headers !== "object" || Array.isArray(headers) ||
+        Object.values(headers).some(value => typeof value !== "string"))) {
+        errors.push(`provider ${name}: personal provider headers must be a string record`);
+      } else if (headers && typeof headers === "object") {
+        for (const [header, value] of Object.entries(headers as Record<string, string>)) {
+          const problem = personalProviderHeaderProblem(header) ?? headerValueProblem(value);
+          if (problem) errors.push(`provider ${name}: header "${header}": ${problem}`);
+        }
+      }
+      const sessionHeader = (p as { sessionHeader?: unknown }).sessionHeader;
+      if (sessionHeader !== undefined) {
+        const problem = personalProviderHeaderProblem(sessionHeader);
+        if (problem || (typeof sessionHeader === "string" && ["authorization", "x-api-key"].includes(sessionHeader.toLowerCase()))) {
+          errors.push(`provider ${name}: invalid or credential-conflicting session header`);
+        }
+      }
+    }
     // Carried by every provider that puts together a system prompt, so checked once for all of them.
     const shared = p as { identity?: unknown; instructionsAppend?: unknown; limits?: unknown; label?: unknown };
     if (shared.identity !== undefined && typeof shared.identity !== "boolean") errors.push(`provider ${name}: identity must be true or false`);
@@ -962,7 +981,7 @@ export function validate(c: Config): string[] {
             errors.push(`provider ${name}: credential ${i} headers must be a string record`);
           } else {
             for (const [header, value] of Object.entries(cred.headers as Record<string, string>)) {
-              const problem = headerValueProblem(value);
+              const problem = (c.security ? personalProviderHeaderProblem(header) : null) ?? headerValueProblem(value);
               if (problem) errors.push(`provider ${name}: credential ${i} header "${header}": ${problem}`);
             }
           }

@@ -28,7 +28,8 @@ const INSTALL_ID = /^[a-f0-9]{32}$/;
 
 function unchanged(a: fs.BigIntStats, b: fs.BigIntStats): boolean {
   return a.dev === b.dev && a.ino === b.ino && a.mode === b.mode && a.nlink === b.nlink &&
-    a.uid === b.uid && a.gid === b.gid && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+    a.uid === b.uid && a.gid === b.gid && a.size === b.size && a.mtimeNs === b.mtimeNs &&
+    a.ctimeNs === b.ctimeNs && a.birthtimeNs === b.birthtimeNs;
 }
 
 function samePath(a: string, b: string): boolean {

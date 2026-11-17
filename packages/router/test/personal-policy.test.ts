@@ -112,6 +112,25 @@ test("personal mode disables high-risk integration features and credential cross
   } })), []);
 });
 
+test("personal providers reject transport authority, framing, and proxy headers in every credential source", () => {
+  const base = { type: "openai-compatible" as const, url: "https://school.example/v1", models: [{ id: "model" }] };
+  for (const header of ["Host", "Proxy-Authorization", "Connection", "Transfer-Encoding", "Cookie", "X-Forwarded-Host", "Set-Cookie", "Bad Header"]) {
+    const configured = normalizeConfig({ providers: { school: { ...base, headers: { [header]: "value" } } } });
+    assert.ok(validate(configured).some(problem => problem.includes(`header "${header}"`)), header);
+    const pooled = normalizeConfig({ providers: { school: { ...base, credentials: [{ id: "school", headers: { [header]: "value" } }] } } });
+    assert.ok(validate(pooled).some(problem => problem.includes(`header "${header}"`)), `pooled ${header}`);
+    const session = normalizeConfig({ providers: { school: { ...base, sessionHeader: header } } });
+    assert.ok(validate(session).some(problem => problem.includes("session header")), `session ${header}`);
+  }
+  for (const header of ["authorization", "x-api-key"]) {
+    assert.ok(validate(normalizeConfig({ providers: { school: { ...base, sessionHeader: header } } }))
+      .some(problem => problem.includes("session header")), header);
+  }
+  assert.deepEqual(validate(normalizeConfig({ providers: { school: {
+    ...base, headers: { authorization: "Bearer SYNTHETIC", "x-school-key": "SYNTHETIC" }, sessionHeader: "x-school-session",
+  } } })), []);
+});
+
 test("fallbacks stay on the initially selected provider", () => {
   const candidates = [{ provider: "school", model: "alternate" }, { provider: "public", model: "same-name" }];
   assert.deepEqual(personalFallbacks({ security: policy() }, { provider: "school" }, candidates), [candidates[0]]);

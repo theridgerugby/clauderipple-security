@@ -56,6 +56,23 @@ export function personalMode(config: { security?: PersonalSecurityPolicy }): boo
   return config.security?.mode === "personal";
 }
 
+// Provider-controlled headers are separate from the intercepted Claude request. These names
+// can change the effective HTTP authority/framing or impersonate an intermediate proxy, even
+// while the socket's TLS destination remains approved. None is needed for an AI API key.
+const RESERVED_PROVIDER_HEADERS = new Set([
+  "host", "connection", "proxy-connection", "proxy-authorization", "proxy-authenticate",
+  "keep-alive", "transfer-encoding", "content-length", "te", "trailer", "upgrade",
+  "cookie", "set-cookie", "forwarded", "x-original-host", "x-rewrite-url",
+]);
+export function personalProviderHeaderProblem(name: unknown): string | null {
+  if (typeof name !== "string" || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) return "invalid HTTP header name";
+  const lower = name.toLowerCase();
+  if (RESERVED_PROVIDER_HEADERS.has(lower) || lower.startsWith("x-forwarded-") || lower.startsWith("proxy-")) {
+    return "reserved HTTP transport or proxy header";
+  }
+  return null;
+}
+
 /** Checked immediately before each outbound attempt, so revocation is effective on retries too. */
 export function assertPersonalEgressAllowed(value: string | URL, _init: RequestInit = {}): void {
   if (!policyProvider) return;

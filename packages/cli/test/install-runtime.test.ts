@@ -68,20 +68,23 @@ test("fingerprint rejects runtime file symlinks", { skip: !fileSymlinks }, t => 
   assert.throws(() => captureRouterCodeIdentity(f.rt), /alias/);
 });
 
-test("fingerprint binds the opened descriptor to the file observed before open", t => {
+test("fingerprint binds the opened descriptor to the file observed before open, including same-size Windows replacements", t => {
   const f = fixture(t);
   const open = fs.openSync;
+  const expectedPath = fs.realpathSync.native(f.rt.router).toLowerCase();
   let swapped = false;
   t.mock.method(fs, "openSync", (file: fs.PathLike, flags: string | number, mode?: fs.Mode) => {
-    if (!swapped && file === f.rt.router) {
+    if (!swapped && typeof file === "string" && fs.realpathSync.native(file).toLowerCase() === expectedPath) {
       swapped = true;
       fs.renameSync(f.rt.router, f.rt.router + ".old");
       fs.writeFileSync(f.rt.router, "export const router = 9;\n");
     }
     return open(file, flags, mode);
   });
-  assert.throws(() => captureRouterCodeIdentity(f.rt), /changed/);
-  assert.equal(swapped, true);
+  let failure: unknown;
+  try { captureRouterCodeIdentity(f.rt); } catch (error) { failure = error; }
+  assert.equal(swapped, true, "the fixture must swap the router file before it is opened");
+  assert.match(String(failure), /changed/);
 });
 
 function controlled(t: TestContext) {
