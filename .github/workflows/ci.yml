@@ -62,7 +62,9 @@ jobs:
       # TAP emits each failed assertion immediately, even if a later fixture hangs.
       # Node parses --test-shard only before positional test paths. Keep the test-file list
       # identical to test:ci; appending the flag through `npm run ... --` silently ran all files.
-      - run: node --test --test-reporter=tap --test-shard=${{ matrix.shard }}/4 packages/router/test/*.test.ts packages/cli/test/*.test.ts test/mod/*.test.ts packages/remote/test/*.test.ts packages/app/test/*.test.ts
+      # Two concurrent files per Windows VM bound PowerShell DPAPI/ACL subprocess contention;
+      # individual tests still exercise real eight-process credential races and fail-closed deadlines.
+      - run: node --test --test-reporter=tap --test-concurrency=2 --test-shard=${{ matrix.shard }}/4 packages/router/test/*.test.ts packages/cli/test/*.test.ts test/mod/*.test.ts packages/remote/test/*.test.ts packages/app/test/*.test.ts
       - run: npm run build
 
   # Collect real desktop-boundary evidence even while a platform's full suite is

@@ -280,6 +280,9 @@ test("the TLS dashboard sets anti-framing headers and rejects oversized headers"
   assert.equal(page.headers.get("x-content-type-options"), "nosniff");
   assert.equal(page.headers.get("referrer-policy"), "no-referrer");
   assert.equal(page.headers.get("x-frame-options"), "DENY");
+  // Drain the real dashboard response before the fixture closes its TLS client. Leaving the
+  // streamed body unread can trip Undici's paused-parser assertion during Windows teardown.
+  await page.arrayBuffer();
   assert.equal((await rawRequest(f.base, "/api/ping", ["Host", new URL(f.base).host, "x-padding", "x".repeat(17 * 1024)])).status, 431);
 });
 
