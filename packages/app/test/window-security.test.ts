@@ -19,6 +19,7 @@ function harness() {
   const opened: string[] = [], loaded: string[] = [];
   class FakeWindow extends EventEmitter {
     webContents = Object.assign(new EventEmitter(), {
+      id: 17, mainFrame: { frames: [], origin: security.ORIGIN, url: `${security.ORIGIN}/`, processId: 7, routingId: 11 },
       setWindowOpenHandler: (handler: typeof popup) => { popup = handler; },
     });
     constructor(options: unknown) { super(); settings = options; window = this; }
@@ -77,4 +78,18 @@ test("frame navigation, redirects and webviews cannot replace or embed privilege
   assert.equal(blocked("will-navigate", "https://untrusted.example/", true), true);
   assert.equal(blocked("will-attach-webview", `${security.ORIGIN}/`, true), true);
   assert.deepEqual(fixture.opened, []);
+});
+
+test("production child-frame policy stays tainted after detach and closes OS-open capability", () => {
+  const fixture = harness();
+  const contents = fixture.contents;
+  assert.equal(security.isPrivilegedWindow(contents as unknown as import("electron").WebContents), true);
+  contents.emit("frame-created", {}, { frame: { parent: contents.mainFrame, processId: 7, routingId: 12 } });
+  assert.equal(security.isPrivilegedWindow(contents as unknown as import("electron").WebContents), false);
+  contents.mainFrame.frames.length = 0;
+  fixture.popup("https://github.com/PBJ-2/clauderipple/releases");
+  contents.emit("will-navigate", { preventDefault() {} }, "https://github.com/PBJ-2/clauderipple/releases");
+  assert.deepEqual(fixture.opened, []);
+  security.watchPrivilegedWindow(contents as unknown as import("electron").WebContents);
+  assert.equal(security.isPrivilegedWindow(contents as unknown as import("electron").WebContents), false);
 });

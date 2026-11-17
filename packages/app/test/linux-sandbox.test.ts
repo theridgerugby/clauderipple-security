@@ -39,3 +39,13 @@ test("native Linux rejects helper aliases, writable files, wrong ownership and u
     }
   }
 });
+
+test("native Linux reports only safe helper metadata when a runner prerequisite fails", () => {
+  assert.throws(() => verifySystemSandboxHelper(helper, fixture({ [helper]: { uid: 1001, mode: 0o100755 } })), (error: Error) => {
+    assert.match(error.message, /"uid":1001/);
+    assert.match(error.message, /"mode":"755"/);
+    assert.match(error.message, /"links":1/);
+    assert.equal(error.message.includes(helper), false);
+    return true;
+  });
+});

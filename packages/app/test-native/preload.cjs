@@ -4,4 +4,5 @@ contextBridge.exposeInMainWorld("rippleNative", {
   sandboxed: process.sandboxed === true,
   contextIsolated: process.contextIsolated === true,
   probe: () => ipcRenderer.invoke("ripple-native:probe"),
+  adminRequest: request => ipcRenderer.invoke("ripple-app:admin-request", request),
 });

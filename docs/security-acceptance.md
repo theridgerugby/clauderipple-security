@@ -34,8 +34,8 @@ operator decisions.
 | Generic writes preserve shared parent permissions | Regression covers existing directory mode | Locally verified on Linux |
 | Windows ACL migration, verify-only transport reads, file ownership | Shared implementation; all secret temp files get explicit owner/DACL before bytes; command-boundary mocks and native tests added; new state reads do not cache DACL decisions | Native execution pending |
 | Dependency graph and known-vulnerability scan | Clean install, valid npm tree, full/prod audit | Snapshot only; scan every release |
-| Electron main-frame/IPC/protocol/permission isolation | Unit tests pass; real-process harness added | Native execution blocked locally |
-| Whole-repository functional regression | One retained loopback networking failure in cloud | Required native rerun; do not waive silently |
+| Electron main-frame/IPC/protocol/permission isolation | Real macOS/Windows execution exposed child-frame network attribution; administration moved to typed IPC with static-only protocol and fail-closed child-frame ownership | Revised native checks must pass; Linux runner sandbox prerequisite still blocks execution |
+| Whole-repository functional regression | Hosted Ubuntu and macOS suites passed at `cf742f3`; one cloud loopback failure remains locally | Later source changes and Windows still require successful full-suite evidence |
 | Claude proprietary mod engine and simultaneous provider sessions | Parser/helper tests only | Maintainer integration test required |
 | Local server identity under port takeover | Dedicated pinned TLS, exact leaf/CA/IP/expiry checks, instance generation, new token namespace; real adversarial TLS regressions | Locally verified; native integration still required |
 | Browser capability transport | Native-only opener and stdin helper; no capability URL, browser storage or HTTP fallback | Implemented; actual Claude engine and native launcher integration pending |

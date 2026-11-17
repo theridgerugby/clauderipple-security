@@ -53,6 +53,7 @@ function harness() {
     "node:child_process": { execFile: forbidden }, "node:fs": new Proxy({}, { get: () => forbidden }),
     "node:os": { homedir: forbidden }, "node:path": path,
     "./admin-auth": { fetchAdmin: forbidden },
+    "./admin-ipc": { createAdminRequestHandler: forbidden, ADMIN_IPC_CHANNEL: "ripple-app:admin-request" },
     "./admin-window": { ...adminWindow, prepareAdminUserDataPath: (directory: string) => directory },
     "./security": security,
     "./claude-desktop": { claudeStartedAt: forbidden, reopenClaude: forbidden },

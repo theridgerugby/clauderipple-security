@@ -20,6 +20,34 @@ export function isDashboardUrl(value: string): boolean {
 
 type Frame = Pick<WebFrameMain, "processId" | "routingId" | "origin" | "url">;
 type Owner = Pick<WebContents, "id" | "mainFrame">;
+const privilegedWindows = new WeakMap<object, { tainted: boolean }>();
+
+/** Install immediately after BrowserWindow creation, before loading any document. The dashboard
+ * has no legitimate subframes. A child can borrow the parent's preload function, so seeing any
+ * child permanently disables this window's privileged capabilities, even after detach/reload. */
+export function watchPrivilegedWindow(contents: Pick<WebContents, "on" | "mainFrame">): void {
+  if (privilegedWindows.has(contents)) return;
+  const state = { tainted: false };
+  privilegedWindows.set(contents, state);
+  contents.on("frame-created", (_event, details) => {
+    try {
+      if (!details.frame || details.frame.parent !== null || details.frame.processId !== contents.mainFrame.processId ||
+          details.frame.routingId !== contents.mainFrame.routingId) state.tainted = true;
+    }
+    catch { state.tainted = true; }
+  });
+  try { if (contents.mainFrame.frames.length !== 0) state.tainted = true; }
+  catch { state.tainted = true; }
+}
+
+export function isPrivilegedWindow(contents: Owner | null): boolean {
+  if (!contents) return false;
+  const state = privilegedWindows.get(contents);
+  if (!state || state.tainted) return false;
+  try { if (contents.mainFrame.frames.length !== 0) state.tainted = true; }
+  catch { state.tainted = true; }
+  return !state.tainted;
+}
 
 export function trustedTopFrame(senderId: number | undefined, frame: Frame | null | undefined, owned: Owner | null): boolean {
   try {
@@ -30,7 +58,7 @@ export function trustedTopFrame(senderId: number | undefined, frame: Frame | nul
 }
 
 export function trustedIpcSender(event: Pick<IpcMainInvokeEvent, "sender" | "senderFrame">, owned: Owner | null): boolean {
-  return trustedTopFrame(event.sender.id, event.senderFrame, owned);
+  return isPrivilegedWindow(owned) && trustedTopFrame(event.sender.id, event.senderFrame, owned);
 }
 
 // These are the destinations the shipped dashboard links to: updates, mobile apps, and the
@@ -53,7 +81,7 @@ export function externalUrl(value: string): string | null {
 }
 
 export const DASHBOARD_CSP = [
-  "default-src 'self'", "script-src 'self'", "style-src 'self'", "connect-src 'self'",
+  "default-src 'self'", "script-src 'self'", "style-src 'self'", "connect-src 'none'",
   "img-src 'self' data:", "object-src 'none'", "frame-src 'none'", "frame-ancestors 'none'",
   "worker-src 'none'", "base-uri 'none'", "form-action 'none'",
 ].join("; ");
@@ -61,7 +89,7 @@ export const DASHBOARD_CSP = [
 /** Only copying text is needed by the dashboard. Camera, mic, files, devices and all else deny. */
 export function configurePermissions(ses: Session, owner: () => WebContents | null): void {
   const isOwner = (contents: WebContents | null): boolean => {
-    try { return !!contents && trustedTopFrame(contents.id, contents.mainFrame, owner()); }
+    try { const owned = owner(); return !!contents && isPrivilegedWindow(owned) && trustedTopFrame(contents.id, contents.mainFrame, owned); }
     catch { return false; }
   };
   ses.setPermissionCheckHandler((contents, permission, requestingOrigin, details) =>

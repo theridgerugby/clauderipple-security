@@ -14,6 +14,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { fetchAdmin } from "./admin-auth";
+import { ADMIN_IPC_CHANNEL, createAdminRequestHandler } from "./admin-ipc";
 import { adminViewFromArgs, adminUserDataPath, prepareAdminUserDataPath } from "./admin-window";
 import { configurePermissions, trustedIpcSender } from "./security";
 import { claudeStartedAt, reopenClaude } from "./claude-desktop";
@@ -1299,12 +1300,13 @@ function fromOurPage(event: Electron.IpcMainInvokeEvent): boolean {
 }
 
 function wireBridge(): void {
+  ipcMain.handle(ADMIN_IPC_CHANNEL, createAdminRequestHandler({ ownedContents: () => mainWindow()?.webContents ?? null, admin: adminUrl, home }));
   ipcMain.handle("ripple-app:state", (event) => (fromOurPage(event) ? bridgeState() : null));
   ipcMain.handle("ripple-app:log", (event) => (fromOurPage(event) ? logTail() : []));
   ipcMain.handle("ripple-app:act", async (event, id: unknown) => {
     if (!fromOurPage(event) || typeof id !== "string" || !BRIDGE_ACTIONS.has(id)) return null;
     await act(id as BridgeAction);
-    return bridgeState();
+    return fromOurPage(event) ? bridgeState() : null;
   });
 }
 
@@ -1869,7 +1871,7 @@ app.on("activate", () => {
 app.whenReady().then(async () => {
   L = STRINGS[uiLang()];
   configurePermissions(session.defaultSession, () => mainWindow()?.webContents ?? null);
-  handleScheme(uiRoot(), adminUrl, home, () => mainWindow()?.webContents ?? null);
+  handleScheme(uiRoot());
   wireBridge();
   // Without this, Windows attributes our notifications to "Electron" instead of ClaudeRipple.
   if (process.platform === "win32") app.setAppUserModelId("com.clauderipple.app");

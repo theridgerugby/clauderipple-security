@@ -8,7 +8,8 @@ const path = require("node:path");
 const { once } = require("node:events");
 const { app, BrowserWindow, ipcMain, net, session } = require("electron");
 const { registerScheme, handleScheme } = require("../dist/protocol.js");
-const { configurePermissions, trustedIpcSender, ORIGIN } = require("../dist/security.js");
+const { ADMIN_IPC_CHANNEL, createAdminRequestHandler } = require("../dist/admin-ipc.js");
+const { configurePermissions, trustedIpcSender, watchPrivilegedWindow, ORIGIN } = require("../dist/security.js");
 const { applyWindowsPrivateAcl } = require("../dist/windows-private-acl.js");
 
 assert.ok(!app.commandLine.hasSwitch("no-sandbox"));
@@ -66,7 +67,8 @@ async function run() {
   // Match the production writer's explicit owner as well as its private DACL. A native elevated
   // test account may otherwise create an Administrators-owned file even inside a private parent.
   if (process.platform === "win32") applyWindowsPrivateAcl(endpointFile, false);
-  const owner = new BrowserWindow(bounds);
+  let owner = new BrowserWindow(bounds);
+  watchPrivilegedWindow(owner.webContents);
   windows.push(owner);
   configurePermissions(session.defaultSession, () => owner.webContents);
   // Observe the real guard's decisions without replacing its policy. Installing a second
@@ -90,7 +92,7 @@ async function run() {
       callback(response);
     }));
   } });
-  try { handleScheme(ui, () => base, home, () => owner.webContents); }
+  try { handleScheme(ui); }
   finally {
     if (beforeRequestDescriptor) Object.defineProperty(webRequest, "onBeforeRequest", beforeRequestDescriptor);
     else delete webRequest.onBeforeRequest;
@@ -98,6 +100,7 @@ async function run() {
   assert.equal(webRequest.onBeforeRequest, originalBeforeRequest);
   assert.equal(guardRegistrations, 1, "the production protocol must install exactly one request guard");
   ipcMain.handle("ripple-native:probe", event => trustedIpcSender(event, owner.webContents));
+  ipcMain.handle(ADMIN_IPC_CHANNEL, createAdminRequestHandler({ ownedContents: () => owner.webContents, admin: () => base, home }));
   await owner.loadURL(`${ORIGIN}/`);
   const isolation = await owner.webContents.executeJavaScript(`({
     sandboxed: rippleNative.sandboxed, isolated: rippleNative.contextIsolated,
@@ -105,24 +108,25 @@ async function run() {
     bridgeNames: Object.keys(rippleNative)
   })`);
   assert.deepEqual(isolation, { sandboxed: true, isolated: true, require: "undefined", process: "undefined", loaded: true,
-    bridgeNames: ["sandboxed", "contextIsolated", "probe"] });
+    bridgeNames: ["sandboxed", "contextIsolated", "probe", "adminRequest"] });
   console.log("PASS native sandbox, context isolation and renderer Node isolation");
   assert.equal(await owner.webContents.executeJavaScript("rippleNative.probe()"), true);
-  const response = await owner.webContents.executeJavaScript(`fetch('/api/status').then(async r => ({ status: r.status, text: await r.text(), headers: [...r.headers] }))`);
+  const response = await owner.webContents.executeJavaScript(`rippleNative.adminRequest({path:'/api/status'}).then(r => ({ status: r.status, text: new TextDecoder().decode(r.body), headers: r.headers }))`);
   assert.equal(response.status, 200);
   assert.deepEqual(JSON.parse(response.text), { fixture: true });
   assert.ok(!JSON.stringify(response).includes(secret));
   assert.equal(received, 1);
-  assert.ok(guardRequests.some(request => request.webContentsId === owner.webContents.id &&
-    request.routingId === owner.webContents.mainFrame.routingId && request.cancel === false));
+  assert.equal(guardRequests.length, 0, "administrative IPC does not traverse the browser protocol");
+  assert.equal(await owner.webContents.executeJavaScript(`fetch('/api/status').then(r => r.status).catch(() => 'blocked')`), "blocked");
+  assert.equal(received, 1, "even the owned top frame has no browser API fallback");
   console.log("PASS native owned-frame IPC and pinned TLS credential isolation");
   const permission = await owner.webContents.executeJavaScript("navigator.permissions.query({name: 'geolocation'}).then(p => p.state)");
   assert.equal(permission, "denied");
   await owner.webContents.executeJavaScript("const script = document.createElement('script'); script.textContent = 'window.inlineRan = true'; document.body.append(script)");
   assert.equal(await owner.webContents.executeJavaScript("window.inlineRan === true"), false);
   console.log("PASS native permission denial and inline-script CSP");
-  // Execute inside Chromium's browser-owned child context after it loads, and verify the
-  // actual guard's frame attribution. Cross-window function calls alone do not establish it.
+  // Execute inside Chromium's actual child context. Browser API routing is denied regardless
+  // of whether this runtime attributes the request to the child or the parent's frame.
   await owner.webContents.executeJavaScript(`new Promise(resolve => {
     const frame = document.createElement('iframe'); frame.id = 'security-child';
     frame.onload = () => resolve(true); document.body.append(frame);
@@ -137,38 +141,51 @@ async function run() {
   const childRequests = guardRequests.slice(childTraceStart);
   console.log("TRACE native child request", JSON.stringify({ result: child, requests: childRequests }));
   assert.equal(child, "blocked", "a request executed inside the child frame must be denied");
-  assert.equal(childRequests.length, 1, "the production guard must see the actual child request");
-  assert.deepEqual(childRequests.map(request => ({ contents: request.webContentsId, process: request.processId,
-    frame: request.routingId, cancel: request.cancel })), [{ contents: owner.webContents.id,
-    process: childFrame.processId, frame: childFrame.routingId, cancel: true }]);
+  assert.ok(childRequests.every(request => request.cancel), "requests reaching the guard are denied unconditionally");
+  assert.equal(await childFrame.executeJavaScript(`parent.rippleNative.adminRequest({path:'/api/status'}).then(r=>r.status)`), 403,
+    "a child borrowing the parent's preload must still be denied");
+  assert.equal(await owner.webContents.executeJavaScript("rippleNative.probe()"), false,
+    "the same sticky policy closes all privileged IPC channels");
   await owner.webContents.executeJavaScript("document.getElementById('security-child').remove()");
+  assert.equal(await owner.webContents.executeJavaScript("rippleNative.adminRequest({path:'/api/status'}).then(r=>r.status)"), 403,
+    "detaching the child must not restore privileged IPC");
+  await owner.loadURL(`${ORIGIN}/`);
+  assert.equal(await owner.webContents.executeJavaScript("rippleNative.adminRequest({path:'/api/status'}).then(r=>r.status)"), 403,
+    "ordinary document reload must not reset the tainted WebContents");
   assert.equal(received, 1, "an unowned child frame cannot borrow the capability");
-  console.log("PASS native child-originated API denial");
+  console.log("PASS native child fetch and borrowed-parent IPC denial, persistent after detach and reload");
+  owner.destroy();
+  owner = new BrowserWindow(bounds);
+  watchPrivilegedWindow(owner.webContents);
+  windows.push(owner);
+  await owner.loadURL(`${ORIGIN}/`);
+  assert.equal(await owner.webContents.executeJavaScript("rippleNative.probe()"), true);
+  assert.equal(await owner.webContents.executeJavaScript("rippleNative.adminRequest({path:'/api/status'}).then(r=>r.status)"), 200);
+  assert.equal(received, 2, "only a newly created owned window restores the administrative bridge");
 
   const sameOrigin = new BrowserWindow(bounds);
   windows.push(sameOrigin);
   await sameOrigin.loadURL(`${ORIGIN}/`);
   assert.equal(await sameOrigin.webContents.executeJavaScript("rippleNative.probe()"), false);
+  assert.equal(await sameOrigin.webContents.executeJavaScript("rippleNative.adminRequest({path:'/api/status'}).then(r=>r.status)"), 403);
   const sameOriginTraceStart = guardRequests.length;
   assert.equal(await sameOrigin.webContents.executeJavaScript(`fetch('/api/status').then(r => r.status).catch(() => 'blocked')`), "blocked");
   const sameOriginRequests = guardRequests.slice(sameOriginTraceStart);
-  assert.equal(sameOriginRequests.length, 1);
-  assert.deepEqual(sameOriginRequests.map(request => ({ contents: request.webContentsId, frame: request.routingId,
-    cancel: request.cancel })), [{ contents: sameOrigin.webContents.id,
-    frame: sameOrigin.webContents.mainFrame.routingId, cancel: true }]);
-  assert.equal(received, 1, "a second same-origin window cannot use the owned dashboard's bridge");
+  assert.ok(sameOriginRequests.every(request => request.cancel));
+  assert.equal(received, 2, "a second same-origin window cannot use the owned dashboard's bridge");
   console.log("PASS native same-origin unowned window IPC and API denial");
 
   const foreign = new BrowserWindow(bounds);
   windows.push(foreign);
   await foreign.loadURL(base);
   assert.equal(await foreign.webContents.executeJavaScript("rippleNative.probe()"), false);
+  assert.equal(await foreign.webContents.executeJavaScript("rippleNative.adminRequest({path:'/api/status'}).then(r=>r.status)"), 403);
   const forbidden = await foreign.webContents.executeJavaScript(`fetch('${ORIGIN}/api/status').then(r => r.status).catch(() => 'blocked')`);
   assert.equal(forbidden, "blocked");
-  assert.equal(received, 1, "a foreign page cannot use the authenticated bridge");
+  assert.equal(received, 2, "a foreign page cannot use the authenticated bridge");
   try { const browserRequest = await net.fetch(`${ORIGIN}/api/status`); assert.equal(browserRequest.status, 403); }
   catch (error) { assert.match(String(error), /ERR_BLOCKED|Failed to fetch|ERR_FAILED/); }
-  assert.equal(received, 1, "browser-initiated requests have no owner frame");
+  assert.equal(received, 2, "browser-initiated requests have no owner frame");
   console.log("PASS native foreign-window and browser-initiated API denial");
   // A process that takes over the exact TLS port with another identity must receive neither the
   // capability nor an HTTP request body. Keep the trusted endpoint/pin unchanged during this test.
@@ -179,7 +196,7 @@ async function run() {
   server = https.createServer({ cert: rogue.certPem, key: rogue.keyPem, minVersion: "TLSv1.2" }, (_req, res) => { rogueRequests++; res.end("untrusted"); });
   server.listen(tlsPort, "127.0.0.1");
   await once(server, "listening");
-  assert.equal(await owner.webContents.executeJavaScript("fetch('/api/status').then(r => r.status)"), 503);
+  assert.equal(await owner.webContents.executeJavaScript("rippleNative.adminRequest({path:'/api/status'}).then(r => r.status)"), 503);
   assert.equal(rogueRequests, 0, "port takeover cannot receive authenticated HTTP requests");
   console.log(`PASS native Electron ${process.versions.electron}: sandbox, isolation, IPC owner, pinned TLS and port takeover, API credential isolation, foreign-frame denial, CSP and permissions`);
 }

@@ -48,6 +48,27 @@ function toast(message, isError, raw) {
 
 // Baselines are indexed by the revision carried through JSON clones used by save handlers.
 const configSnapshots = new Map();
+// Match the native bridge's four-call budget. Startup reads and provider refreshes may arrive
+// together; a bounded FIFO keeps ordinary UI traffic from exhausting the main-process gate.
+const adminRequestQueue = [];
+let adminRequestsActive = 0;
+function drainAdminRequests() {
+  while (adminRequestsActive < 4 && adminRequestQueue.length) {
+    const entry = adminRequestQueue.shift();
+    adminRequestsActive++;
+    Promise.resolve().then(() => APP.adminRequest(entry.request)).then(entry.resolve, entry.reject).finally(() => {
+      adminRequestsActive--;
+      drainAdminRequests();
+    });
+  }
+}
+function queuedAdminRequest(request) {
+  if (adminRequestQueue.length >= 32) return Promise.reject(new Error("Dashboard request queue is full; wait for the current operation to finish."));
+  return new Promise((resolve, reject) => {
+    adminRequestQueue.push({ request, resolve, reject });
+    drainAdminRequests();
+  });
+}
 // Native main owns the pinned TLS connection and the new capability. The renderer has neither.
 // Clear the obsolete browser bootstrap if an old bookmark opens this code during migration.
 function clearLegacyAdminToken() {
@@ -62,10 +83,25 @@ function adminFetch(path, opts) {
   // Accept only this dashboard's API paths, including encoded paths checked by the server.
   // A URL or a protocol-relative path must never receive the local capability.
   if (typeof path !== "string" || !path.startsWith("/api/") || /[\\\r\n]/.test(path)) throw new Error("Invalid local admin path");
-  if (!APP) throw new Error("Open the native dashboard with clauderipple ui; browser administration is disabled.");
+  if (!APP || typeof APP.adminRequest !== "function") throw new Error("Open the updated native dashboard with clauderipple ui; browser administration is disabled.");
+  const method = String(opts && opts.method || "GET").toUpperCase();
+  if (!["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"].includes(method)) throw new Error("Invalid local admin method");
+  const body = opts && opts.body;
+  if (body != null && (typeof body !== "string" || method === "GET" || method === "HEAD")) throw new Error("Invalid local admin body");
+  if (body != null && (body.length > 2 * 1024 * 1024 || new TextEncoder().encode(body).byteLength > 2 * 1024 * 1024)) throw new Error("Local admin body is too large");
   const headers = new Headers(opts && opts.headers);
-  headers.delete("x-clauderipple-admin");
-  return fetch(path, { ...opts, headers, mode: "same-origin", redirect: "error" });
+  const ordinaryHeaders = {};
+  for (const name of ["accept", "content-type"]) {
+    const value = headers.get(name);
+    if (value !== null) ordinaryHeaders[name] = value;
+  }
+  // Browser protocol requests never carry administrative authority. The isolated preload
+  // exposes one typed IPC method; main verifies the actual sending frame and owns TLS/auth.
+  return queuedAdminRequest({ path, method, headers: ordinaryHeaders, ...(body == null ? {} : { body }) }).then(result => {
+    if (!result || !Number.isInteger(result.status) || result.status < 200 || result.status > 599) throw new Error("Invalid native admin response");
+    const noBody = method === "HEAD" || [204, 205, 304].includes(result.status);
+    return new Response(noBody ? null : result.body, { status: result.status, headers: result.headers });
+  });
 }
 clearLegacyAdminToken();
 async function api(path, opts) {
@@ -4358,6 +4394,18 @@ async function loadClients() {
   } catch (error) { toast(t("common.loadFailed"), true, error.message); return false; }
 }
 
+// Use a small worker pool instead of enqueueing an unbounded request for every provider.
+// Three workers leave room for a status read or an interactive save in the IPC budget.
+async function probeProviders(providers, onUpdate) {
+  const entries = Object.entries(providers || {});
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(3, entries.length) }, async () => {
+    while (next < entries.length) {
+      const [name, provider] = entries[next++];
+      await probeProvider(name, provider, onUpdate);
+    }
+  }));
+}
 async function loadProviders() {
   providersLoaded = true;
   // Before the first config the rail and the detail hold bars, not the "no provider selected" text.
@@ -4373,9 +4421,9 @@ async function loadProviders() {
     // in the config. A router too old to answer leaves the note off rather than breaking the screen.
     pickerContextWindows = await api("/api/context-windows").catch(() => pickerContextWindows);
     renderProviderWorkspace();
-    void Promise.all(Object.entries(currentConfig.providers || {}).map(([name, provider]) => probeProvider(name, provider, () => {
+    void probeProviders(currentConfig.providers, () => {
       if ($("#view-providers").classList.contains("active")) renderProviderWorkspace();
-    })));
+    });
   } catch (error) {
     toast(t("common.loadFailed"), true, error.message);
     // A first read that failed leaves the page in its failure state, and the next visit reads again.
@@ -4392,8 +4440,8 @@ $("#providers-refresh").addEventListener("click", async () => {
   if (!currentConfig) return;
   const button = $("#providers-refresh");
   button.disabled = true;
-  await Promise.all(Object.entries(currentConfig.providers).map(([name, provider]) => probeProvider(name, provider)));
-  button.disabled = false;
+  try { await probeProviders(currentConfig.providers); }
+  finally { button.disabled = false; }
   renderProviderWorkspace();
 });
 

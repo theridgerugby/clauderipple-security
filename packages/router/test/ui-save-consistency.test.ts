@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import { assertNativeAdminFetch, nativeDashboardWindow } from './ui-native-fixture.ts';
 
 // Execute the native dashboard's real rendering, save, retry, toast and keyboard functions.
-// DOM/timers and the app protocol fetch are replaced; no real configuration or network is used.
+// DOM/timers and the native IPC backend are replaced; no real configuration or network is used.
 const source = fs.readFileSync(new URL('../../ui/app.js', import.meta.url), 'utf8');
 function block(from: string, to: string) {
   const start = source.indexOf(from), end = source.indexOf(to, start);
@@ -151,7 +151,7 @@ async function harness(initial = fixture()) {
     { querySelectorAll: queryAll, querySelector: (s: string) => queryAll(s)[0] ?? null,
       createElement: (tag: string) => new DomNode(tag.toUpperCase()), createElementNS: (_ns: string, tag: string) => new DomNode(tag.toUpperCase()),
       createTextNode: (text: string) => { const node = new DomNode('#TEXT'); node.textContent = text; return node; } },
-    { ...nativeDashboardWindow(), addEventListener: (name: string, fn: (event: KeyEvent) => void) => { assert.equal(name, 'keydown'); keyboard = fn; } },
+    { ...nativeDashboardWindow(fetchMock), addEventListener: (name: string, fn: (event: KeyEvent) => void) => { assert.equal(name, 'keydown'); keyboard = fn; } },
     DomNode, fetchMock,
     (fn: () => void, ms: number) => { const id = ++timerId; timers.set(id, { fn, ms }); return id; },
     (id: number) => { timers.delete(id); },

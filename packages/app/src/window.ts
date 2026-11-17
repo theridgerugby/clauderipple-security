@@ -7,7 +7,7 @@ import { execFile } from "node:child_process";
 import path from "node:path";
 
 import { ORIGIN } from "./protocol";
-import { externalUrl, isDashboardUrl } from "./security";
+import { externalUrl, isDashboardUrl, isPrivilegedWindow, watchPrivilegedWindow } from "./security";
 
 export type Bounds = { x: number; y: number; width: number; height: number };
 
@@ -78,18 +78,19 @@ export function openWindow(deps: WindowDeps, view?: string): void {
       spellcheck: false,
     },
   });
+  watchPrivilegedWindow(win.webContents);
   if (!mac) win.removeMenu();
   // Links the dashboard opens (release notes, sign-in pages) belong in the user's browser.
   win.webContents.setWindowOpenHandler(({ url }) => {
     const target = externalUrl(url);
-    if (target) void shell.openExternal(target).catch(() => undefined);
+    if (target && win && isPrivilegedWindow(win.webContents)) void shell.openExternal(target).catch(() => undefined);
     return { action: "deny" };
   });
   win.webContents.on("will-navigate", (event, url) => {
     if (isDashboardUrl(url)) return;
     event.preventDefault();
     const target = externalUrl(url);
-    if (target) void shell.openExternal(target).catch(() => undefined);
+    if (target && win && isPrivilegedWindow(win.webContents)) void shell.openExternal(target).catch(() => undefined);
   });
   win.webContents.on("will-frame-navigate", event => {
     if (!event.isMainFrame || !isDashboardUrl(event.url)) event.preventDefault();
@@ -181,5 +182,5 @@ export function windowVisible(): boolean {
 
 /** Sends the bridge's state to the page, if the window is open. */
 export function sendToWindow(channel: string, payload: unknown): void {
-  if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
+  if (win && !win.isDestroyed() && isPrivilegedWindow(win.webContents)) win.webContents.send(channel, payload);
 }

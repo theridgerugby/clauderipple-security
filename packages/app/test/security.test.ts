@@ -1,13 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { EventEmitter } from "node:events";
 import { runInNewContext } from "node:vm";
 import ts from "typescript";
 import type { Session, WebContents, IpcMainInvokeEvent } from "electron";
-import { configurePermissions, DASHBOARD_CSP, externalUrl, isAppUrl, isDashboardUrl, ORIGIN, trustedIpcSender, trustedTopFrame } from "../src/security.ts";
+import { configurePermissions, DASHBOARD_CSP, externalUrl, isAppUrl, isDashboardUrl, ORIGIN, trustedIpcSender, trustedTopFrame, watchPrivilegedWindow } from "../src/security.ts";
 
-const frame = { processId: 7, routingId: 11, origin: ORIGIN, url: `${ORIGIN}/?lang=en#health` };
-const owner = { id: 17, mainFrame: frame } as unknown as WebContents;
+const frame = { processId: 7, routingId: 11, origin: ORIGIN, url: `${ORIGIN}/?lang=en#health`, frames: [] };
+const owner = Object.assign(new EventEmitter(), { id: 17, mainFrame: frame }) as unknown as WebContents;
+watchPrivilegedWindow(owner);
 const event = { sender: owner, senderFrame: frame } as unknown as IpcMainInvokeEvent;
 
 test("privilege belongs to exactly the owned top-level dashboard frame", () => {
@@ -88,7 +90,7 @@ test("session permissions deny all capabilities except sanitized clipboard write
 });
 
 test("the desktop CSP excludes embedded frames, workers, plugin objects and inline execution", () => {
-  for (const directive of ["script-src 'self'", "connect-src 'self'", "frame-src 'none'", "frame-ancestors 'none'", "worker-src 'none'", "object-src 'none'", "base-uri 'none'", "form-action 'none'"])
+  for (const directive of ["script-src 'self'", "connect-src 'none'", "frame-src 'none'", "frame-ancestors 'none'", "worker-src 'none'", "object-src 'none'", "base-uri 'none'", "form-action 'none'"])
     assert.ok(DASHBOARD_CSP.includes(directive));
   assert.doesNotMatch(DASHBOARD_CSP, /unsafe-inline|unsafe-eval|https?:|\*/);
 });
@@ -108,9 +110,11 @@ test("real IPC handlers reject foreign windows and same-origin child frames befo
   runInNewContext(compiled, {
     ipcMain: { handle: (channel: string, callback: Function) => handlers.set(channel, callback) },
     trustedIpcSender, mainWindow: () => ({ webContents: owner }),
+    ADMIN_IPC_CHANNEL: "ripple-app:admin-request", createAdminRequestHandler: () => async () => ({ status: 403 }),
+    adminUrl: () => "http://127.0.0.1:1/", home: "/unused-test-home",
     bridgeState: () => ({ test: true }), logTail: () => ["fixture"], act: async (id: string) => { actions.push(id); },
   });
-  assert.deepEqual([...handlers.keys()], ["ripple-app:state", "ripple-app:log", "ripple-app:act"]);
+  assert.deepEqual([...handlers.keys()], ["ripple-app:admin-request", "ripple-app:state", "ripple-app:log", "ripple-app:act"]);
   for (const invalid of [
     { ...event, sender: { id: 18 } }, { ...event, senderFrame: null },
     { ...event, senderFrame: { ...frame, routingId: 12 } },
@@ -125,4 +129,11 @@ test("real IPC handlers reject foreign windows and same-origin child frames befo
   assert.deepEqual(handlers.get("ripple-app:state")!(event), { test: true });
   await handlers.get("ripple-app:act")!(event, "refresh");
   assert.deepEqual(actions, ["refresh"]);
+  const completion = handlers.get("ripple-app:act")!(event, "refresh");
+  owner.emit("frame-created", {} as Electron.Event, { frame: { ...frame, parent: frame, routingId: 99 } } as never);
+  assert.equal(await completion, null, "an authorized action cannot return state after its window loses privilege");
+  assert.equal(handlers.get("ripple-app:state")!(event), null);
+  assert.equal(handlers.get("ripple-app:log")!(event).length, 0);
+  assert.equal(await handlers.get("ripple-app:act")!(event, "repair"), null);
+  assert.deepEqual(actions, ["refresh", "refresh"], "tainted parent cannot borrow any recovery-action channel");
 });

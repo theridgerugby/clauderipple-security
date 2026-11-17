@@ -3,16 +3,20 @@
 Original upstream review base: `PBJ-2/clauderipple` v0.12.36,
 `e7420ab5dc14c9569fed3439bc43e68a989c7055`.
 Integrated upstream revision: `7fe108c847428694e6fd05f5991c7a37c3c992fb`.
-Locally tested runtime-code checkpoint: `f3057ccadf4afcccd53ea37610fc9da559420e1a`.
+Original local validation checkpoint: `f3057ccadf4afcccd53ea37610fc9da559420e1a`.
+Latest recorded hosted checkpoint: `cf742f3062ffdee8d19c209674eeb3652c83c13e`,
+tree `51c5a38925d573a48c4350f2e35a85cea28c9cef`.
 Validation date: 2026-11-16 (America/Toronto).
 Environment: Linux cloud workspace, Node 24.22.1, npm 11.9.0.
 
 ## Decision and scope
 
 The local port-impersonation fixes and their executable regression tests are
-implemented. Native validation and genuine signed release acceptance remain
-unverified. The writable fork is `theridgerugby/clauderipple-security`; hosted CI
-evidence must be recorded separately from the local results below. No signed
+implemented. Hosted native execution found an additional child-frame authority
+defect; the subsequent IPC fix requires its own fresh run. Genuine signed release
+acceptance remains unverified. The writable fork is
+`theridgerugby/clauderipple-security`; hosted evidence below is tied to its exact
+checkpoint and does not certify later changes. No signed
 application release or installation on the user's machine was performed. This
 work does not establish a Google security certification.
 
@@ -21,7 +25,37 @@ See [security-acceptance.md](security-acceptance.md) for the release gates and
 handoff. A test that runs only through a command mock is not evidence of native
 Windows/macOS execution.
 
-## Executed checks
+## Hosted validation and resulting fixes
+
+Run [44024775833](https://github.com/theridgerugby/clauderipple-security/actions/runs/44024775833)
+used the recorded `cf742f3` checkpoint. Its completed results at this checkpoint:
+
+| Job | Observed result |
+| --- | --- |
+| Ubuntu full suite | 4,022 tests: 3,992 passed, 30 skipped, zero failures/cancellations; audit, typecheck, mod check and build passed |
+| macOS full suite | 4,022 tests: 3,998 passed, 24 skipped, zero failures/cancellations; audit, typecheck, mod check and build passed |
+| Windows full suite | Still running when this checkpoint was recorded; no success claimed |
+| macOS/Windows Electron harness | Failed: real child-frame fetch reached the administrative protocol handler and returned 200 |
+| Ubuntu Electron harness | Failed before app initialization: the preinstalled sandbox helper did not meet the protected root-owned mode-4755 prerequisite |
+
+The child-frame fixture used `WebFrameMain.executeJavaScript` and verified that it
+was not executing in the top frame. Instrumented `webRequest` metadata nevertheless
+identified the request as the main frame. This is a genuine authority-boundary
+failure. The revised design removes all administrative protocol handling, uses
+typed IPC with actual sender-frame validation, and refuses privileged IPC after
+any child frame is created, including parent-bridge borrowing. Those changes must
+be evaluated by the next exact-commit native run. The Linux preflight now reports
+safe ownership/mode metadata for an authorized runner administrator; it does not
+alter system permissions, AppArmor or sandbox flags.
+
+The same checkpoint's local `npm run test:ci` produced 4,022 tests: 3,991 passed,
+30 skipped, one retained Undici loopback failure and no cancellations. That test
+passed on both hosted Ubuntu and macOS above. Earlier Linux worker-lock and
+fixture-cleanup defects were fixed before this hosted checkpoint; an old failing
+run is not evidence against the later patch, and a later green run does not erase
+the earlier findings.
+
+## Original local checks
 
 | Check | Result |
 | --- | --- |
@@ -39,7 +73,7 @@ The retained full-suite failure and platform skips are not counted as passes.
 The dependency scan is a point-in-time known-vulnerability check, not proof that
 every dependency is free of vulnerabilities. No audit threshold was lowered.
 
-The inspected local npm archive has SHA-256
+The inspected archive from the original local checkpoint has SHA-256
 `8fac46e9a64627474bed74ee1bb563963b6e32f95f962088e1210e3274cdbd42`.
 It was not published and is not a signed/native application distribution.
 
@@ -72,8 +106,9 @@ It was not published and is not a signed/native application distribution.
   capabilities. Additional regressions reject pathname/descriptor swaps during
   ACL operations, hard-link insertion, wrong owners and replacement during
   publication retries. Real Windows DACL assertions remain platform-specific tests.
-- Renderer fixtures follow the native preload/custom-protocol contract. They
-  assert no renderer bearer, same-origin requests and rejected redirects while
+- Renderer fixtures follow the typed native preload/IPC contract. They
+  assert no browser admin fetch, no renderer bearer, bounded text bodies and
+  allowlisted representation headers while
   preserving existing save/revision/concurrency assertions.
 - Release tests reject absent/wrong signers, mixed notarization modes, unsigned
   output, altered fuse policy, unexpected artifacts and credential-bearing package
@@ -110,7 +145,8 @@ patched npm dependencies, reproduced the request-path issue: its IPv4 loopback
 server returned 200, while its IPv6 loopback server bound successfully but received
 zero requests before ordinary `fetch` timed out. No proxy setting, sandbox or
 network restriction was bypassed. This supports an environment-path explanation;
-the original test remains mandatory and must pass in the native CI environment.
+the original test remains mandatory. It subsequently passed in the recorded
+hosted Ubuntu and macOS full suites.
 
 ## External acceptance still required
 
@@ -124,8 +160,9 @@ the original test remains mandatory and must pass in the native CI environment.
 - Explicitly authorized disposable provider accounts for subscription/API end-to-end
   checks. No live provider request, user token rotation, trust-store modification,
   actual update installation or release publication was performed.
-- Hosted CI on the writable fork, recording the exact source revision, operating
-  system, architecture and job result. The real-process Electron harness uses
+- A successful complete hosted CI matrix for the final reviewed revision,
+  recording the source, operating system, architecture and each job result.
+  The real-process Electron harness uses
   fixture windows/preloads and synthetic credentials; passing it alone does not
   establish production-application installation or signed-artifact acceptance.
 

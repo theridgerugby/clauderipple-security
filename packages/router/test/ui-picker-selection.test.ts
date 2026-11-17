@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { assertNativeAdminFetch, nativeDashboardWindow } from "./ui-native-fixture.ts";
+import { assertNativeAdminFetch, nativeDashboardWindow, nativeAdminBridge } from "./ui-native-fixture.ts";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -1026,8 +1026,7 @@ test('config revision conflicts re-read and reapply only this save; legacy route
     fresh.providers.q = { type: 'openai-compatible', models: [{ id: 'remote' }] };
     fresh.cli.extraModels.push({ model: 'remote', name: 'Remote' });
     const h = { original, fresh, reads: 0, writes: [] as SavedConfig[] };
-    const saved = await new Function('h', 'window', 'assertNativeAdminFetch', `
-      const APP = window.rippleApp;
+    const saved = await new Function('h', 'window', 'assertNativeAdminFetch', 'nativeAdminBridge', `
       const clone = value => JSON.parse(JSON.stringify(value)); let currentConfig;
       const toast = () => {};
       const fetch = async (url, options) => {
@@ -1037,10 +1036,11 @@ test('config revision conflicts re-read and reapply only this save; legacy route
         if (h.original.configRevision && h.writes.length === 1) return {ok:false,status:409,text:async()=>JSON.stringify({error:'conflict',config:h.fresh})};
         return {ok:true,text:async()=>JSON.stringify(h.original.configRevision ? {configRevision:'revision-3'} : {ok:true})};
       };
+      const APP = { ...window.rippleApp, adminRequest: nativeAdminBridge(fetch) };
       ${mergeBlock}
       ${dashboardBlock('const configSnapshots =', 'function modelsOf(')}
       return (async () => { const next = clone(await latestConfig()); next.autoUpdate = false; next.cli.extraModels[0].name = 'Local one'; next.providers.p.models[0].name = 'Local model'; await configRequest(next); return next; })();
-    `)(h, nativeDashboardWindow(), assertNativeAdminFetch) as SavedConfig;
+    `)(h, nativeDashboardWindow(), assertNativeAdminFetch, nativeAdminBridge) as SavedConfig;
     assert.equal(saved.autoUpdate, false);
     assert.equal(h.writes.length, versioned ? 2 : 1);
     if (versioned) {
@@ -1062,8 +1062,7 @@ function pickerSaveHarness(config: SavedConfig) {
     server: { config: { ...structuredClone(config), configRevision: 'r1' }, revision: 1 } as PickerServer,
     writes: [] as SavedConfig[], errors: [] as string[], selections: [] as string[],
   };
-  const ui = new Function('h', 'window', 'assertNativeAdminFetch', `
-    const APP = window.rippleApp;
+  const ui = new Function('h', 'window', 'assertNativeAdminFetch', 'nativeAdminBridge', `
     const clone = value => JSON.parse(JSON.stringify(value)); let currentConfig;
     const toast = (message, error) => { if (error) h.errors.push(message); };
     const fetch = async (url, options) => {
@@ -1083,6 +1082,7 @@ function pickerSaveHarness(config: SavedConfig) {
       return { ok: true, text: async () => JSON.stringify({ configRevision: s.config.configRevision }) };
     };
     ${mergeBlock}
+    const APP = { ...window.rippleApp, adminRequest: nativeAdminBridge(fetch) };
     ${dashboardBlock('const configSnapshots =', 'function modelsOf(')}
     const groupedModels = config => Object.entries(config.providers).map(([name, p]) => ({ name, models: p.models || [] }));
     ${dashboardBlock('function allKnownModelIds(', 'function updateSlotSummary(')}
@@ -1091,7 +1091,7 @@ function pickerSaveHarness(config: SavedConfig) {
     const clientPickerSelections = () => h.selections.map(id => ({ id, name: id, provider: 'p' }));
     ${dashboardBlock('// One picker save at a time', 'function pickerModeOn(')}
     return { save: changed => saveClientPickerModels(changed), load: latestConfig, pend: ids => { pickerOrderPending = ids; }, pending: () => pickerOrderPending };
-  `)(h, nativeDashboardWindow(), assertNativeAdminFetch) as { save(selectionsChanged?: boolean): Promise<void>; load(): Promise<unknown>; pend(ids: string[]): void; pending(): string[] | null };
+  `)(h, nativeDashboardWindow(), assertNativeAdminFetch, nativeAdminBridge) as { save(selectionsChanged?: boolean): Promise<void>; load(): Promise<unknown>; pend(ids: string[]): void; pending(): string[] | null };
   return { h, ...ui };
 }
 function threeModels(): SavedConfig {

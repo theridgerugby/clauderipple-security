@@ -132,13 +132,29 @@ content. Pattern redaction does not prove that arbitrary text contains no secret
 
 ## Desktop boundary
 
-Electron is pinned to 45.3.3. The main process verifies the owning window, main
-frame, page URL and true origin for IPC and the API protocol bridge. API protocol
-requests additionally require Electron's browser-supplied initiator origin. Node
-integration is disabled in renderers, subframes and workers; context isolation and
-the sandbox are enabled. Navigation, redirects, new windows and webviews are
-restricted. CSP excludes embedded frames, workers, inline scripts and plugin
-objects; permissions are denied by default except the owned dashboard's text copy.
+Electron is pinned to 45.3.3. `ripple://` serves static dashboard resources only;
+all `/api/` protocol requests are denied, including requests from the owner window.
+The isolated preload exposes a typed administrative IPC method. Main validates
+the owning window, actual IPC sender frame, page URL and true origin before
+reading private state or making a pinned-TLS request. Its schema permits only API
+paths, the supported HTTP methods, two representation headers and bounded text
+bodies. The IPC limits requests to 2 MiB, responses to 8 MiB, concurrent operations
+to four and each operation to 60 seconds. No renderer-supplied capability,
+destination, redirect policy or arbitrary IPC channel is accepted.
+
+Native tests found that Electron's network callback could attribute a child-frame
+fetch to the main frame. That callback is no longer the admin authority. A child
+can also borrow a same-origin parent's JavaScript bridge, so any child-frame
+creation permanently disables privileged IPC for that window. Removing the child
+or reloading does not restore it; a newly created window is required. The shipped
+dashboard needs no child frames. This fail-closed policy is tested in addition to
+the normal CSP and navigation restrictions.
+
+Node integration is disabled in renderers, subframes and workers; context isolation
+and the sandbox are enabled. Navigation, redirects, new windows and webviews are
+restricted. CSP excludes browser network connections, embedded frames, workers,
+inline scripts and plugin objects; permissions are denied by default except the
+owned dashboard's text copy.
 
 The Windows ACL and local TLS implementations each have one canonical source and
 a generated, byte-for-byte parity-tested Electron copy. Native security tests use
