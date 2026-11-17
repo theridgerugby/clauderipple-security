@@ -1318,12 +1318,18 @@ test("HEAD answers a read-only route with its headers and no body", async () => 
       const head = await fetch(`${base()}:${port}${route}`, { method: "HEAD" });
       assert.notEqual(head.status, 404, `HEAD ${route} must reach its route`);
       assert.equal(head.status, get.status, `HEAD ${route} answers as the GET does`);
+      // Fully drain each GET before closing the test server. Undici's HTTP/1 parser can
+      // assert on a paused unread response when an idle keep-alive connection is closed.
+      await get.arrayBuffer();
+      assert.equal((await head.arrayBuffer()).byteLength, 0);
     }
     // A static file is the same bytes on both calls, so its stated length can be compared exactly;
     // `/api/status` carries live counters and would differ between two reads.
     const [getCss, headCss] = [await fetch(`${base()}:${port}/style.css`), await fetch(`${base()}:${port}/style.css`, { method: "HEAD" })];
     assert.ok(Number(getCss.headers.get("content-length")) > 0);
     assert.equal(headCss.headers.get("content-length"), getCss.headers.get("content-length"), "the length of the body a GET would have sent");
+    await getCss.arrayBuffer();
+    assert.equal((await headCss.arrayBuffer()).byteLength, 0);
     // The body is the part a HEAD must not carry, and `fetch` never exposes one — read the wire.
     const wire = await new Promise<string>((done, fail) => {
       const options = adminTestTlsOptions(`${base()}:${port}`);

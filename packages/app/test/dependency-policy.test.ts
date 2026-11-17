@@ -1,7 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import path from "node:path";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
@@ -36,37 +35,23 @@ test("the app and router use a byte-identical pinned TLS admin transport", () =>
     fs.readFileSync(new URL("../../router/src/admin-transport-client.ts", import.meta.url), "utf8"));
 });
 
-test("the two modern builder glob consumers resolve patched minimatch without changing legacy glob APIs", () => {
-  for (const consumer of ["app-builder-lib", "@electron/universal"]) {
-    const from = createRequire(require.resolve(consumer));
-    assert.equal(from("minimatch/package.json").version, "11.0.9", consumer);
-    const { minimatch, Minimatch } = from("minimatch");
-    const matcher = new Minimatch("dist/**", { dot: true });
-    assert.equal(matcher.match("dist/main.js"), true);
-    assert.equal(matcher.match("dist", true), true);
-    assert.ok(Array.isArray(matcher.set));
-    assert.equal(new Minimatch("!**/*.map").negate, true);
-    assert.equal(minimatch("path/tool.node", "*.node", { matchBase: true }), true);
+test("source-only Windows installation excludes the vulnerable native packager dependency tree", () => {
+  const root = new URL("../../../", import.meta.url);
+  const project = JSON.parse(fs.readFileSync(new URL("package.json", root), "utf8"));
+  const lock = JSON.parse(fs.readFileSync(new URL("package-lock.json", root), "utf8"));
+  assert.equal(project.devDependencies["electron-builder"], undefined);
+  for (const name of ["electron-builder", "app-builder-lib", "@electron/universal", "builder-util", "node-gyp", "tinyglobby", "fdir", "picomatch"]) {
+    assert.equal(lock.packages[`node_modules/${name}`], undefined, `source-only lock must exclude ${name}`);
   }
-  const fromGlob = createRequire(require.resolve("glob"));
-  assert.equal(typeof fromGlob("minimatch"), "function", "glob7 still receives its compatible minimatch3 API");
 });
 
-test("real electron-builder file filters preserve includes, excludes, partial directories and dotfiles", () => {
-  const { FileMatcher } = require("app-builder-lib/out/fileMatcher.js");
-  const root = path.resolve("fixture-app");
-  const filter = new FileMatcher(root, path.resolve("fixture-output"), (value: string) => value,
-    ["dist/**", "assets/**", "package.json", "!**/*.map"]).createFilter();
-  const matches = (relative: string, directory = false) => filter(path.join(root, relative), { isDirectory: () => directory });
-  assert.equal(matches("dist", true), true);
-  assert.equal(matches("dist/main.js"), true);
-  assert.equal(matches("dist/.hidden.js"), true);
-  assert.equal(matches("dist/main.js.map"), false);
-  assert.equal(matches("assets/icon.png"), true);
-  assert.equal(matches("package.json"), true);
-  assert.equal(matches("src/main.ts"), false);
-  assert.equal(matches("node_modules", true), false);
-  // Directory shorthand is used by builder for extra resources and needs its .set inspection.
-  const extra = new FileMatcher(root, path.resolve("fixture-output"), (value: string) => value, ["assets"]).createFilter();
-  assert.equal(extra(path.join(root, "assets", "tray.png"), { isDirectory: () => false }), true);
+test("every native distribution entry point is disabled in the source-only app", () => {
+  const app = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  for (const name of ["dist", "dist:win", "release", "release:win"]) {
+    assert.equal(app.scripts[name], "node scripts/block-personal-release.mjs");
+  }
+  const blocker = fs.readFileSync(new URL("../scripts/block-personal-release.mjs", import.meta.url), "utf8");
+  assert.match(blocker, /source-only/);
+  assert.match(blocker, /process\.exitCode = 1/);
+  assert.doesNotMatch(blocker, /fetch\(|exec\(|spawn\(|require\(|writeFile|electron-builder/);
 });

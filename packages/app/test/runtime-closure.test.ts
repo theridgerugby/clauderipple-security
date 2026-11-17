@@ -3,20 +3,18 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 // @ts-ignore The build hook is executable ESM, with its exported pure staging/validation seams.
 import { copyRuntimeTree, reserveRuntimeStage, stageNativeRuntime, verifyRuntimeClosure } from "../scripts/stage-runtime.mjs";
 
 const checkout = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
-const require = createRequire(import.meta.url);
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-native-closure-"));
 const runtime = path.join(temporary, "resources", "clauderipple");
 const copiedRuntime = path.join(temporary, "actual-builder-resources", "clauderipple");
 test.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
 
-test("builder resolves a distinct resource staging directory for each supported native target", () => {
+test("dormant native release configuration reserves distinct Windows target staging paths", () => {
   const app = JSON.parse(fs.readFileSync(path.join(checkout, "packages/app/package.json"), "utf8"));
   assert.equal(app.build.beforePack, "scripts/stage-runtime.mjs");
   assert.equal(app.build.npmRebuild, false);
@@ -25,32 +23,25 @@ test("builder resolves a distinct resource staging directory for each supported 
     { from: "release-native/runtime/${os}/${arch}", to: "clauderipple" },
     { from: "release-native/runtime/${os}/${arch}/node_modules", to: "clauderipple/node_modules" },
   ]);
-  const { expandMacro } = require("app-builder-lib/out/util/macroExpander.js");
-  const { Arch } = require("builder-util");
-  assert.equal(Arch.x64, 1); assert.equal(Arch.arm64, 3);
+  assert.equal(app.scripts["release:win"], "node scripts/block-personal-release.mjs");
   const destinations = new Set<string>();
-  for (const target of ["mac", "win", "linux"]) for (const arch of ["x64", "arm64"]) {
-    const from = expandMacro(app.build.extraResources[0].from, arch, {}, { os: target });
-    assert.equal(from, `release-native/runtime/${target}/${arch}`);
+  for (const arch of ["x64", "arm64"]) {
+    const from = app.build.extraResources[0].from.replace("${os}", "win").replace("${arch}", arch);
+    assert.equal(from, `release-native/runtime/win/${arch}`);
     destinations.add(from);
   }
-  assert.equal(destinations.size, 6);
+  assert.equal(destinations.size, 2);
 });
 
-test("the real builder's extraResources copier preserves external dependencies and hidden mod manifests", async () => {
-  const app = JSON.parse(fs.readFileSync(path.join(checkout, "packages/app/package.json"), "utf8"));
-  const project = path.join(temporary, "builder-copy");
-  const staged = path.join(project, "release-native/runtime/mac/x64");
-  const resources = path.join(temporary, "builder-copied-resources");
+test("owned runtime copying preserves selected dependencies and hidden mod manifests", () => {
+  const project = path.join(temporary, "source-copy");
+  const staged = path.join(project, "release-native/runtime/win/x64");
+  const resources = path.join(temporary, "source-copied-resources");
   const files = ["node_modules/ws/package.json", "packages/remote/src/main.ts", "packages/mod/.claude-plugin/plugin.json", "packages/installers/install.ps1"];
   for (const file of files) { fs.mkdirSync(path.dirname(path.join(staged, file)), { recursive: true }); fs.writeFileSync(path.join(staged, file), "copy-fixture"); }
-  const { getFileMatchers, copyFiles } = require("app-builder-lib/out/fileMatcher.js");
-  const { expandMacro } = require("app-builder-lib/out/util/macroExpander.js");
-  const matchers = getFileMatchers(app.build, "extraResources", resources, {
-    defaultSrc: project, customBuildOptions: {}, globalOutDir: path.join(project, "release"),
-    macroExpander: (value: string) => expandMacro(value, "x64", {}, { os: "mac" }),
-  });
-  await copyFiles(matchers, null, false);
+  const destination = path.join(resources, "clauderipple");
+  copyRuntimeTree(staged, destination);
+  copyRuntimeTree(path.join(staged, "node_modules/ws"), path.join(destination, "node_modules/ws"), true);
   for (const file of files) assert.equal(fs.readFileSync(path.join(resources, "clauderipple", file), "utf8"), "copy-fixture");
 });
 
@@ -75,16 +66,8 @@ test("isolated native resources include complete sources, web assets, production
   assert.equal(verifyRuntimeClosure(runtime).dependencies.length, result.dependencies.length);
 });
 
-test("the complete actual builder-copied resource tree independently passes runtime closure", async () => {
-  const { getFileMatchers, copyFiles } = require("app-builder-lib/out/fileMatcher.js");
-  const matchers = getFileMatchers({ extraResources: [
-    { from: runtime, to: "clauderipple" },
-    { from: path.join(runtime, "node_modules"), to: "clauderipple/node_modules" },
-  ] }, "extraResources", path.dirname(copiedRuntime), {
-    defaultSrc: temporary, customBuildOptions: {}, globalOutDir: path.join(temporary, "unused-release"),
-    macroExpander: (value: string) => value,
-  });
-  await copyFiles(matchers, null, false);
+test("an independently copied source-only runtime retains complete dependency closure", () => {
+  fs.cpSync(runtime, copiedRuntime, { recursive: true, errorOnExist: true, force: false });
   assert.equal(verifyRuntimeClosure(copiedRuntime).dependencies.length, verifyRuntimeClosure(runtime).dependencies.length);
 });
 
@@ -104,7 +87,7 @@ test("trusted parent aliases use canonical containment without accepting links w
   finally { fs.unlinkSync(link); }
 });
 
-test("packaged CLI and Remote help run with no checkout ancestor, NODE_PATH or user state", () => {
+test("isolated CLI and Remote help run with no checkout ancestor, NODE_PATH or user state", () => {
   assert.equal(fs.existsSync(path.join(temporary, "node_modules")), false);
   const state = path.join(temporary, "empty-home");
   fs.mkdirSync(state);
