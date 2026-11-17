@@ -147,7 +147,9 @@ function windowsPrivateAcl(file: string, directory: boolean, verifyOnly: boolean
   if (!systemRoot || !path.win32.isAbsolute(systemRoot)) throw new Error("Windows system directory is unavailable for private storage");
   const executable = path.win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   const result = run(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_PRIVATE_ACL_SCRIPT], {
-    input: JSON.stringify({ path: file, directory, ...(verifyOnly ? { verifyOnly: true } : {}) }), encoding: "utf8", timeout: 10_000,
+    // Cold Windows PowerShell startup under antivirus/CI contention can exceed ten seconds.
+    // Keep a finite fail-closed deadline while allowing a slow, legitimate ACL verification.
+    input: JSON.stringify({ path: file, directory, ...(verifyOnly ? { verifyOnly: true } : {}) }), encoding: "utf8", timeout: 30_000,
     maxBuffer: 16 * 1024, windowsHide: true,
   });
   // Do not surface subprocess output: it may reflect paths and cannot establish successful ACLs.

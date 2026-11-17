@@ -15,6 +15,7 @@ test("Windows verify-only ACL checks use fixed code, data-only paths, and a dist
   verifyWindowsPrivateAcl(file, false, (executable, args, options) => {
     assert.equal(executable, "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
     assert.deepEqual(args, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_PRIVATE_ACL_SCRIPT]);
+    assert.equal(options.timeout, 30_000, "ACL check must remain fail-closed with a bounded Windows cold-start allowance");
     assert.deepEqual(JSON.parse(options.input), { path: file, directory: false, verifyOnly: true });
     assert.ok(args.every(argument => !argument.includes(file)));
     return { status: 0, stdout: "private-acl-verified" };
