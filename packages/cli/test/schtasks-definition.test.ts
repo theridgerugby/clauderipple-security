@@ -76,16 +76,16 @@ test("launcher waits on the router process alone, never with -Wait (#131)", () =
   const start = lines.findIndex(line => line.includes("Start-Process -FilePath"));
   assert.ok(start >= 0);
   assert.doesNotMatch(launcher, /-Wait\b/);
-  assert.match(lines[start]!, /-PassThru -RedirectStandardOutput \$out -RedirectStandardError \$err$/);
+  assert.match(lines[start]!, /-PassThru$/);
   assert.equal(lines[start + 1]!.trim(), "$null = $p.Handle");
   assert.equal(lines[start + 2]!.trim(), "$p.WaitForExit()");
   // Exit-code handling is unchanged: 0 ends the loop, anything else relaunches after the backoff.
   assert.equal(lines[start + 3]!.trim(), "if ($p.ExitCode -eq 0) { break }");
   assert.ok(lines.slice(start + 4, start + 8).some(line => line.includes("$quickFailures++")));
   assert.ok(lines.some(line => line.trim() === "Start-Sleep -Seconds $(if ($quickFailures -ge 5) { 60 } else { 2 })"));
-  // Redirection to the same log files as before.
-  assert.ok(lines.includes(`$out = '${path.join("C:\\home", "logs", "launcher.log")}'`));
-  assert.ok(lines.includes(`$err = '${path.join("C:\\home", "logs", "launcher.err.log")}'`));
+  // Personal-mode diagnostics stay in the router's bounded RAM history. Unexpected process
+  // stdout/stderr cannot be copied into persistent files by the task launcher.
+  assert.doesNotMatch(launcher, /RedirectStandard(?:Output|Error)|launcher\.err\.log|launcher\.log/);
 });
 
 // #159: a router that is alive but frozen was never restarted, because the launcher only waited for

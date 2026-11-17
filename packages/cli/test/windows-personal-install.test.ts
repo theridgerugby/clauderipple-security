@@ -168,6 +168,9 @@ test("hosted Windows installs, verifies, restarts and removes an isolated person
   assert.equal(tasks.taskRouterPid(task, { home }), after.pid);
   assert.deepEqual(fs.readFileSync(settings), settingsBytes);
   assert.equal(fs.readFileSync(path.join(home, "config.json")).includes(syntheticKey), false);
+  for (const name of ["launcher.log", "launcher.err.log"]) {
+    assert.equal(fs.existsSync(path.join(home, "logs", name)), false, `${name} must not persist unhandled process output`);
+  }
   for (const name of ["router.log", "requests.jsonl", "launcher.log", "launcher.err.log", "launcher-watchdog.log"]) {
     const file = path.join(home, "logs", name);
     if (fs.existsSync(file)) assert.equal(fs.readFileSync(file).includes(syntheticKey), false, `${name} must not contain the synthetic credential`);

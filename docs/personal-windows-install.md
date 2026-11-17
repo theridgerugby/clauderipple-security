@@ -144,6 +144,7 @@ With picker mode left off, the ordinary setup changes are:
 | Area | Change |
 | --- | --- |
 | Personal data directory | Owner-private local keys/state; DPAPI-protected provider-credential/config storage, bound to this Windows user |
+| Diagnostics | Bounded RAM history while the router runs; headless task and tray subprocesses do not write their stdout/stderr to durable log files |
 | Task Scheduler | An owned `ClaudeRippleRouter` logon task, using the interactive user with limited privileges |
 | Claude Code settings | Owned `HTTPS_PROXY` and `NODE_EXTRA_CA_CERTS` entries, with a backup and ownership record |
 | Local listeners | Loopback proxy plus authenticated, certificate-pinned local admin TLS; no privileged browser dashboard |

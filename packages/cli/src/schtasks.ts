@@ -144,7 +144,8 @@ function taskDefinitionMatchesExceptPriority(value: unknown, expected: { execute
  * The task runs a PowerShell launcher rather than node directly, for three reasons.
  *
  * 1. It pins CLAUDERIPPLE_HOME and any extra environment the installer recorded, which a scheduled
- *    task cannot carry on its own, and keeps output in a log file the way StandardOutPath does.
+ *    task cannot carry on its own. The personal Windows build leaves child stdout/stderr attached
+ *    to the headless task console: even an uncaught diagnostic cannot persist a research prompt.
  * 2. `Start-Process` detaches the router from the console: a task started from one inherits it, and
  *    closing that window sends a Ctrl+C — measured 2026-09-14, the router died with 0xC000013A the
  *    moment the installer's window closed.
@@ -179,8 +180,6 @@ export function renderLauncher(opts: { program: string; args: string[]; home: st
   return String.fromCharCode(0xFEFF) + [
     ...Object.entries(env).map(([k, v]) => `$env:${k} = ${ps(v)}`),
     `$routerArgs = @(${opts.args.map(quoteArg).join(", ")})`,
-    `$out = ${ps(path.join(logDir, "launcher.log"))}`,
-    `$err = ${ps(path.join(logDir, "launcher.err.log"))}`,
     "$quickFailures = 0",
     // A task registered before -Priority 4 starts this at BelowNormal, and Start-Process hands that
     // to the router (process-priority.ts has the measurement).
@@ -246,7 +245,9 @@ export function renderLauncher(opts: { program: string; args: string[]; home: st
     // for this task to end (restartWindowsRouter): each side waited on the other, so the router was not
     // restarted until the next logon. Waiting on the process handle alone returns when the router exits.
     // The handle must be held before WaitForExit so ExitCode stays readable after the process ends.
-    `  $p = Start-Process -FilePath ${ps(opts.program)} -ArgumentList $routerArgs -WindowStyle Hidden -PassThru -RedirectStandardOutput $out -RedirectStandardError $err`,
+    // No -RedirectStandardOutput/-RedirectStandardError: those persisted unhandled errors outside
+    // the router's RAM-only logger. The headless scheduled task console is not a disk sink.
+    `  $p = Start-Process -FilePath ${ps(opts.program)} -ArgumentList $routerArgs -WindowStyle Hidden -PassThru`,
     "  $null = $p.Handle",
     ...(watchdog ? [
       "  $adminPort = Get-AdminPort",
