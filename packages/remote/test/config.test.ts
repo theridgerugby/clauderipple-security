@@ -3,7 +3,16 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
-import { loadConfig, routerAdminUrl } from "../src/config.ts";
+import { loadConfig, routerAdminUrl, resolveBind } from "../src/config.ts";
+
+test("literal admin/Remote binds need no network-interface enumeration", t => {
+  t.mock.method(os, "networkInterfaces", () => { throw new Error("interface enumeration denied"); });
+  for (const bind of ["127.0.0.1", "::1", "localhost", "192.168.1.10"]) {
+    assert.deepEqual(resolveBind(bind), { listen: bind, advertise: bind, reachableFromPhone: bind === "192.168.1.10" });
+  }
+  assert.throws(() => resolveBind("lan"), /enumeration denied/);
+  assert.throws(() => resolveBind("0.0.0.0"), /enumeration denied/);
+});
 
 function tempDir(t: import("node:test").TestContext): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-config-"));

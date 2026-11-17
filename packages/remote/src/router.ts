@@ -2,6 +2,10 @@
 // picker, the proxy settings a spawned CLI needs, and per-session request records for the
 // mod's figures. It writes one thing, and only when the phone asks: the mod's host-wide effortAuto.
 import type { Effort, Figures, ProviderGroup, RippleLimit, RippleStatus } from "./protocol.ts";
+import { readAdminToken } from "../../router/src/admin-auth.ts";
+import { adminTlsFetch, validateAdminPath } from "../../router/src/admin-transport-client.ts";
+import { readAdminEndpoint, readAdminTlsIdentity } from "../../router/src/admin-transport-state.ts";
+import { homeDir } from "../../router/src/config.ts";
 
 const EFFORTS: readonly Effort[] = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 const LABELS: Record<string, string> = {
@@ -28,33 +32,61 @@ export interface RouterStatus { ok: boolean; problem?: string; proxyEnv: Record<
 /** The router's `GET`/409 body for mod settings: the settings and the revision they were read at. */
 interface ModSettingsBody { settings?: unknown; revision?: number }
 
-export type Fetch = (url: string, init?: { signal?: AbortSignal; method?: string; headers?: Record<string, string>; body?: string }) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
+export type Fetch = (url: string, init?: { signal?: AbortSignal; method?: string; headers?: Record<string, string>; body?: string; redirect?: "error" }) => Promise<{ ok: boolean; status: number; body?: { cancel(): Promise<void> } | null; json(): Promise<unknown> }>;
 
 const toEffort = (s: string | undefined): Effort | null => (s && (EFFORTS as readonly string[]).includes(s) ? (s as Effort) : null);
 const base = (id: string): string => id.split("@")[0]!.replace(/-\d{8}$/, "");
 
 export class RouterClient {
   private adminUrl: string;
-  private fetch: Fetch;
+  private fetch: Fetch | undefined;
+  private adminHome: string;
 
-  constructor(adminUrl: string, fetchImpl: Fetch = globalThis.fetch as unknown as Fetch) {
-    this.adminUrl = adminUrl.replace(/\/$/, "");
+  constructor(adminUrl: string, fetchImpl?: Fetch, adminHome = homeDir()) {
+    const url = new URL(adminUrl);
+    if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" ||
+        url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
+      throw new Error("router admin URL must be a literal loopback HTTP origin");
+    }
+    this.adminUrl = url.origin;
     this.fetch = fetchImpl;
+    this.adminHome = adminHome;
+  }
+
+  private request(path: string, init: Parameters<Fetch>[1] = {}): ReturnType<Fetch> {
+    validateAdminPath(path);
+    // An explicitly injected transport is a unit-test seam; production never uses ambient fetch.
+    if (this.fetch) return this.fetch(this.adminUrl + path, init);
+    const endpoint = readAdminEndpoint(this.adminHome);
+    const identity = readAdminTlsIdentity(this.adminHome);
+    const token = readAdminToken(this.adminHome);
+    if (!endpoint || !identity || !token || endpoint.publicPort !== Number(new URL(this.adminUrl).port || 80)) {
+      throw new Error("private admin transport state is unavailable or mismatched; start the updated router");
+    }
+    return adminTlsFetch(endpoint, identity, token, path, init);
   }
 
   private async get<T>(path: string): Promise<T> {
-    const res = await this.fetch(this.adminUrl + path, { signal: AbortSignal.timeout(4000) });
-    if (!res.ok) throw new Error(`router ${path}: HTTP ${res.status}`);
-    return (await res.json()) as T;
+    const res = await this.request(path, { redirect: "error", signal: AbortSignal.timeout(4000) });
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {});
+      throw new Error(`router ${path}: HTTP ${res.status}`);
+    }
+    try { return (await res.json()) as T; }
+    catch {
+      await res.body?.cancel().catch(() => {});
+      throw new Error(`router ${path}: invalid JSON response`);
+    }
   }
 
   private async put<T>(path: string, body: unknown): Promise<{ ok: boolean; status: number; data: T }> {
-    const res = await this.fetch(this.adminUrl + path, {
-      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(4000),
+    const res = await this.request(path, {
+      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body), redirect: "error", signal: AbortSignal.timeout(4000),
     });
     let data: T;
     // A 409 carries the snapshot to retry with; anything else may carry a plain-text body.
-    try { data = (await res.json()) as T; } catch { data = undefined as T; }
+    try { data = (await res.json()) as T; }
+    catch { await res.body?.cancel().catch(() => {}); data = undefined as T; }
     return { ok: res.ok, status: res.status, data };
   }
 

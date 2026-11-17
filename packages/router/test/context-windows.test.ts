@@ -10,7 +10,7 @@ import { readCompactSettings, syncCompactWindows } from "../../cli/src/compact-w
 import { claimsOf, readOwners } from "../../cli/src/owners.ts";
 import { removeProxyEnv } from "../../cli/src/settings.ts";
 import { readAutoCompactWindow, writeAutoCompactWindow } from "../src/mod-settings.ts";
-import { startAdmin } from "../src/admin.ts";
+import { startAdmin, fetch } from "./admin-client.ts";
 import { Logger } from "../src/log.ts";
 import { RequestLog } from "../src/requestlog.ts";
 

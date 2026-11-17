@@ -155,7 +155,7 @@ test("Astra figures use the resolved window over a cached million-token SDK/nati
   let target = "gpt-6-astra";
   let provider = "chatgpt";
   let body: unknown = {};
-  const router = new RouterClient("http://fixture.invalid", async url => ({ ok: true, status: 200, json: async () => {
+  const router = new RouterClient("http://127.0.0.1:8792", async url => ({ ok: true, status: 200, json: async () => {
     if (new URL(url).pathname === "/api/context-windows") return body;
     if (new URL(url).pathname === "/api/requests") return { requests: [{ source, target, provider, at: "2026-10-25T00:00:00Z", ok: true, status: 200, usage: { input: 8400, cached: 250000 } }] };
     return {};

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, type Config, type ChatGptProvider } from "../src/config.ts";
-import { startAdmin } from "../src/admin.ts";
+import { startAdmin, fetch } from "./admin-client.ts";
 import { injectBootstrap } from "../src/bootstrap.ts";
 import { chatPickerModels, injectPickerModels } from "../src/picker.ts";
 import { ChatGptAdapter } from "../src/providers/chatgpt/index.ts";

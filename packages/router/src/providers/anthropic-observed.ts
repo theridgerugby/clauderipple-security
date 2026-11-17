@@ -4,6 +4,8 @@
 // Code-tab request happens to pass through. No diagnostics or listing surface exists.
 
 import fs from "node:fs";
+import { readPrivateFile } from "../private-file.ts";
+import { writeJsonAtomic } from "../locked-file.ts";
 import { parseClaudeCliVersion } from "./claude-cli-version.ts";
 
 export const OBSERVED_CLAUDE_CODE_TTL_MS = 12 * 60 * 60 * 1_000;
@@ -57,11 +59,16 @@ export class ObservedClaudeCodeAuth {
     this.file = file ?? null;
     if (this.file) {
       try {
-        const raw = JSON.parse(fs.readFileSync(this.file, "utf8")) as ObservedClaudeCodeAuthSnapshot;
-        if (raw && typeof raw.authorization === "string" && raw.headers && typeof raw.observedAt === "number") {
-          this.snapshot = { authorization: raw.authorization, headers: Object.freeze({ ...raw.headers }), observedAt: raw.observedAt };
+        const raw = JSON.parse(readPrivateFile(this.file, 64 * 1024).toString("utf8")) as ObservedClaudeCodeAuthSnapshot;
+        if (raw && typeof raw.authorization === "string" && bearerToken(raw.authorization) && raw.headers &&
+          !Array.isArray(raw.headers) && typeof raw.observedAt === "number" && Number.isFinite(raw.observedAt)) {
+          const headers = Object.fromEntries(Object.entries(raw.headers).filter(([name, value]) =>
+            isObservedHeader(name) && typeof value === "string" && !/[\r\n\0]/.test(value) &&
+            (name.toLowerCase() !== "authorization" || value === raw.authorization)));
+          if (!Object.keys(headers).some(name => name.toLowerCase() === "authorization")) headers.authorization = raw.authorization;
+          this.snapshot = { authorization: raw.authorization, headers: Object.freeze(headers), observedAt: raw.observedAt };
           this.persistedAt = raw.observedAt;
-          this.recordCliVersion(raw.headers, raw.observedAt);
+          this.recordCliVersion(headers, raw.observedAt);
         }
       } catch {
         /* no file yet or unreadable: start empty */
@@ -85,9 +92,7 @@ export class ObservedClaudeCodeAuth {
   private persist(): void {
     if (!this.file || !this.snapshot) return;
     try {
-      const tmp = `${this.file}.tmp-${process.pid}`;
-      fs.writeFileSync(tmp, JSON.stringify(this.snapshot), { mode: 0o600 });
-      fs.renameSync(tmp, this.file);
+      writeJsonAtomic(this.file, this.snapshot);
       this.persistedAt = this.snapshot.observedAt;
     } catch {
       /* best effort */

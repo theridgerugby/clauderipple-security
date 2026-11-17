@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { startAdmin } from "../src/admin.ts";
-import { AutoUpdater, type AutoUpdateStatus } from "../src/autoupdate.ts";
+import { startAdmin, fetch } from "./admin-client.ts";
+import { AutoUpdater, autoUpdateEnabled, type AutoUpdateStatus } from "../src/autoupdate.ts";
 import { ConfigStore, DEFAULTS, type Config } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
 import { RequestLog } from "../src/requestlog.ts";
@@ -27,7 +27,7 @@ test("status, hot config and manual POST share the router's automatic-update coo
   const check = { current: "1.0.0", latest: "1.1.0", newer: true, kind: "npm" };
   let launches = 0;
   const runCli = async () => ({ ok: true, output: JSON.stringify(check) });
-  const updater = new AutoUpdater({ home, version: "1.0.0", enabled: () => store.get().autoUpdate !== false,
+  const updater = new AutoUpdater({ home, version: "1.0.0", enabled: () => autoUpdateEnabled(store.get()),
     activity: () => ({ inFlight: 0 }), log, runCli,
     startCliDetached: () => { launches++; }, alive: () => false,
   });
@@ -38,9 +38,12 @@ test("status, hot config and manual POST share the router's automatic-update coo
   try {
     const url = `http://127.0.0.1:${admin.port}`;
     const status = async () => ((await (await fetch(`${url}/api/status`)).json()) as { autoUpdate: AutoUpdateStatus }).autoUpdate;
-    assert.equal((await status()).enabled, true);
+    assert.equal((await status()).enabled, false);
     const config = (await (await fetch(`${url}/api/config`)).json()) as Config;
-    const put = await fetch(`${url}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...config, autoUpdate: false }) });
+    const optIn = await fetch(`${url}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...config, autoUpdate: true }) });
+    assert.equal(optIn.status, 200); assert.equal((await status()).enabled, true);
+    const updatedConfig = (await (await fetch(`${url}/api/config`)).json()) as Config;
+    const put = await fetch(`${url}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...updatedConfig, autoUpdate: false }) });
     assert.equal(put.status, 200); assert.equal((await status()).enabled, false);
     await fetch(`${url}/api/update`);
     assert.equal((await status()).available, "1.1.0");

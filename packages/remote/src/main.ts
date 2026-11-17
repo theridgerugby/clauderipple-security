@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ripple-host: runs Claude Code sessions on this machine for the phone.
-//   ripple-host [--bind 127.0.0.1|tailscale|lan|0.0.0.0|<ip>] [--port 8797] [--relay <https url>|off] [--new-token]
+//   ripple-host [--bind 127.0.0.1|tailscale|lan|0.0.0.0|<ip>] [--port 8797] [--relay <https url>|off]
 //   ripple-host install [same options] [--print]   launchd agent com.clauderipple.host (--print: only show the plist)
 //   ripple-host uninstall                           stop and remove the agent
 //   ripple-host status                              agent state and health (prints no secret)
@@ -18,7 +18,8 @@ import { sdkQuery as query } from "./sdk-launcher.ts";
 import qrcode from "qrcode-generator";
 import nacl from "tweetnacl";
 import { WebSocket } from "ws";
-import { loadConfig, newToken, normalizeRelay, pairingUrl, relayPairingUrl, remoteHome, resolveBind, saveConfig } from "./config.ts";
+import { DIRECT_PHONE_DISABLED, PHONE_REPAIR_REQUIRED, loadConfig, normalizeRelay, relayPairingUrl, remoteHome, resolveBind, saveConfig } from "./config.ts";
+import { ensurePhonePairingSecurity } from "./phone-auth-migration.ts";
 import type { HostConfig } from "./config.ts";
 import { MacAway } from "./away.ts";
 import { toB64u } from "./e2ee.ts";
@@ -79,8 +80,15 @@ function qr(text: string): string {
   return lines.join("\n");
 }
 
-/** --bind / --port / --relay / --new-token given on the command line are remembered. */
+function rejectLegacyTokenRotation(): void {
+  if (process.argv.includes("--new-token")) {
+    throw new Error("--new-token is disabled. Rotate the phone pairing key through the running host's authenticated Phone settings, then pair each phone again.");
+  }
+}
+
+/** --bind / --port / --relay given on the command line are remembered. */
 function configFromArgs(dir: string): HostConfig {
+  rejectLegacyTokenRotation();
   const cfg = loadConfig(dir);
   const bind = arg("bind");
   const port = arg("port");
@@ -89,24 +97,17 @@ function configFromArgs(dir: string): HostConfig {
   if (port) cfg.port = Number(port);
   if (relay === "off") delete cfg.relay;
   else if (relay) cfg.relay = normalizeRelay(relay);
-  if (process.argv.includes("--new-token")) cfg.token = newToken();
-  if (bind || port || relay || process.argv.includes("--new-token")) saveConfig(cfg, dir);
+  if (cfg.relay) cfg.relay = normalizeRelay(cfg.relay);
+  if (bind || port || relay) saveConfig(cfg, dir);
   return cfg;
 }
 
 function printPairing(cfg: HostConfig, dir: string): void {
-  const where = resolveBind(cfg.bind);
-  let url: string;
-  if (cfg.relay) {
-    // The fragment (token, server id, host key) never leaves the phone; the relay only sees the page request.
-    url = relayPairingUrl(cfg.relay, cfg.serverId, toB64u(loadHostKey(dir, nacl).publicKey), cfg.token);
-    out(`\nThrough the relay ${cfg.relay} (works from anywhere; notifications need this https address).\n`);
-  } else {
-    url = pairingUrl(where.advertise, cfg.port, cfg.token);
-    out(where.reachableFromPhone
-      ? "\nDirect http: works on this network only, and without notifications (they need https: use --relay).\n"
-      : "\nOnly this computer can reach it. For the phone, use --relay <url> (anywhere) or --bind lan / tailscale (same network).\n");
-  }
+  if (!cfg.relay) { out(`\n${DIRECT_PHONE_DISABLED}\n`); return; }
+  if (cfg.pairingSecurityVersion !== 2) { out(`\n${PHONE_REPAIR_REQUIRED}\n`); return; }
+  // The fragment (token, server id, host key) never leaves the phone; the relay only sees the page request.
+  const url = relayPairingUrl(cfg.relay, cfg.serverId, toB64u(loadHostKey(dir, nacl).publicKey), cfg.token);
+  out(`\nThrough the HTTPS relay ${cfg.relay}; phone frames are end-to-end encrypted.\n`);
   out(`\nScan with the phone's camera (the link carries the pairing key — do not share it):\n\n${qr(url)}\n\n${url}\n\n`);
 }
 
@@ -239,6 +240,13 @@ async function runHost(): Promise<void> {
       for (const id of notifier.devices()) notifier.unsubscribe(id);
       for (const id of expoNotifier.devices()) expoNotifier.unsubscribe(id);
     },
+    beforeLocalControl: () => {
+      const pairingSecurity = ensurePhonePairingSecurity(dir);
+      if (cfg.token !== pairingSecurity.token) host.rotateToken(pairingSecurity.token);
+      cfg.token = pairingSecurity.token;
+      cfg.pairingSecurityVersion = pairingSecurity.pairingSecurityVersion;
+      if (pairingSecurity.rotated) log("Phone pairing security was upgraded; show a new pairing QR and pair every phone again.");
+    },
     local: new LocalControl({
       dir, config: cfg, version: VERSION, hostPublicKey: toB64u(loadHostKey(dir, nacl).publicKey),
       phones: () => server?.phones() ?? [],
@@ -309,13 +317,13 @@ async function status(): Promise<void> {
 async function installCmd(): Promise<void> {
   const dir = remoteHome();
   // Read the running host's old port before command-line options persist a replacement.
-  if (process.platform === "win32" && !process.argv.includes("--print")) await controlShutdown(dir);
+  const stopped = process.platform === "win32" && !process.argv.includes("--print") ? await controlShutdown(dir) : undefined;
   const cfg = process.argv.includes("--print") ? loadConfig(dir, false) : configFromArgs(dir);
   // The CLI the host will start; also what a person is told to run when it has no login.
   const claudePath = findClaude(cfg.claudePath);
   const spec = hostSpec(claudePath);
   if (process.argv.includes("--print")) { out(renderService(spec)); return; }
-  for (const line of await installService(spec)) out(`${line}\n`);
+  for (const line of await installService(spec, stopped ? { shutdown: async () => stopped.assertStillStopped() } : {})) out(`${line}\n`);
   out(`Pair the phone: clauderipple remote pair\n`);
   // The host starts Claude Code through the Agent SDK and passes no credential of its own, so a
   // machine where the CLI was never logged in fails on every turn (issue #71). Say so now; the
@@ -350,6 +358,8 @@ async function refreshCmd(): Promise<void> {
 
 async function main(): Promise<void> {
   if (process.argv.slice(2).some(arg => arg === "--help" || arg === "-h")) { out(REMOTE_USAGE); return; }
+  // Refuse before install's authenticated shutdown or any state initialization, not just saveConfig.
+  rejectLegacyTokenRotation();
   const sub = process.argv[2] && !process.argv[2].startsWith("--") ? process.argv[2] : null;
   switch (sub) {
     case null: return runHost();

@@ -4,45 +4,51 @@
 # secrets, so nothing here may need one. The tests must keep to temporary homes: a runner is a
 # throwaway VM, but the same tests also run on a maintainer's Mac next to the live install.
 #
-# Linux and Windows do not block a merge yet (continue-on-error) — the suite has only been run on
-# macOS so far. Drop that once they pass.
-
 name: CI
 
 on:
   pull_request:
   push:
     branches: [main]
+  workflow_call:
+  # A maintainer can request the same mandatory three-OS native gates without publishing.
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.os != 'macos-latest' }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
     env:
-      # The tray's Electron is only a type dependency at build time; its ~270MB binary is not needed.
+      # Dependency hooks remain disabled. Only the pinned Electron downloader below is invoked.
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
           node-version: 24
           package-manager-cache: false
 
-      - run: npm ci
+      - run: npm ci --ignore-scripts
+      - run: npm audit --audit-level=low
+      - name: Fetch the pinned Electron runtime
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: ""
+        run: node node_modules/electron/install.js
       - run: npm run typecheck
       # The mod's TSX needs Claude's engine types and its tests need a local Claude installation,
       # neither of which belongs in CI for a fork's code (G-D12). This parses the mod, resolves
@@ -50,3 +56,10 @@ jobs:
       # maintainer step on a machine that has the engine.
       - run: npm run check:mod
       - run: npm test
+      - run: npm run build
+      - name: Native Electron boundary tests (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run test:native --workspace @clauderipple/app
+      - name: Native Electron boundary tests (Windows and macOS)
+        if: runner.os != 'Linux'
+        run: npm run test:native --workspace @clauderipple/app

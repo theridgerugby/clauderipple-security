@@ -7,7 +7,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
-import { startAdmin } from "../src/admin.ts";
+import { startAdmin, adminTestAuthHeaders, adminTestTlsOptions } from "./admin-client.ts";
 import { CertStore } from "../src/certs.ts";
 import { DEFAULTS, type Config } from "../src/config.ts";
 import { UpstreamHealth } from "../src/health.ts";
@@ -112,7 +112,8 @@ async function rig() {
   await proxy.listen();
   const admin = await startAdmin({ config: () => cfg, configFile: path.join(home, "config.json"), log, requests, stats: () => proxy.stats, health: () => 0, version: "test", compactPick: (session, model) => model === null ? proxy.compactPicks.clear(session) : proxy.compactPicks.set(session, model) });
   const pick = (body: unknown, headers: Record<string, string> = {}) => new Promise<{ status: number }>((resolve, reject) => {
-    const req = http.request(`http://127.0.0.1:${admin.port}/api/compact-pick`, { method: "POST", headers: { "content-type": "application/json", ...headers } }, res => {
+    const base = `http://127.0.0.1:${admin.port}`;
+    const req = https.request({ ...adminTestTlsOptions(base), path: "/api/compact-pick", method: "POST", headers: { ...adminTestAuthHeaders(base), "content-type": "application/json", ...headers } }, res => {
       res.resume(); res.once("end", () => resolve({ status: res.statusCode! }));
     });
     req.once("error", reject); req.end(JSON.stringify(body));

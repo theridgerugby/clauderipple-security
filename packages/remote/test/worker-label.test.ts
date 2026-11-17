@@ -60,7 +60,7 @@ test("account names come from the router's worker files by provider and pin", as
     { name: "a", provider: "anthropic", account: "mambo20211", accountPin: "f952fac6" },
     { name: "b", provider: "anthropic" },
   ] };
-  const client = new RouterClient("http://x", async () => ({ ok: true, status: 200, json: async () => body }));
+  const client = new RouterClient("http://127.0.0.1:8792", async () => ({ ok: true, status: 200, json: async () => body }));
   assert.deepEqual(await client.workerAccounts(), ACCOUNTS);
 });
 

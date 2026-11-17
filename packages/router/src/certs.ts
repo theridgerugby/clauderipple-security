@@ -8,6 +8,8 @@ import fs from "node:fs";
 import path from "node:path";
 import tls from "node:tls";
 import { createLeaf } from "./x509.ts";
+import { ensurePrivateDirectory, readPrivateFile } from "./private-file.ts";
+import { withFileLock, writePrivateFileAtomic } from "./locked-file.ts";
 
 export class CertStore {
   private readonly home: string;
@@ -39,29 +41,32 @@ export class CertStore {
   private leafFor(host: string): { cert: Buffer; key: Buffer } {
     if (!/^[a-z0-9.-]+$/i.test(host)) throw new Error(`refusing to mint a certificate for "${host}"`);
     const dir = path.join(this.home, "certs");
+    ensurePrivateDirectory(dir);
     const certFile = path.join(dir, `${host}.pem`);
     const keyFile = path.join(dir, `${host}.key`);
-    if (fs.existsSync(certFile) && fs.existsSync(keyFile)) {
-      const cert = fs.readFileSync(certFile);
-      // re-mint when within 30 days of expiry
-      try {
-        const notAfter = new crypto.X509Certificate(cert).validTo;
-        if (Date.parse(notAfter) - Date.now() > 30 * 86400_000) return { cert, key: fs.readFileSync(keyFile) };
-      } catch {
-        /* unparseable cache entry: fall through and mint a fresh one */
+    return withFileLock(keyFile, () => {
+      if (fs.existsSync(certFile) && fs.existsSync(keyFile)) {
+        const cert = readPrivateFile(certFile, 64 * 1024);
+        const key = readPrivateFile(keyFile, 64 * 1024);
+        // re-mint when within 30 days of expiry
+        try {
+          const notAfter = new crypto.X509Certificate(cert).validTo;
+          if (Date.parse(notAfter) - Date.now() > 30 * 86400_000) return { cert, key };
+        } catch {
+          /* unparseable cache entry: fall through and mint a fresh one */
+        }
       }
-    }
-    const caPem = path.join(this.home, "ca.pem");
-    const caKey = path.join(this.home, "ca.key");
-    if (!fs.existsSync(caKey)) throw new Error(`CA key missing (${caKey}); re-run the installer`);
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const leaf = createLeaf({
-      host,
-      caCertPem: fs.readFileSync(caPem, "utf8"),
-      caKeyPem: fs.readFileSync(caKey, "utf8"),
+      const caPem = path.join(this.home, "ca.pem");
+      const caKey = path.join(this.home, "ca.key");
+      if (!fs.existsSync(caKey)) throw new Error(`CA key missing (${caKey}); re-run the installer`);
+      const leaf = createLeaf({
+        host,
+        caCertPem: readPrivateFile(caPem, 64 * 1024).toString("utf8"),
+        caKeyPem: readPrivateFile(caKey, 64 * 1024).toString("utf8"),
+      });
+      writePrivateFileAtomic(certFile, leaf.certPem);
+      writePrivateFileAtomic(keyFile, leaf.keyPem);
+      return { cert: Buffer.from(leaf.certPem), key: Buffer.from(leaf.keyPem) };
     });
-    fs.writeFileSync(certFile, leaf.certPem);
-    fs.writeFileSync(keyFile, leaf.keyPem, { mode: 0o600 });
-    return { cert: Buffer.from(leaf.certPem), key: Buffer.from(leaf.keyPem) };
   }
 }

@@ -6,6 +6,7 @@
 // Exit codes: 0 clean, 2 bad config/certs, 75 upstream unreachable (supervisor should restart).
 
 import fs from "node:fs";
+import { readPrivateFile } from "./private-file.ts";
 import path from "node:path";
 import { codexEnabled, followCodexCache, writeCodexCatalog } from "../../cli/src/codex.ts";
 import { ingressModels } from "./ingress/models.ts";
@@ -14,7 +15,7 @@ import { targetWarnings } from "./targets.ts";
 import { ensureInstallationId } from "./installation-id.ts";
 import { AwakeController, execRunner, type Activity } from "./awake.ts";
 import { TetherController } from "./tether.ts";
-import { AutoUpdater } from "./autoupdate.ts";
+import { AutoUpdater, autoUpdateEnabled } from "./autoupdate.ts";
 import { runCli, startCliDetached } from "./cli-control.ts";
 import { powerPlatform } from "./power.ts";
 import { defaultAgentDir, PinnedAgentSync } from "./agents.ts";
@@ -98,7 +99,7 @@ const certs = new CertStore(home);
 // Prices come from the AA cache before the log replays unflushed hours (openRequestLog), so those are priced too.
 const requests = openRequestLog(home);
 try {
-  certs.register(cfg0.upstream, fs.readFileSync(path.join(home, "leaf.pem")), fs.readFileSync(path.join(home, "leaf.key")));
+  certs.register(cfg0.upstream, readPrivateFile(path.join(home, "leaf.pem"), 64 * 1024), readPrivateFile(path.join(home, "leaf.key"), 64 * 1024));
 } catch (e) {
   log.error(`cannot load leaf.pem/leaf.key from ${home}: ${(e as Error).message}. Run the installer first.`);
   process.exit(2);
@@ -163,7 +164,7 @@ const activity = (): Activity => {
   };
 };
 const autoUpdater = new AutoUpdater({
-  home, version: VERSION, enabled: () => store.get().autoUpdate !== false,
+  home, version: VERSION, enabled: () => autoUpdateEnabled(store.get()),
   activity, log, runCli, startCliDetached,
 });
 const awake = new AwakeController({

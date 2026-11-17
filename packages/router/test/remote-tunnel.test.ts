@@ -8,7 +8,7 @@ import { PassThrough } from "node:stream";
 import { DEFAULTS, validate, type Config } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
 import { RequestLog } from "../src/requestlog.ts";
-import { startAdmin } from "../src/admin.ts";
+import { startAdmin, fetch } from "./admin-client.ts";
 import { SSH_MISSING, hostProblem } from "../src/remote-host.ts";
 import { RemoteTunnels, tunnelArgs, type TunnelChild, type TunnelStatus } from "../src/remote-tunnel.ts";
 

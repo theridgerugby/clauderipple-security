@@ -8,7 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { CompatibleCaps } from "./compat.ts";
-import { tightenToOwnerOnly } from "./locked-file.ts";
+import { readPrivateFile } from "./private-file.ts";
 import { PRESETS } from "./presets.ts";
 import { hostProblem, portProblem } from "./remote-host.ts";
 import { ingressOnly } from "./targets.ts";
@@ -475,7 +475,7 @@ export function webSearchNative(cfg: Pick<Config, "webSearch">): boolean {
 }
 
 export type Config = {
-  /** Install new versions while idle. Omitted means enabled; hot-reloaded. */
+  /** Install new versions while idle only after explicit opt-in; hot-reloaded. */
   autoUpdate?: boolean;
   /**
    * Windows only. Absent means "normal". "below-normal" is what Task Scheduler gave the router
@@ -832,6 +832,11 @@ function foldSplitProviders(c: Config): Config {
   };
 }
 
+/** The effective config shape used by both live readers and revision-bound admin snapshots. */
+export function normalizeConfig(parsed: Partial<Config>): Config {
+  return foldSplitProviders(merge(DEFAULTS, parsed));
+}
+
 export function validate(c: Config): string[] {
   const errors: string[] = [];
   if (c.autoUpdate !== undefined && typeof c.autoUpdate !== "boolean") errors.push("autoUpdate must be true or false");
@@ -1059,7 +1064,7 @@ export function validate(c: Config): string[] {
 
 export class ConfigStore {
   private current: Config = DEFAULTS;
-  private mtimeMs = -1;
+  private fingerprint = "";
   private readonly file: string;
   private readonly onChange: ((c: Config, errors: string[]) => void) | undefined;
 
@@ -1078,27 +1083,29 @@ export class ConfigStore {
   private reload(initial: boolean): void {
     let st: fs.Stats;
     try {
-      st = fs.statSync(this.file);
+      st = fs.lstatSync(this.file);
     } catch {
       if (initial) this.onChange?.(this.current, [`no config at ${this.file}; using defaults`]);
-      this.mtimeMs = -1;
+      this.fingerprint = "";
       return;
     }
-    // Before the mtime check: a chmod leaves the mtime alone, so a looser mode is seen on every read.
-    tightenToOwnerOnly(this.file, st.mode);
-    if (st.mtimeMs === this.mtimeMs) return;
+    // Include identity and metadata: replacing a file or weakening its mode must not reuse a
+    // snapshot solely because an editor preserved mtime. The private reader fails closed.
+    const fingerprint = [st.dev, st.ino, st.ctimeMs, st.mtimeMs, st.size, st.mode].join(":");
+    if (fingerprint === this.fingerprint) return;
     try {
-      const parsed = JSON.parse(fs.readFileSync(this.file, "utf8")) as Partial<Config>;
+      const parsed = JSON.parse(readPrivateFile(this.file).toString("utf8")) as Partial<Config>;
       // Folded before validation, because the old three-provider shape is what is on disk and the
       // references it carries have to be the ones that get checked.
-      const next = foldSplitProviders(merge(DEFAULTS, parsed));
+      const next = normalizeConfig(parsed);
       const errors = validate(next);
       if (errors.length === 0 || initial) this.current = next;
-      this.mtimeMs = st.mtimeMs;
+      this.fingerprint = fingerprint;
       this.onChange?.(this.current, errors);
-    } catch (e) {
-      this.mtimeMs = st.mtimeMs; // do not re-parse a broken file on every request
-      this.onChange?.(this.current, [`config parse error: ${(e as Error).message}`]);
+    } catch {
+      this.fingerprint = fingerprint; // do not re-parse a broken file on every request
+      // JSON.parse diagnostics may quote a provider key from malformed input.
+      this.onChange?.(this.current, ["config is unreadable, insecure, or invalid JSON; previous configuration retained"]);
     }
   }
 }

@@ -15,6 +15,7 @@ import type { ClientMsg, DiffView, HostMsg } from "../src/protocol.ts";
 import { HostServer } from "../src/server.ts";
 import { Sessions } from "../src/sessions.ts";
 import type { QueryFn, SdkUserMessage } from "../src/sessions.ts";
+import { peerFixtureUrl } from "./peer-fixture.ts";
 
 const webDir = fileURLToPath(new URL("../web", import.meta.url));
 const token = "remote-test-token-not-a-real-pairing-token";
@@ -333,7 +334,7 @@ test("the diff op answers through the server for the session's own folder", asyn
   await server.listen();
   const id = await sessions.create({ clientMsgId: "diff-1", cwd, model: "claude-test", effort: "high", text: "ping" });
 
-  const socket = new WebSocket(`ws://127.0.0.1:${server.address().port}/ws`);
+  const socket = new WebSocket(await peerFixtureUrl(t, server));
   sockets.push(socket);
   socket.on("message", data => frames.push(JSON.parse(String(data)) as HostMsg));
   await new Promise<void>(resolve => socket.once("open", () => resolve()));

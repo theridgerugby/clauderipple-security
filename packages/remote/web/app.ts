@@ -12,8 +12,8 @@ import { browserPushEnv, currentSubscription, enablePush, sameKey } from "./noti
 import { adopt, autoSendable, createSend, hostIdentity, loadOutbox, named, outboxStart, preserved, refuse, requeue, writeOutbox } from "./outbox.ts";
 import type { OutboxEntry, OutboxStart, PreservedItem } from "./outbox.ts";
 import { pushAvailability } from "./pushstate.ts";
-import { RelaySocket, browserNacl, relayClientUrl } from "./secure.ts";
-import type { RawSocket, RelayPairing } from "./secure.ts";
+import { RelaySocket, browserNacl, relayClientUrl, secureRelayPairing } from "./secure.ts";
+import type { RawSocket } from "./secure.ts";
 import { PING_MS, SLOW_PING_MS, defaultEffort } from "../src/protocol.ts";
 import { mergeEvents, reduce, timelineItems, workerFor, workerPrompt, workerConversationItems } from "./timeline.ts";
 import type { TimelineItem, SessionView } from "./timeline.ts";
@@ -81,10 +81,10 @@ function savePairing(fragment: string): boolean {
   const hash = new URLSearchParams(fragment.slice(1));
   const paired = hash.get("pair");
   if (!paired) return false;
+  const relay = secureRelayPairing({ url: location.origin, server: hash.get("server"), hpk: hash.get("hpk") }, location.origin);
+  if (!relay) return false;
   store.set("rr.token", paired);
-  // A relay pairing names the host (server id) and its key; a direct one does not, and replaces any relay pairing.
-  const server = hash.get("server"), hpk = hash.get("hpk");
-  store.set("rr.relay", server && hpk ? ({ url: location.origin, server, hpk } satisfies RelayPairing) : null);
+  store.set("rr.relay", relay);
   return true;
 }
 
@@ -189,21 +189,26 @@ export class App {
 
   // ---- boot --------------------------------------------------------------------------------
 
-  /** Resolves once the pairing is known and the first screen is up; awaiting only the token fingerprint. */
+  /** Resolves once an HTTPS relay pairing is verified and the first screen is up. */
   async start(): Promise<void> {
-    if (savePairing(location.hash)) history.replaceState(null, "", location.pathname);
+    savePairing(location.hash);
+    if (new URLSearchParams(location.hash.replace(/^#/, "")).has("pair")) history.replaceState(null, "", location.pathname);
     const token = store.get<string | null>("rr.token", null);
     if (!token) { this.screen = { name: "pair" }; this.bind(); this.render(); return; }
+    const relay = secureRelayPairing(store.get<unknown>("rr.relay", null), location.origin);
+    if (!relay) {
+      // Do not open any socket, read/overwrite an old outbox, or reuse a direct pairing token.
+      // The user can recover old messages explicitly after scanning a new HTTPS relay QR.
+      this.screen = { name: "pair" }; this.bind(); this.render(); this.toast(t("pair.secureRequired")); return;
+    }
     this.screen = this.routeFromHash();
     window.addEventListener("hashchange", () => { this.rememberPosition(); this.screen = this.routeFromHash(); this.workerPath = []; this.ui.sheet = null; this.render(); this.attachCurrent(); });
     const clientId = store.get<string>("rr.clientId", "") || uid();
     store.set("rr.clientId", clientId);
-    // Served by the relay → through the relay, encrypted end to end; served by the host itself → straight to it.
+    // Every connection uses the paired relay's host-authenticated encrypted channel.
     // The same pairing names the computer whose unsent messages this phone keeps: switching computers
     // keeps each one's queue, and two computers never share one (B05).
-    const relay = store.get<RelayPairing | null>("rr.relay", null);
     const identity = await hostIdentity({ relay, origin: location.origin, token });
-    const viaRelay = identity?.kind === "relay" ? relay : null;
     const outcome = outboxStart(identity, rawStorage);
     this.outboxKey = outcome.key;
     this.outbox = outcome.entries;
@@ -216,13 +221,11 @@ export class App {
     if (outcome.notice !== null) this.toast(noticeText(outcome.notice));
     this.refreshRecovery();
     const link = new Link({
-      url: viaRelay ? relayClientUrl(viaRelay) : `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`,
+      url: relayClientUrl(relay),
       token, clientId,
       // Only the transport chunks are asked for; the rest of this client's answers stay as they are.
       features: ["chunkedFrames"],
-      makeSocket: viaRelay
-        ? (url) => new RelaySocket(new WebSocket(url) as unknown as RawSocket, viaRelay, browserNacl())
-        : (url) => new WebSocket(url) as unknown as import("./conn.ts").SocketLike,
+      makeSocket: (url) => new RelaySocket(new WebSocket(url) as unknown as RawSocket, relay, browserNacl()),
       now: () => Date.now(),
       setTimer: (fn, ms) => setTimeout(fn, ms),
       clearTimer: (id) => clearTimeout(id as number),
@@ -1323,7 +1326,12 @@ export class App {
         // A Home Screen app keeps its own storage, apart from Safari's: the pairing a scanned QR
         // left in Safari never reaches it, so the link is pasted here instead.
         const value = (document.getElementById("pair-link") as HTMLInputElement | null)?.value ?? "";
-        if (savePairing(value.slice(value.indexOf("#")))) location.reload();
+        let paired = false;
+        try {
+          const url = new URL(value);
+          paired = url.protocol === "https:" && !url.username && !url.password && url.origin === location.origin && savePairing(url.hash);
+        } catch { /* A malformed link cannot replace the existing pairing. */ }
+        if (paired) location.reload();
         else this.toast(t("pair.badLink"));
         break;
       }

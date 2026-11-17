@@ -38,7 +38,16 @@ test("the pinned-Node cmd wrapper switches to UTF-8 before non-ASCII paths, with
   assert.match(block, /chcp 65001 >nul`r`n/);
   assert.match(block, /WriteAllText\(\$cmd, \$wrapper, \(New-Object System.Text.UTF8Encoding\(\$false\)\)\)/);
   assert.doesNotMatch(block, /-Encoding ASCII/);
-  assert.ok(block.indexOf("chcp 65001") < block.indexOf('`"$node`"'), "cmd changes code page on its own line before reading the path");
+  assert.ok(block.indexOf("chcp 65001") < block.indexOf('`"$nodeLiteral`"'), "cmd changes code page on its own line before reading the path");
+  assert.match(block, /\$node\.Replace\('%', '%%'\)/);
+  assert.match(block, /\$entry\.Replace\('%', '%%'\)/);
+  assert.match(block, /setlocal DisableDelayedExpansion/);
+});
+
+test("both bootstrap installers disable dependency lifecycle hooks and select the public registry", () => {
+  for (const name of ["install.sh", "install.ps1"]) {
+    assert.match(read(name), /install --global --prefix .* --registry https:\/\/registry\.npmjs\.org --ignore-scripts --loglevel error/);
+  }
 });
 
 test("Windows npm build commands use a shell for npm.cmd", async () => {

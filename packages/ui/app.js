@@ -48,13 +48,33 @@ function toast(message, isError, raw) {
 
 // Baselines are indexed by the revision carried through JSON clones used by save handlers.
 const configSnapshots = new Map();
+// Native main owns the pinned TLS connection and the new capability. The renderer has neither.
+// Clear the obsolete browser bootstrap if an old bookmark opens this code during migration.
+function clearLegacyAdminToken() {
+  const fragment = new URLSearchParams((window.location.hash || "").replace(/^#/, ""));
+  if (fragment.has("admin-token")) {
+    const view = fragment.get("view");
+    window.history.replaceState(null, "", window.location.pathname + window.location.search + (view && /^[a-z-]+$/.test(view) ? `#${view}` : ""));
+  }
+  try { window.sessionStorage.removeItem("clauderipple-admin-token"); } catch { /* no legacy storage available */ }
+}
+function adminFetch(path, opts) {
+  // Accept only this dashboard's API paths, including encoded paths checked by the server.
+  // A URL or a protocol-relative path must never receive the local capability.
+  if (typeof path !== "string" || !path.startsWith("/api/") || /[\\\r\n]/.test(path)) throw new Error("Invalid local admin path");
+  if (!APP) throw new Error("Open the native dashboard with clauderipple ui; browser administration is disabled.");
+  const headers = new Headers(opts && opts.headers);
+  headers.delete("x-clauderipple-admin");
+  return fetch(path, { ...opts, headers, mode: "same-origin", redirect: "error" });
+}
+clearLegacyAdminToken();
 async function api(path, opts) {
-  const res = await fetch(path, opts);
+  const res = await adminFetch(path, opts);
   const text = await res.text();
   let body;
   try { body = text ? JSON.parse(text) : {}; } catch { body = { raw: text }; }
   if (!res.ok) {
-    const raw = (body.errors || [body.error || body.raw || `HTTP ${res.status}`]).join("; ");
+    const raw = res.status === 401 ? "Dashboard authorization required. Open it with clauderipple ui or the tray app." : (body.errors || [body.error || body.raw || `HTTP ${res.status}`]).join("; ");
     const error = new Error(raw);
     error.body = body;
     error.status = res.status;
@@ -853,7 +873,7 @@ if (diagnosticsCopy) diagnosticsCopy.addEventListener("click", () => void copyDi
 let updateState = { busy: false, check: null };
 let autoUpdateSaving = false;
 function autoUpdateRow() {
-  const control = modSwitch("auto-update", status.autoUpdate?.enabled !== false, t("update.auto"), toggleAutoUpdate);
+  const control = modSwitch("auto-update", status.autoUpdate?.enabled === true, t("update.auto"), toggleAutoUpdate);
   control.querySelector("input").disabled = autoUpdateSaving || !status.autoUpdate;
   return cell(t("update.auto"), control, t("update.autoHelp"));
 }
@@ -876,7 +896,7 @@ async function toggleAutoUpdate(enabled) {
     autoUpdateSaving = false;
     await refreshHealth();
     const current = document.querySelector('[data-key="auto-update"]');
-    if (current) { current.disabled = !status.autoUpdate; current.checked = status.autoUpdate?.enabled !== false; }
+    if (current) { current.disabled = !status.autoUpdate; current.checked = status.autoUpdate?.enabled === true; }
   }
 }
 
@@ -3110,7 +3130,7 @@ async function probeProvider(name, provider, onComplete) {
     const result = await api("/api/providers/probe", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ ...body, name }),
     });
     probeStates.set(name, { ...result, at: Date.now() });
     onComplete && onComplete(result);
@@ -4025,14 +4045,14 @@ function headersForKey(provider, key, base) {
   return keyHeaderKind(provider) === "authorization-bearer" ? { ...extras, authorization: `Bearer ${key}` } : { ...extras, "x-api-key": key };
 }
 /** Never the whole key: its first and last four characters, or nothing of a key too short to cut. */
-function maskKey(key) { return key.length > 8 ? `${key.slice(0, 4)}…${key.slice(-4)}` : "…"; }
+function maskKey(key) { return key === "__CLAUDERIPPLE_REDACTED_SECRET__" ? t("providers.keySaved") : key.length > 8 ? `${key.slice(0, 4)}…${key.slice(-4)}` : "…"; }
 function keyPool(provider) {
   if (Array.isArray(provider.credentials) && provider.credentials.length) return provider.credentials;
   return provider.headers ? [{ id: "default", headers: provider.headers }] : [];
 }
-/** Keep a single key's identity when it has a label or explicit pool flags. */
+/** A redacted key needs its pool identity even when it becomes the last remaining entry. */
 function writeKeyPool(provider, pool) {
-  if (pool.length > 1 || (pool[0] && (pool[0].label || pool[0].preferred !== undefined || pool[0].paused !== undefined))) {
+  if (pool.length > 1 || (pool[0] && (Array.isArray(provider.credentials) || pool[0].label || pool[0].preferred !== undefined || pool[0].paused !== undefined))) {
     provider.credentials = pool;
     provider.headers = { ...pool[0].headers };
     return;
@@ -4679,7 +4699,7 @@ function openAnthropicProviderForm(options) {
     result.textContent = t("providers.checking");
     try {
       const body = auth.value === "claude-code" ? { type: "anthropic", auth: "claude-code" } : { type: "anthropic", auth: "api-key", apiKey: keyInput.value || (existing && existing.apiKey) };
-      const response = await api("/api/providers/probe", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      const response = await api("/api/providers/probe", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...body, name: options.name }) });
       if (!formActive) return;
       sourceLine.textContent = anthropicSourceText(response.source);
       const noCredits = response.ok && /^no-credits:/.test(response.error || "");
@@ -4772,7 +4792,7 @@ function openGrokProviderForm(options) {
   }
   renderModels(currentChecked);
   // Fields this form has no control for (a home, a binary, a pinned version) go to the probe as saved.
-  const probeBody = () => ({ type: "grok", ...Object.fromEntries(["home", "cli", "url", "clientVersion"].filter((key) => existing && existing[key]).map((key) => [key, existing[key]])) });
+  const probeBody = () => ({ type: "grok", name: options.name, ...Object.fromEntries(["home", "cli", "url", "clientVersion"].filter((key) => existing && existing[key]).map((key) => [key, existing[key]])) });
   async function runProbe() {
     probeButton.disabled = true;
     result.textContent = t("providers.checking");
@@ -4886,9 +4906,9 @@ function openGoogleProviderForm(options) {
     probeButton.disabled = true;
     result.textContent = t("providers.checking");
     try {
-      // The provider being edited and its pinned host, so the list is its own catalogue's and not another Antigravity provider's.
-      const body = auth.value === "antigravity" ? { type: "google", auth: "antigravity", ...(options.name ? { name: options.name } : {}), ...(existing && existing.url ? { url: existing.url } : {}) } : { type: "google", auth: "api-key", apiKey: keyInput.value.trim() || (existing && existing.apiKey) };
-      const response = await api("/api/providers/probe", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      // Name and host select this provider's catalogue and let the server resolve a saved, redacted API key.
+      const body = auth.value === "antigravity" ? { type: "google", auth: "antigravity" } : { type: "google", auth: "api-key", apiKey: keyInput.value.trim() || (existing && existing.apiKey) };
+      const response = await api("/api/providers/probe", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...body, name: options.name, ...(existing && existing.url ? { url: existing.url } : {}) }) });
       if (!formActive) return;
       const failed = response.auth === "bad-key" ? t("providers.probeBadKey") : response.auth === "missing" && auth.value === "antigravity" ? t("providers.googleSignInFirst") : t("providers.probeFailed");
       result.replaceChildren(...[
@@ -5168,7 +5188,7 @@ function openProviderForm(options) {
     probeButton.disabled = true;
     result.textContent = t("providers.checking");
     const temporary = `__new_${Date.now()}`;
-    const response = await probeProvider(temporary, draft);
+    const response = await probeProvider(options.name || temporary, draft);
     probeButton.disabled = false;
     const noCredits = response.ok && /^no-credits:/.test(response.error || "");
     const headline = noCredits ? t("providers.probeNoCredits") : response.ok ? t("providers.probeOk") : response.auth === "not-entitled" ? t("providers.probeNotEntitled") : response.auth === "bad-key" ? t("providers.probeBadKey") : response.unavailable ? t("providers.apiSoon") : t("providers.probeFailed");
@@ -6873,7 +6893,8 @@ async function refreshLogs() {
   if (logsPanel !== "raw") return;
   const box = $("#logbox");
   try {
-    const response = await fetch("/api/logs?n=200");
+    const response = await adminFetch("/api/logs?n=200");
+    if (!response.ok) throw new Error(`router logs: HTTP ${response.status}`);
     const text = await response.text();
     const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 30;
     box.replaceChildren(...text.split("\n").filter(Boolean).map(colorizeLogLine));

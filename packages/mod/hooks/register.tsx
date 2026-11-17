@@ -4,6 +4,8 @@ import { atom, read, update } from 'claude-code'
 import type { AgentSpawnInput, EngineInterface, ModelCompleteResult, ModelForkResult, PermissionRequestDecision, Register, RenderElement, RenderInput, RenderNode, SessionCompactResult, SessionContextBreakdown, SessionContextUsage, SessionRateLimit, ToolCallInput, ToolCallResult, TurnStepInput, TurnUsage } from 'claude-code'
 import type { AgentRec, CacheMemory, CostSummary, Effort, JudgeInput, JudgeKind, JudgeRun, LimitItem, ModSettingsSnapshot, Pick, Settings, StatusRequest, TierTarget, Verdict, WorkerCandidate, WorkerPick, WorkerVerdict } from '../types'
 import { MOD_SETTINGS_SCHEMA_VERSION, RUNG_EFFORT, applySettingsChanges, normalizeSettings, settingsChanges } from './settings'
+import { ADMIN_BRIDGE_REMEDIATION, ADMIN_RUNTIME_FILE, adminRequest, adminResponse, nativeCommand, nativeResult, parseAdminRuntime } from './admin'
+import type { AdminRuntime } from './admin'
 import { rungOf, workerLadderLine } from './ladder'
 import { debugText, langFrom, t } from './i18n'
 import type { Lang } from './i18n'
@@ -275,6 +277,29 @@ async function adminUrl($: EngineInterface): Promise<string> {
   const port = typeof admin === 'number' ? admin : (typeof listen === 'number' ? listen : 8791) + 1
   return `http://127.0.0.1:${port}`
 }
+async function adminRuntime($: EngineInterface): Promise<AdminRuntime> {
+  try {
+    const home = await rippleHome($)
+    const file = `${home}/${ADMIN_RUNTIME_FILE}`
+    const directory = await $.fs.stat(home, { resolve: false })
+    const descriptor = await $.fs.stat(file, { resolve: false })
+    if (directory.kind !== 'dir' || directory.isLink || descriptor.kind !== 'file' || descriptor.isLink || descriptor.size > 16_384) throw new Error(ADMIN_BRIDGE_REMEDIATION)
+    const text = await $.fs.read(file)
+    if (text.length > 16_384) throw new Error(ADMIN_BRIDGE_REMEDIATION)
+    const runtime = parseAdminRuntime(JSON.parse(text), home)
+    for (const executable of [runtime.node, runtime.bridge]) {
+      const stat = await $.fs.stat(executable, { resolve: false })
+      if (stat.kind !== 'file' || stat.isLink) throw new Error(ADMIN_BRIDGE_REMEDIATION)
+    }
+    return runtime
+  } catch { throw new Error(ADMIN_BRIDGE_REMEDIATION) }
+}
+async function adminFetch($: EngineInterface, url: string, init?: Parameters<EngineInterface['http']['fetch']>[1]) {
+  const request = adminRequest(url, init)
+  const command = nativeCommand(await adminRuntime($), request)
+  try { return adminResponse(await $.process.run(command.argv, command.init)) }
+  catch { throw new Error(ADMIN_BRIDGE_REMEDIATION) }
+}
 /** Opens a URL with the system's opener (a browser page, or a claude:// link the desktop app takes); throws when it cannot. */
 async function openUrl($: EngineInterface, url: string): Promise<void> {
   let argv: string[]
@@ -289,12 +314,11 @@ async function openUrl($: EngineInterface, url: string): Promise<void> {
   if (result.exitCode !== 0) throw new Error(result.stderr || `opener exited ${result.exitCode}`)
 }
 async function openAllSettings($: EngineInterface): Promise<void> {
-  const url = `${await adminUrl($)}/#mod`
   try {
-    await openUrl($, url)
-  } catch (error) {
-    await report($, 'open mod settings', error)
-    await $.ui.toast(url)
+    const command = nativeCommand(await adminRuntime($), { kind: 'ui', view: 'mod' })
+    if (nativeResult(await $.process.run(command.argv, command.init)).ok !== true) throw new Error(ADMIN_BRIDGE_REMEDIATION)
+  } catch {
+    await $.ui.toast('Could not open native settings. Run `clauderipple mod on`, then `clauderipple ui`. No browser capability was opened.')
   }
 }
 async function currentSettings($: EngineInterface): Promise<Settings> {
@@ -373,7 +397,7 @@ async function putSettings($: EngineInterface, admin: string, base: Settings): P
     // A migration that lost a CAS race is not a user edit: never retry it as a full save.
     if (!sync.pending.length && !sync.migration) return
     const count = sync.pending.length
-    const response = await $.http.fetch(`${admin}/api/mod-settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ schemaVersion: MOD_SETTINGS_SCHEMA_VERSION, settings: applySettingsChanges(base, sync.pending), revision: sync.revision }) })
+    const response = await adminFetch($, `${admin}/api/mod-settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ schemaVersion: MOD_SETTINGS_SCHEMA_VERSION, settings: applySettingsChanges(base, sync.pending), revision: sync.revision }) })
     if (!response.ok && response.status !== 409) throw new Error(t(await read($, lang), 'commands.routerHttp', { status: response.status }))
     const snapshot = settingsSnapshot(response.text)
     await acceptSettings($, snapshot, response.ok ? count : 0)
@@ -387,10 +411,10 @@ async function currentCompactAt($: EngineInterface): Promise<number | null> {
   return modelCompactWindow(compactWindows, await $.session.model()) ?? await read($, compactAt)
 }
 async function syncSettings($: EngineInterface, admin: string): Promise<void> {
-  const windows = await $.http.fetch(`${admin}/api/context-windows`)
+  const windows = await adminFetch($, `${admin}/api/context-windows`)
   if (windows.ok) compactWindows = JSON.parse(windows.text)
   else if (windows.status !== 404) await report($, 'context windows', `HTTP ${windows.status}`)
-  const response = await $.http.fetch(`${admin}/api/mod-settings`)
+  const response = await adminFetch($, `${admin}/api/mod-settings`)
   if (!response.ok) throw new Error(t(await read($, lang), 'commands.routerHttp', { status: response.status }))
   const snapshot = settingsSnapshot(response.text)
   // Claude Code writes `/autocompact` to settings.json itself, so this can change without a
@@ -636,7 +660,7 @@ async function refreshRouter($: EngineInterface): Promise<void> {
     await refreshPhoneQueue($, session)
     const open = await isLogUp($)
     if (!open && await read($, bandHidden)) { await update($, line, () => null); return }
-    const own = await $.http.fetch(`${admin}/api/requests?kind=messages&n=${open ? 60 : 20}&session=${encodeURIComponent(session)}`)
+    const own = await adminFetch($, `${admin}/api/requests?kind=messages&n=${open ? 60 : 20}&session=${encodeURIComponent(session)}`)
     if (!own.ok) throw new Error(t(language, 'commands.routerHttp', { status: own.status }))
     const mine = (object(JSON.parse(own.text)).requests ?? []) as StatusRequest[]
     const newest = mine[0] ?? null
@@ -650,7 +674,7 @@ async function refreshRouter($: EngineInterface): Promise<void> {
     if (!open) return
     let shown = mine
     if (!await read($, onlySession)) {
-      const all = await $.http.fetch(`${admin}/api/requests?kind=messages&n=60`)
+      const all = await adminFetch($, `${admin}/api/requests?kind=messages&n=60`)
       if (!all.ok) throw new Error(t(language, 'commands.routerHttp', { status: all.status }))
       shown = (object(JSON.parse(all.text)).requests ?? []) as StatusRequest[]
     }
@@ -761,12 +785,12 @@ async function workerFix($: EngineInterface, spawn: Spawn): Promise<WorkerFix | 
 }
 async function availability($: EngineInterface): Promise<boolean> {
   try {
-    const status = await $.http.fetch(`${await adminUrl($)}/api/status`)
+    const status = await adminFetch($, `${await adminUrl($)}/api/status`)
     return status.ok ? chatgptUsable(JSON.parse(status.text)) : true
   } catch (error) { await report($, 'availability unknown', error); return true }
 }
 async function refreshModels($: EngineInterface): Promise<void> {
-  const response = await $.http.fetch(`${await adminUrl($)}/api/config`)
+  const response = await adminFetch($, `${await adminUrl($)}/api/config`)
   if (!response.ok) throw new Error(t(await read($, lang), 'commands.routerHttp', { status: response.status }))
   await update($, routerModels, () => routerModelOptions(JSON.parse(response.text)))
 }
@@ -779,7 +803,7 @@ const KEEP_MS = 600000
  */
 async function refreshLadder($: EngineInterface): Promise<void> {
   try {
-    const response = await $.http.fetch(`${await adminUrl($)}/api/mod-options`)
+    const response = await adminFetch($, `${await adminUrl($)}/api/mod-options`)
     if (!response.ok) throw new Error(t(await read($, lang), 'commands.routerHttp', { status: response.status }))
     const fresh = ladderOptionsFrom(JSON.parse(response.text), await $.clock.now() + KEEP_MS, (await currentSettings($)).allow, (await currentSettings($)).allowKnown)
     if (!same(await read($, ladderOptions), fresh)) await update($, ladderOptions, () => fresh)
@@ -798,7 +822,7 @@ let endingMode = false
 /** The chosen provider's windows: Claude uses the band's binding limit; ChatGPT its account quota API. */
 async function modeWindows($: EngineInterface, provider: string): Promise<QuotaWindow[]> {
   if (provider === 'anthropic') return claudeWindow(await read($, limit))
-  const response = await $.http.fetch(`${await adminUrl($)}/api/chatgpt-accounts?provider=${encodeURIComponent(provider)}`)
+  const response = await adminFetch($, `${await adminUrl($)}/api/chatgpt-accounts?provider=${encodeURIComponent(provider)}`)
   if (!response.ok) return []
   const body: unknown = JSON.parse(response.text)
   // The router answers for its first ChatGPT provider when the name is not one: not this provider.
@@ -1358,7 +1382,7 @@ async function openClear($: EngineInterface): Promise<void> {
 /** The router's figure for this login's plan windows; nothing when the router cannot say. */
 async function routerClaudeLimits($: EngineInterface): Promise<SessionRateLimit[]> {
   try {
-    const status = await $.http.fetch(`${await adminUrl($)}/api/status`)
+    const status = await adminFetch($, `${await adminUrl($)}/api/status`)
     return status.ok ? claudeLimitsFrom(JSON.parse(status.text), await $.clock.now()) : []
   } catch (error) { await report($, 'claude limits', error); return [] }
 }
@@ -1372,7 +1396,7 @@ async function routerClaude($: EngineInterface): Promise<{ limits: SessionRateLi
   if (!(await currentSettings($)).extras.includes('limits') || now - routerClaudeAt < 60_000) return routerClaudeCache
   routerClaudeAt = now
   try {
-    const status = await $.http.fetch(`${await adminUrl($)}/api/status`)
+    const status = await adminFetch($, `${await adminUrl($)}/api/status`)
     if (status.ok) {
       const body: unknown = JSON.parse(status.text)
       routerClaudeCache = { limits: claudeLimitsFrom(body, now), scoped: claudeScopedFrom(body, now) }
@@ -1403,9 +1427,9 @@ async function fallbackLimits($: EngineInterface): Promise<LimitItem[]> {
     .map(w => ({ provider: 'claude', type: 'anthropic', title: 'Claude', account: 0, kind: w.kind as 'five_hour' | 'seven_day', label: '', percent: w.percentUsed, ...(w.resetsAt ? { resetsAt: w.resetsAt } : {}) }))
   for (const s of fromRouter.scoped) items.push({ provider: 'claude', type: 'anthropic', title: 'Claude', account: 0, kind: 'scoped', label: s.name, percent: s.percent, ...(s.resetsAt ? { resetsAt: s.resetsAt } : {}) })
   const admin = await adminUrl($)
-  const status = await $.http.fetch(`${admin}/api/status`)
+  const status = await adminFetch($, `${admin}/api/status`)
   if (status.ok) for (const provider of chatgptProviders(JSON.parse(status.text))) {
-    const response = await $.http.fetch(`${admin}/api/chatgpt-accounts?provider=${encodeURIComponent(provider)}`)
+    const response = await adminFetch($, `${admin}/api/chatgpt-accounts?provider=${encodeURIComponent(provider)}`)
     if (!response.ok) continue
     const body: unknown = JSON.parse(response.text)
     // The router answers for its first ChatGPT provider when the name is not one: not this provider.
@@ -1431,7 +1455,7 @@ async function refreshLimits($: EngineInterface): Promise<void> {
   if (now - limitsAt < 60_000 && await read($, limits) !== null) return
   try {
     const admin = await adminUrl($)
-    const response = await $.http.fetch(`${admin}/api/limits`)
+    const response = await adminFetch($, `${admin}/api/limits`)
     let items: LimitItem[] | null = null
     if (response.ok) items = routerLimitItems(JSON.parse(response.text), now)
     else if (response.status === 404) items = await fallbackLimits($)
@@ -1461,7 +1485,7 @@ async function refreshCost($: EngineInterface, opening = false): Promise<void> {
     const admin = await adminUrl($)
     const fetchPart = async (from: number): Promise<CostSummary | null> => {
       try {
-        const response = await $.http.fetch(`${admin}/api/requests/summary?from=${from}&to=${now}`)
+        const response = await adminFetch($, `${admin}/api/requests/summary?from=${from}&to=${now}`)
         return response.ok ? costFromSummary(JSON.parse(response.text), from) : null
       } catch (error) { await report($, 'cost', error); return null }
     }
@@ -1630,7 +1654,7 @@ async function stopTurn($: EngineInterface): Promise<boolean> {
  * a clear is claimed and again before it runs, so a /clear is never run with no way to report it.
  */
 async function moveRouteReady($: EngineInterface, admin: string, session: string, itemId: string): Promise<boolean> {
-  const probe = await $.http.fetch(`${admin}/api/mod/moved`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ itemId, from: session, to: '' }) })
+  const probe = await adminFetch($, `${admin}/api/mod/moved`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ itemId, from: session, to: '' }) })
   return probe.status === 409
 }
 
@@ -1646,7 +1670,7 @@ async function clearInPlace($: EngineInterface, admin: string, session: string, 
   const to = clearedTo
   clearedTo = null
   if (!to || to === session) return false
-  const moved = await $.http.fetch(`${admin}/api/mod/moved`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ itemId, from: session, to }) })
+  const moved = await adminFetch($, `${admin}/api/mod/moved`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ itemId, from: session, to }) })
   return moved.status === 200
 }
 
@@ -1659,7 +1683,7 @@ async function clearInPlace($: EngineInterface, admin: string, session: string, 
 async function forgetAsk($: EngineInterface, admin: string, ask: string | null): Promise<HostAnswer | null> {
   if (!ask) return null
   try {
-    const done = await $.http.fetch(`${admin}/api/mod/approval/done`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ askId: ask }) })
+    const done = await adminFetch($, `${admin}/api/mod/approval/done`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ askId: ask }) })
     if (done.status !== 200) return null
     const reply = heldReply(done.text)
     return reply.state === 'answered' ? reply.answer ?? null : null
@@ -1689,7 +1713,7 @@ async function waitForPhone($: EngineInterface, admin: string, ask: string): Pro
       // A poll never outlasts the window: a request that never answers must not hold the hook past it.
       const left = Math.max(0, heard + APPROVAL_FRESH_MS - at)
       const polled = await Promise.race([
-        $.http.fetch(`${admin}/api/mod/approval?askId=${encodeURIComponent(ask)}&sentAt=${Math.floor(sent)}`),
+        adminFetch($, `${admin}/api/mod/approval?askId=${encodeURIComponent(ask)}&sentAt=${Math.floor(sent)}`),
         $.clock.sleep(left).then(() => null),
       ])
       if (polled?.status === 200) reply = heldReply(polled.text)
@@ -1723,7 +1747,7 @@ async function pollPhoneInbox($: EngineInterface): Promise<void> {
     if (await $.clock.now() < inboxRetryAt) return
     const session = await $.session.id()
     const admin = await adminUrl($)
-    const list = await $.http.fetch(`${admin}/api/phone-inbox?session=${encodeURIComponent(session)}`)
+    const list = await adminFetch($, `${admin}/api/phone-inbox?session=${encodeURIComponent(session)}`)
     if (list.status !== 200) throw new Error(`inbox HTTP ${list.status}`)
     const offers = object(JSON.parse(list.text)).offers
     if (!Array.isArray(offers)) throw new Error('invalid inbox response')
@@ -1736,7 +1760,7 @@ async function pollPhoneInbox($: EngineInterface): Promise<void> {
       // A clear the host cannot be told about is left unclaimed: the offer expires and the /clear waits.
       if (kind === 'clear' && !await moveRouteReady($, admin, session, offer.itemId)) continue
       const claimAt = await $.clock.now()
-      const claim = await $.http.fetch(`${admin}/api/phone-inbox/claim`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ itemId: offer.itemId }) })
+      const claim = await adminFetch($, `${admin}/api/phone-inbox/claim`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ itemId: offer.itemId }) })
       if (claim.status === 409) continue
       if (claim.status !== 200) throw new Error(`inbox claim HTTP ${claim.status}`)
       let outcome: 'submitted' | 'failed' = 'failed'
@@ -1752,7 +1776,7 @@ async function pollPhoneInbox($: EngineInterface): Promise<void> {
           }
         }
       } catch { /* The host shows the failed item for a deliberate resend. */ }
-      const result = await $.http.fetch(`${admin}/api/phone-inbox/result`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ itemId: offer.itemId, outcome }) })
+      const result = await adminFetch($, `${admin}/api/phone-inbox/result`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ itemId: offer.itemId, outcome }) })
       if (result.status !== 200) throw new Error(`inbox result HTTP ${result.status}`)
     }
     inboxRetryAt = 0
@@ -1808,7 +1832,7 @@ async function pollSettingsJobs($: EngineInterface): Promise<void> {
     if (settingsHelper.permissionMode !== 'bypassPermissions') return
     const helper = settingsHelper.sessionId
     const admin = await adminUrl($)
-    const list = await $.http.fetch(`${admin}/api/settings-jobs?exclude=${encodeURIComponent(helper)}`)
+    const list = await adminFetch($, `${admin}/api/settings-jobs?exclude=${encodeURIComponent(helper)}`)
     if (list.status !== 200) throw new Error('settings jobs request failed')
     const jobs = object(JSON.parse(list.text)).jobs
     if (!Array.isArray(jobs)) throw new Error('invalid settings jobs response')
@@ -1818,13 +1842,13 @@ async function pollSettingsJobs($: EngineInterface): Promise<void> {
       if (typeof job.jobId !== 'string' || !/^[\w-]{1,100}$/.test(job.jobId) || typeof job.appSessionId !== 'string' || !/^[\w-]{1,100}$/.test(job.appSessionId) || job.appSessionId === helper ||
           job.model !== undefined && (typeof job.model !== 'string' || !/^[\w.\-\[\]@:]{1,100}$/.test(job.model)) || job.effort !== undefined && !effort || job.model === undefined && !effort) throw new Error('invalid settings job')
       const claimAt = await $.clock.now()
-      const claim = await $.http.fetch(`${admin}/api/settings-jobs/claim`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jobId: job.jobId, helper }) })
+      const claim = await adminFetch($, `${admin}/api/settings-jobs/claim`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jobId: job.jobId, helper }) })
       if (claim.status === 409) continue
       if (claim.status !== 200) throw new Error('settings job claim failed')
       let outcome: 'applied' | 'failed' = 'applied'
       try { await applySettingsJob($, { appSessionId: job.appSessionId, ...(typeof job.model === 'string' ? { model: job.model } : {}), ...(effort ? { effort } : {}) }, helper, claimAt) }
       catch { outcome = 'failed'; settingsHelper = null }
-      const result = await $.http.fetch(`${admin}/api/settings-jobs/result`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jobId: job.jobId, outcome, ...(outcome === 'failed' ? { detail: 'settings change failed' } : {}) }) })
+      const result = await adminFetch($, `${admin}/api/settings-jobs/result`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jobId: job.jobId, outcome, ...(outcome === 'failed' ? { detail: 'settings change failed' } : {}) }) })
       if (result.status !== 200 || outcome === 'failed') throw new Error('settings job failed')
     }
     jobsRetryAt = 0
@@ -2385,7 +2409,7 @@ export const register: Register = on => {
       const id = askId(await $.clock.now())
       const body = JSON.stringify({ askId: id, session: await $.session.id(), tool: e.tool_name, input: e.tool_input, suggestions: e.permission_suggestions ?? [], title: '' })
       if (body.length <= APPROVAL_BODY_CAP) {
-        const start = await $.http.fetch(`${admin}/api/mod/approval`, { method: 'POST', headers: { 'content-type': 'application/json' }, body })
+        const start = await adminFetch($, `${admin}/api/mod/approval`, { method: 'POST', headers: { 'content-type': 'application/json' }, body })
         if (start.status === 200) {
           ask = id
           if (object(JSON.parse(start.text)).state === 'hold') {
@@ -2759,7 +2783,7 @@ export const register: Register = on => {
     const choice = !e.agentId && e.trigger === 'manual' ? compactOnce : null
     const pick = async (model: string | null): Promise<void> => {
       try {
-        const response = await $.http.fetch(`${await adminUrl($)}/api/compact-pick`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ session: await $.session.id(), model }) })
+        const response = await adminFetch($, `${await adminUrl($)}/api/compact-pick`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ session: await $.session.id(), model }) })
         if (!response.ok) throw new Error(`compact pick HTTP ${response.status}`)
       } catch (error) { await report($, 'session.compact pick', error).catch(() => undefined) }
     }

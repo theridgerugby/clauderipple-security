@@ -11,6 +11,8 @@ import {
   earlyExit,
   enclosingApp,
   ensureTrayBundle,
+  ELECTRON_VERSION,
+  installElectronPackage,
   installTrayRuntime,
   npmEnv,
   swapTrayRuntime,
@@ -21,6 +23,28 @@ import {
   trayRuntimeMatches,
   trayRuntimeRange,
 } from "../src/tray.ts";
+
+test("the tray fetch pins the reviewed app version and runs only its explicit downloader", () => {
+  const app = JSON.parse(fs.readFileSync(path.resolve(import.meta.dirname, "../../app/package.json"), "utf8"));
+  assert.equal(ELECTRON_VERSION, app.devDependencies.electron);
+  assert.equal(ELECTRON_VERSION, app.build.electronVersion);
+  assert.match(ELECTRON_VERSION, /^\d+\.\d+\.\d+$/);
+  const target = path.join(os.tmpdir(), "inert tray fixture");
+  const calls: string[][] = [];
+  assert.equal(installElectronPackage(target, "/fake/npm-cli.js", (program, args, opts) => {
+    assert.equal(program, process.execPath);
+    assert.equal(opts.cwd, target);
+    calls.push(args);
+    return { status: 0 };
+  }), 0);
+  assert.deepEqual(calls, [
+    ["/fake/npm-cli.js", "install", "--prefix", target, "--no-package-lock", "--save-exact", "--registry", "https://registry.npmjs.org", "--ignore-scripts", "--loglevel", "error", `electron@${ELECTRON_VERSION}`],
+    [path.join(target, "node_modules", "electron", "install.js")],
+  ]);
+  let attempts = 0;
+  assert.equal(installElectronPackage(target, "/fake/npm-cli.js", () => { attempts++; return { status: 8 }; }), 8);
+  assert.equal(attempts, 1, "a failed npm fetch must never execute the downloader");
+});
 
 /** What npm's Electron.app holds, cut down to what the tray's bundle changes or must keep. */
 const ELECTRON_PLIST = `<?xml version="1.0" encoding="UTF-8"?>

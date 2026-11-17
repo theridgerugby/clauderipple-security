@@ -5,7 +5,9 @@
 
 import { persistPowerChange, type PowerChange, type PowerStatus } from "../../router/src/power.ts";
 import type { Runner } from "../../router/src/awake.ts";
+import { homeDir } from "../../router/src/config.ts";
 import { awakeRemove, awakeSetup, releaseAwake, releaseFailedHint, type SetupDeps } from "./awake-setup.ts";
+import { adminFetch } from "./admin-client.ts";
 
 /** `HH:MM` → the next time the clock shows it (today, else tomorrow), as ISO. A full ISO time is accepted too. */
 export function parseUntil(text: string, now: Date): string {
@@ -60,14 +62,14 @@ export function formatPower(s: PowerStatus): string[] {
 /** One admin call; null when the router is not answering. */
 export type PowerCall = (method: "GET" | "PUT", body?: PowerChange) => Promise<{ status: number; json: unknown } | null>;
 
-export function adminPowerCall(port: number): PowerCall {
+export function adminPowerCall(port: number, home: string = homeDir()): PowerCall {
   return async (method, body) => {
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/api/power`, {
+      const res = await adminFetch(`http://127.0.0.1:${port}/api/power`, {
         method,
         signal: AbortSignal.timeout(15_000),
         ...(body ? { headers: { "content-type": "application/json" }, body: JSON.stringify(body) } : {}),
-      });
+      }, home);
       return { status: res.status, json: await res.json().catch(() => ({})) };
     } catch {
       return null;

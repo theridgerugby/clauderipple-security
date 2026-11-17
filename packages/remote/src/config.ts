@@ -6,14 +6,19 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { ConfigStore, adminPort, configPath as routerConfigPath } from "../../router/src/config.ts";
-import { readJson, writeFileAtomic } from "./fsutil.ts";
+import { withFileLock, writePrivateFileAtomic } from "../../router/src/locked-file.ts";
+import { readPhoneHostRecord } from "./phone-config-storage.ts";
 
 export const DEFAULT_PORT = 8797;
 /** ClaudeRipple's own relay: what phone access turns back on with after it was switched off. */
 export const DEFAULT_RELAY = "https://ripple-relay.clauderipple.workers.dev";
+export const DIRECT_PHONE_DISABLED = "Direct HTTP/LAN phone connections are disabled. Configure an HTTPS relay with `clauderipple remote install --relay <https-url>`, then show a new pairing QR.";
+export const PHONE_REPAIR_REQUIRED = "Phone pairing security was upgraded. Restart the updated host, then show a new pairing QR and pair every phone again.";
 
 export interface HostConfig {
   token: string;
+  /** Version 2 tokens have never been issued by the retired direct HTTP phone channel. */
+  pairingSecurityVersion?: 2;
   /** an address, or "tailscale" / "lan" to pick this machine's address on that network at start */
   bind: string;
   port: number;
@@ -48,9 +53,17 @@ export function routerAdminUrl(configFile = routerConfigPath()): string {
 /** `persist: false` reads without writing the generated secrets (for commands that only print). */
 export function loadConfig(dir = remoteHome(), persist = true): HostConfig {
   const file = path.join(dir, "host.json");
-  const stored = readJson<Partial<HostConfig>>(file) ?? {};
+  const stored = (readPhoneHostRecord(file) ?? {}) as Partial<HostConfig>;
+  if (typeof stored !== "object" || Array.isArray(stored) ||
+      (stored.pairingSecurityVersion !== undefined && stored.pairingSecurityVersion !== 2)) {
+    throw new Error("invalid phone host configuration or pairing security version");
+  }
+  if (stored.pairingSecurityVersion === 2 && (typeof stored.token !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(stored.token))) {
+    throw new Error("invalid migrated phone pairing token");
+  }
   const cfg: HostConfig = {
     token: typeof stored.token === "string" && stored.token.length >= 32 ? stored.token : newToken(),
+    ...(stored.pairingSecurityVersion === 2 ? { pairingSecurityVersion: 2 as const } : {}),
     bind: typeof stored.bind === "string" ? stored.bind : "127.0.0.1",
     port: typeof stored.port === "number" ? stored.port : DEFAULT_PORT,
     adminUrl: typeof stored.adminUrl === "string" ? stored.adminUrl : routerAdminUrl(),
@@ -64,7 +77,27 @@ export function loadConfig(dir = remoteHome(), persist = true): HostConfig {
 }
 
 export function saveConfig(cfg: HostConfig, dir = remoteHome()): void {
-  writeFileAtomic(path.join(dir, "host.json"), JSON.stringify(cfg, null, 2) + "\n");
+  const file = path.join(dir, "host.json");
+  withFileLock(file, () => {
+    const current = readPhoneHostRecord(file) as Partial<HostConfig> | undefined;
+    if (current !== undefined && (typeof current !== "object" || Array.isArray(current) ||
+        (current.pairingSecurityVersion !== undefined && current.pairingSecurityVersion !== 2))) {
+      throw new Error("invalid phone host configuration or pairing security version");
+    }
+    // Ordinary settings writes never replace an existing capability or its generation. Both
+    // a legacy snapshot and a stale v2 snapshot must preserve a later explicit rotation.
+    // ensurePhonePairingSecurity / rotatePhonePairingToken own the only credential writes.
+    if (current !== undefined) {
+      if (current.pairingSecurityVersion === 2) {
+        if (typeof current.token !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(current.token)) throw new Error("invalid migrated phone pairing token");
+        cfg = { ...cfg, token: current.token, pairingSecurityVersion: 2 };
+      } else {
+        cfg = { ...cfg, ...(typeof current.token === "string" && current.token.length >= 32 ? { token: current.token } : {}) };
+        delete cfg.pairingSecurityVersion;
+      }
+    }
+    writePrivateFileAtomic(file, JSON.stringify(cfg, null, 2) + "\n");
+  });
 }
 
 export function tokenMatches(expected: string, given: unknown): boolean {
@@ -88,23 +121,26 @@ function firstV4(ifaces: Ifaces, pick: (ip: string) => boolean): string | null {
 }
 
 /** The address to listen on, and the one to put in the pairing link. */
-export function resolveBind(bind: string, ifaces: Ifaces = os.networkInterfaces()): { listen: string; advertise: string; reachableFromPhone: boolean } {
+export function resolveBind(bind: string, ifaces?: Ifaces): { listen: string; advertise: string; reachableFromPhone: boolean } {
   if (bind === "tailscale" || bind === "lan") {
-    const ip = firstV4(ifaces, bind === "tailscale" ? isTailnet : isLan);
+    const ip = firstV4(ifaces ?? os.networkInterfaces(), bind === "tailscale" ? isTailnet : isLan);
     if (!ip) throw new Error(`no ${bind === "tailscale" ? "Tailscale (100.64.0.0/10)" : "LAN"} address on this machine`);
     return { listen: ip, advertise: ip, reachableFromPhone: true };
   }
   if (bind === "0.0.0.0" || bind === "::") {
-    const ip = firstV4(ifaces, isTailnet) ?? firstV4(ifaces, isLan) ?? "127.0.0.1";
+    const interfaces = ifaces ?? os.networkInterfaces();
+    const ip = firstV4(interfaces, isTailnet) ?? firstV4(interfaces, isLan) ?? "127.0.0.1";
     return { listen: bind, advertise: ip, reachableFromPhone: ip !== "127.0.0.1" };
   }
+  // A literal bind needs no interface discovery. This also keeps loopback-only operation
+  // available in restricted environments where enumerating network interfaces is denied.
   const loopback = bind === "127.0.0.1" || bind === "::1" || bind === "localhost";
   return { listen: bind, advertise: bind, reachableFromPhone: !loopback };
 }
 
-export function pairingUrl(advertise: string, port: number, token: string): string {
-  const host = advertise.includes(":") ? `[${advertise}]` : advertise;
-  return `http://${host}:${port}/#pair=${token}`;
+/** Retained only to make an outdated caller fail closed, without formatting a token URL. */
+export function pairingUrl(_advertise: string, _port: number, _token: string): never {
+  throw new Error(DIRECT_PHONE_DISABLED);
 }
 
 /**
@@ -112,14 +148,15 @@ export function pairingUrl(advertise: string, port: number, token: string): stri
  * fragment, so the relay sees neither the token nor the host's public key, only the page request.
  */
 export function relayPairingUrl(relay: string, serverId: string, hostPublicKey: string, token: string): string {
-  const origin = new URL(relay).origin;
+  const origin = normalizeRelay(relay);
   return `${origin}/#pair=${token}&server=${serverId}&hpk=${hostPublicKey}`;
 }
 
-/** The relay's address, validated: https (or http only for a local `wrangler dev`). */
+/** Relay code and the host registration credential both require authenticated HTTPS. */
 export function normalizeRelay(url: string): string {
-  const u = new URL(url);
-  const local = u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]";
-  if (u.protocol !== "https:" && !(u.protocol === "http:" && local)) throw new Error(`relay must be https:// (http:// only for localhost): ${url}`);
-  return u.origin;
+  try {
+    const u = new URL(url);
+    if (u.protocol === "https:" && !u.username && !u.password && !u.search && !u.hash && u.pathname === "/") return u.origin;
+  } catch { /* No URL or credential value belongs in the error. */ }
+  throw new Error("relay must be an HTTPS origin without credentials, path, query, or fragment");
 }

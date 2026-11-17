@@ -1,38 +1,37 @@
-// Observed-login persistence uses an in-memory filesystem: no keychain, account files or network.
+// Observed-login persistence uses private temporary files with dummy tokens only.
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { ObservedClaudeCodeAuth, OBSERVED_CLAUDE_CODE_TTL_MS } from "../src/providers/anthropic-observed.ts";
 
-const FILE = "/mock/observed-claude.json";
 const MINUTE = 60_000;
 
 function storage(t: TestContext) {
-  const files = new Map<string, string>();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-observed-"));
+  const file = path.join(home, "observed-claude.json");
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   let writes = 0;
   let failRename = false;
-  t.mock.method(fs, "readFileSync", (file: string) => {
-    const value = files.get(file);
-    if (value === undefined) throw new Error("missing mock file");
-    return value;
-  });
-  t.mock.method(fs, "writeFileSync", (file: string, value: string, options: { mode: number }) => {
-    assert.equal(options.mode, 0o600);
+  const writeFile = fs.writeFileSync;
+  const rename = fs.renameSync;
+  t.mock.method(fs, "writeFileSync", (fd: number, value: string, encoding: BufferEncoding) => {
+    if (process.platform !== "win32") assert.equal(fs.fstatSync(fd).mode & 0o777, 0o600);
     writes++;
-    files.set(file, value);
+    writeFile(fd, value, encoding);
   });
   t.mock.method(fs, "renameSync", (from: string, to: string) => {
     if (failRename) throw new Error("mock rename failure");
-    files.set(to, files.get(from)!);
-    files.delete(from);
+    rename(from, to);
   });
-  t.mock.method(fs, "rmSync", (file: string) => { files.delete(file); });
-  return { files, writes: () => writes, failRename: (value: boolean) => { failRename = value; } };
+  return { file, files: { has: (name: string) => fs.existsSync(name) }, writes: () => writes, failRename: (value: boolean) => { failRename = value; } };
 }
 
 for (const activity of ["observe", "noteUsed"] as const) {
   test(`continuous ${activity} activity checkpoints freshness and survives a restart`, t => {
     const disk = storage(t);
+    const FILE = disk.file;
     const auth = new ObservedClaudeCodeAuth(FILE);
     const headers = ["Authorization", "Bearer mock-token", "anthropic-beta", "mock-beta"];
     auth.observe(headers, 0);
@@ -54,6 +53,7 @@ for (const activity of ["observe", "noteUsed"] as const) {
 
 test("a loaded checkpoint sets the throttle baseline and a failed write is retried", t => {
   const disk = storage(t);
+  const FILE = disk.file;
   const first = new ObservedClaudeCodeAuth(FILE);
   first.observe(["authorization", "Bearer mock-token"], 0);
   const restarted = new ObservedClaudeCodeAuth(FILE);
@@ -70,6 +70,7 @@ test("a loaded checkpoint sets the throttle baseline and a failed write is retri
 
 test("token replacement and exact-token invalidation keep their generation guards", t => {
   const disk = storage(t);
+  const FILE = disk.file;
   const auth = new ObservedClaudeCodeAuth(FILE);
   auth.observe(["authorization", "Bearer old-token"], 0);
   auth.observe(["authorization", "Bearer new-token"], 1);

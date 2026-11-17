@@ -11,6 +11,7 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { readPrivateFile } from "../../private-file.ts";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -95,7 +96,7 @@ export function identityFromTokens(tokens: { accessToken: string; idToken?: stri
 
 export function readOwn(home: string): Tokens | null {
   try {
-    const j = JSON.parse(fs.readFileSync(ownAuthPath(home), "utf8")) as Partial<Tokens>;
+    const j = JSON.parse(readPrivateFile(ownAuthPath(home)).toString("utf8")) as Partial<Tokens>;
     if (!j.accessToken || !j.accountId) return null;
     return { ...(j as Tokens), source: "own" };
   } catch {

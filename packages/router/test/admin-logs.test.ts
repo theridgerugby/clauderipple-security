@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { startAdmin } from "../src/admin.ts";
+import { startAdmin, fetch } from "./admin-client.ts";
 import { DEFAULTS } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
 import { RequestLog } from "../src/requestlog.ts";

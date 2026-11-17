@@ -10,6 +10,8 @@ import { renderUnit } from "../../cli/src/systemd.ts";
 import { recordedLaunchHome } from "../../cli/src/launcher.ts";
 import { type AgentStop, type Ownership, ownerOf, plistEnvironment, unitEnvironment } from "../../cli/src/ownership.ts";
 import { loadConfig, remoteHome } from "./config.ts";
+import { localControlHome, localControlRequest, readLocalControlState } from "./local-transport.ts";
+import { readAdminEndpoint, type AdminEndpoint } from "../../router/src/admin-transport-state.ts";
 import { assertGeneration, definitionGeneration, withServiceLockAsync, writeServiceFile } from "../../cli/src/service-definition.ts";
 
 export const TASK = "ClaudeRippleHost";
@@ -63,34 +65,59 @@ export function renderService(spec: Spec, platform = process.platform): string {
   throw new Error(`host service is unsupported on ${platform}`);
 }
 
+export interface HostStopReceipt { assertStillStopped(): void }
+
+function stopReceipt(dir: string, endpoint?: AdminEndpoint): HostStopReceipt {
+  const expected = endpoint ? { ...endpoint } : undefined;
+  return Object.freeze({ assertStillStopped() {
+    // Configuration may now specify a new public port. Compare only the protected generation
+    // actually stopped, never retarget a request or authorize stopping a newly started host.
+    const current = readAdminEndpoint(localControlHome(dir));
+    if (expected ? !current || current.instanceId !== expected.instanceId || current.publicPort !== expected.publicPort || current.tlsPort !== expected.tlsPort
+      : current !== undefined || fs.existsSync(path.join(dir, "local.secret"))) {
+      throw new Error("host instance changed after shutdown was checked");
+    }
+  } });
+}
+
 /** An authenticated local request, never a pairing credential or a public shutdown endpoint. */
-export async function controlShutdown(dir = remoteHome()): Promise<void> {
-  const cfg = loadConfig(dir, false);
-  let secret: string;
-  try { secret = fs.readFileSync(path.join(dir, "local.secret"), "utf8").trim(); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
-  const url = `http://127.0.0.1:${cfg.port}`;
-  const headers = { "x-ripple-local": secret };
+export async function controlShutdown(dir = remoteHome()): Promise<HostStopReceipt> {
+  const initial = readLocalControlState(dir);
+  const receipt = stopReceipt(dir, initial?.endpoint);
+  const stopped = () => { receipt.assertStillStopped(); return receipt; };
+  if (!initial) {
+    // A legacy capability is evidence of a previous host, never permission to hard-kill it
+    // when the new authenticated boundary cannot determine liveness or finish its shutdown.
+    if (fs.existsSync(path.join(dir, "local.secret"))) throw new Error("legacy host control cannot be authenticated; stop the old host manually and stop its supervisor, then start the updated foreground host with `clauderipple remote` and retry `clauderipple remote install` in another terminal");
+    return stopped();
+  }
   // Check first: a refused secret or incompatible live host must not lead to a hard kill.
   let status: Response;
-  try { status = await fetch(`${url}/local/status`, { headers, signal: AbortSignal.timeout(2000), redirect: "error" }); }
+  try { status = await localControlRequest(dir, "/local/status", { signal: AbortSignal.timeout(2000) }, initial.endpoint.instanceId); }
   catch (error) {
     const cause = (error as { cause?: { code?: string } }).cause;
-    if (cause?.code === "ECONNREFUSED") return;
+    if (cause?.code === "ECONNREFUSED") {
+      return stopped();
+    }
     throw new Error("could not check the host before shutdown");
   }
-  if (!status.ok) throw new Error(`host local status refused (${status.status})`);
   await status.body?.cancel();
-  const response = await fetch(`${url}/local/shutdown`, { method: "POST", headers, redirect: "error", signal: AbortSignal.timeout(5000) });
-  if (!response.ok) throw new Error(`host shutdown refused (${response.status}); update the host before stopping its task`);
+  if (!status.ok) throw new Error(`host local status refused (${status.status})`);
+  const response = await localControlRequest(dir, "/local/shutdown", { method: "POST", signal: AbortSignal.timeout(5000) }, initial.endpoint.instanceId);
   await response.body?.cancel();
+  if (!response.ok) throw new Error(`host shutdown refused (${response.status}); update the host before stopping its task`);
   for (let i = 0; i < 100; i++) {
     await delay(100);
     try {
-      const probe = await fetch(`${url}/healthz`, { signal: AbortSignal.timeout(500) });
+      const current = readLocalControlState(dir);
+      if (!current) return stopped();
+      if (current.endpoint.instanceId !== initial.endpoint.instanceId) throw new Error("host restarted before shutdown could be confirmed");
+      const probe = await localControlRequest(dir, "/local/status", { signal: AbortSignal.timeout(500) }, initial.endpoint.instanceId);
       await probe.body?.cancel();
     } catch (error) {
-      if ((error as { cause?: { code?: string } }).cause?.code === "ECONNREFUSED") return;
+      if ((error as { cause?: { code?: string } }).cause?.code === "ECONNREFUSED") {
+        return stopped();
+      }
       throw new Error("could not confirm host shutdown");
     }
   }
@@ -98,17 +125,16 @@ export async function controlShutdown(dir = remoteHome()): Promise<void> {
 }
 
 async function waitForHost(dir = remoteHome()): Promise<void> {
-  const cfg = loadConfig(dir, false);
   for (let i = 0; i < 100; i++) {
     try {
-      const secret = fs.readFileSync(path.join(dir, "local.secret"), "utf8").trim();
-      const response = await fetch(`http://127.0.0.1:${cfg.port}/local/status`, { headers: { "x-ripple-local": secret }, redirect: "error", signal: AbortSignal.timeout(500) });
+      const response = await localControlRequest(dir, "/local/status", { signal: AbortSignal.timeout(500) });
       await response.body?.cancel();
       if (response.ok) return;
       if (response.status === 403) throw new Error("host local authentication refused");
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code ?? (error as { cause?: { code?: string } }).cause?.code;
-      if (code !== "ENOENT" && code !== "ECONNREFUSED" && !(error instanceof Error && ["TimeoutError", "AbortError"].includes(error.name))) throw error;
+      if (code !== "ENOENT" && code !== "LOCAL_CONTROL_UNAVAILABLE" && code !== "ECONNREFUSED" &&
+          !(error instanceof Error && (["TimeoutError", "AbortError"].includes(error.name) || error.message === "admin request aborted"))) throw error;
     }
     await delay(100);
   }
@@ -133,9 +159,7 @@ export function refreshPlan(o: { installed: boolean; definition: string | null; 
 /** Unknown liveness is not permission to stop a host. Callers retain a pending update. */
 export async function hostStatus(dir = remoteHome()): Promise<{ busy?: boolean; version?: string } | null> {
   try {
-    const cfg = loadConfig(dir, false);
-    const secret = fs.readFileSync(path.join(dir, "local.secret"), "utf8").trim();
-    const response = await fetch(`http://127.0.0.1:${cfg.port}/local/status`, { headers: { "x-ripple-local": secret }, redirect: "error", signal: AbortSignal.timeout(2000) });
+    const response = await localControlRequest(dir, "/local/status", { signal: AbortSignal.timeout(2000) });
     if (!response.ok) { await response.body?.cancel(); return null; }
     const body = await response.json() as { busy?: unknown; version?: unknown };
     return { ...(typeof body.busy === "boolean" ? { busy: body.busy } : {}), ...(typeof body.version === "string" ? { version: body.version } : {}) };
@@ -143,9 +167,7 @@ export async function hostStatus(dir = remoteHome()): Promise<{ busy?: boolean; 
 }
 /** The live host reserves idle and exits itself with a retryable status; never kill via a supervisor. */
 export async function refreshRunningHost(version: string, dir = remoteHome()): Promise<void> {
-  const cfg = loadConfig(dir, false);
-  const secret = fs.readFileSync(path.join(dir, "local.secret"), "utf8").trim();
-  const response = await fetch(`http://127.0.0.1:${cfg.port}/local/refresh`, { method: "POST", headers: { "x-ripple-local": secret }, redirect: "error", signal: AbortSignal.timeout(2000) });
+  const response = await localControlRequest(dir, "/local/refresh", { method: "POST", signal: AbortSignal.timeout(2000) });
   await response.body?.cancel();
   if (!response.ok) throw new Error(response.status === 404 ? "안전한 자동 교체를 지원하지 않는 호스트입니다. 작업이 끝난 뒤 호스트를 다시 시작해 주세요." : `host refresh deferred (${response.status})`);
   const deadline = Date.now() + 25_000;

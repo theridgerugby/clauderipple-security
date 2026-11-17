@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import * as V from "../web/views.ts";
 import type { UI } from "../web/views.ts";
 import type { DiffView } from "../src/protocol.ts";
+import { FixtureRelaySocket as Socket, fixtureNacl, fixtureRelayPairing } from "./fixture-relay-socket.ts";
 
 const ORIGIN = "https://phone.example";
 const TOKEN = "token-for-the-tests-0123456789";
@@ -89,32 +90,6 @@ class Storage {
   keys(): string[] { return [...this.map.keys()]; }
 }
 
-class Socket {
-  static latest: Socket | null = null;
-  static respond: ((op: Record<string, unknown>) => unknown) | null = null;
-  readyState = 0;
-  frames: string[] = [];
-  url: string;
-  onopen: (() => void) | null = null;
-  onmessage: ((ev: { data: unknown }) => void) | null = null;
-  onclose: (() => void) | null = null;
-  onerror: (() => void) | null = null;
-  constructor(url: string) { this.url = url; Socket.latest = this; }
-  send(data: string): void {
-    this.frames.push(data);
-    const msg = JSON.parse(data) as { t?: string; reqId?: string; op?: Record<string, unknown> };
-    if (msg.t !== "req" || !msg.reqId) return;
-    const reqId = msg.reqId;
-    void Promise.resolve().then(() => Socket.respond ? Socket.respond(msg.op ?? {}) : null).then(
-      answer => this.deliver({ t: "res", reqId, ok: true, data: answer }),
-      error => this.deliver({ t: "res", reqId, ok: false, error: String(error) }),
-    );
-  }
-  open(): void { this.readyState = 1; this.onopen?.(); }
-  deliver(msg: unknown): void { this.onmessage?.({ data: JSON.stringify(msg) }); }
-  close(): void { this.readyState = 3; this.onclose?.(); }
-}
-
 interface Element { dataset: Record<string, string>; innerHTML: string; value: string; hidden: boolean; scrollTop: number }
 
 function install(storage: Storage): { sheet(): Element; diff(): Element } {
@@ -140,6 +115,7 @@ function install(storage: Storage): { sheet(): Element; diff(): Element } {
       ? { configurable: true, enumerable: true, value: storage.getItem(key) } : undefined,
   }));
   define("WebSocket", Socket);
+  define("nacl", fixtureNacl);
   define("document", {
     documentElement: { lang: "", dataset: {} as Record<string, string> },
     visibilityState: "visible",
@@ -182,7 +158,9 @@ async function launch(): Promise<{ app: AppBoundary; socket: Socket; sheet: () =
   const storage = new Storage();
   const elements = install(storage);
   Socket.respond = null;
+  Socket.latest = null;
   storage.setItem("rr.token", JSON.stringify(TOKEN));
+  storage.setItem("rr.relay", JSON.stringify(fixtureRelayPairing(ORIGIN)));
   if (AppClass === null) {
     storage.setItem("rr.token", JSON.stringify(""));
     const specifier = "../web/app.ts";
@@ -193,8 +171,9 @@ async function launch(): Promise<{ app: AppBoundary; socket: Socket; sheet: () =
   const app = new AppClass({ state: "connecting", attempt: 0, nextAt: null, lastRx: null, downSince: null });
   app.ui.models = [];
   await app.start();
-  const socket = Socket.latest;
+  const socket = Socket.current();
   assert.ok(socket);
+  assert.match(socket.url, /^wss:\/\//);
   socket.open();
   socket.deliver({ t: "ready", host: { name: "Mac", version: "t", routerOk: true, capabilities: { sessionFiles: true, diffScope: true } }, sessions: [] });
   return { app, socket, sheet: elements.sheet, diff: elements.diff };

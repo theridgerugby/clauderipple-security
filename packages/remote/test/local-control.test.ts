@@ -2,6 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
+import https from "node:https";
+import net from "node:net";
+import { checkServerIdentity } from "node:tls";
 import os from "node:os";
 import path from "node:path";
 import { once } from "node:events";
@@ -14,12 +17,30 @@ import { SettingsJobs } from "../src/settings-jobs.ts";
 import { HostServer } from "../src/server.ts";
 import { ExpoNotifier } from "../src/expo-push.ts";
 import { posixModes } from "../../../test/capabilities.ts";
+import { localControlHome, localControlRequest, readLocalControlState } from "../src/local-transport.ts";
+import { ADMIN_TOKEN_HEADER } from "../../router/src/admin-auth.ts";
+import { peerFixtureUrl } from "./peer-fixture.ts";
+import { ensurePhonePairingSecurity } from "../src/phone-auth-migration.ts";
+
+async function rawControl(dir: string, route: string, headers: Record<string, string> = {}, method = "GET"): Promise<number> {
+  const state = readLocalControlState(dir); assert.ok(state);
+  return new Promise((resolve, reject) => {
+    const request = https.request({ host: "127.0.0.1", port: state.endpoint.tlsPort, path: `/api/local/${route}`, method,
+      ca: state.identity.caCertPem, rejectUnauthorized: true, servername: "", agent: false,
+      checkServerIdentity: (_name, cert) => checkServerIdentity("127.0.0.1", cert), headers: {
+        [ADMIN_TOKEN_HEADER]: state.token, "x-clauderipple-instance-id": state.endpoint.instanceId, ...headers,
+      } }, response => { response.resume(); response.on("end", () => resolve(response.statusCode!)); });
+    request.on("error", reject); request.end();
+  });
+}
 
 async function fixture(t: import("node:test").TestContext, relay?: string, listen = "127.0.0.1", mod?: import("../src/local-control.ts").ModHost) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-local-"));
   const cfg = loadConfig(dir);
   if (relay) cfg.relay = relay;
   saveConfig(cfg, dir);
+  const pairing = ensurePhonePairingSecurity(dir);
+  cfg.token = pairing.token; cfg.pairingSecurityVersion = pairing.pairingSecurityVersion;
   const logs: string[] = [];
   const push = new ExpoNotifier({ dir, send: async () => "sent", seenRecently: () => false, log: line => logs.push(line) });
   push.subscribe("offline-phone", "ExpoPushToken[offline]", "en");
@@ -37,15 +58,16 @@ async function fixture(t: import("node:test").TestContext, relay?: string, liste
     pushDevices: () => push.devices(), clearPush: () => { for (const id of push.devices()) push.unsubscribe(id); },
   });
   await host.listen();
+  saveConfig(cfg, dir);
   t.after(async () => { await host.close(); fs.rmSync(dir, { recursive: true, force: true }); });
   const secret = localSecret(dir);
   const base = `http://127.0.0.1:${host.address().port}`;
-  const call = (route: string, body?: unknown) => fetch(`${base}/local/${route}`, { headers: { "x-ripple-local": secret }, ...(body === undefined ? {} : { method: "POST", body: JSON.stringify(body) }) });
+  const call = (route: string, body?: unknown) => localControlRequest(dir, `/local/${route}`, body === undefined ? {} : { method: "POST", body: JSON.stringify(body) });
   return { dir, cfg, host, local, logs, push, call, base, secret, inbox, outcomes, settingsJobs };
 }
 
-async function hello(t: import("node:test").TestContext, port: number, token: string, id = "online-phone") {
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+async function hello(t: import("node:test").TestContext, host: HostServer, token: string, id = "online-phone") {
+  const ws = new WebSocket(await peerFixtureUrl(t, host));
   ws.on("error", () => {});
   t.after(() => ws.terminate());
   await once(ws, "open");
@@ -56,34 +78,37 @@ async function hello(t: import("node:test").TestContext, port: number, token: st
 }
 
 test("refresh is authenticated, refuses a busy host and only requests self-exit after idle reservation", async t => {
-  const f = await fixture(t);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-refresh-"));
+  const cfg = loadConfig(dir); saveConfig(cfg, dir);
   let busy = true, reservations = 0, exits = 0;
-  const local = new LocalControl({ dir: f.dir, config: f.cfg, version: "old", hostPublicKey: "public", phones: () => [], rotate() {},
+  const local = new LocalControl({ dir, config: cfg, version: "old", hostPublicKey: "public", phones: () => [], rotate() {},
     prepareRefresh: () => { reservations++; return !busy; }, refresh: () => { exits++; } });
-  const server = http.createServer((req, res) => { void local.handle(req, res); });
-  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
-  const address = server.address(); assert.ok(address && typeof address !== "string");
-  const url = `http://127.0.0.1:${address.port}/local/refresh`;
-  assert.equal((await fetch(url, { method: "POST" })).status, 403);
+  await local.listen(cfg.port);
+  t.after(async () => { await local.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  assert.equal(await rawControl(dir, "refresh", { [ADMIN_TOKEN_HEADER]: "wrong" }, "POST"), 403);
   assert.equal(reservations, 0);
-  const refresh = () => fetch(url, { method: "POST", headers: { "x-ripple-local": f.secret } });
+  const refresh = () => localControlRequest(dir, "/local/refresh", { method: "POST" });
   assert.equal((await refresh()).status, 409); assert.equal(exits, 0);
   busy = false;
   assert.equal((await refresh()).status, 200); assert.equal(exits, 1);
 });
 
-test("local control requires both a loopback socket and the one persistent 0600 secret", async t => {
+test("local control requires authenticated TLS, loopback, and the new persistent private capability", async t => {
   const f = await fixture(t);
   assert.equal(localSecret(f.dir), f.secret);
-  if (posixModes) assert.equal(fs.statSync(path.join(f.dir, "local.secret")).mode & 0o777, 0o600);
+  assert.equal(fs.existsSync(path.join(f.dir, "local.secret")), false);
+  if (posixModes) assert.equal(fs.statSync(path.join(localControlHome(f.dir), "admin-tls-token")).mode & 0o777, 0o600);
   for (const address of ["127.0.0.1", "127.0.0.2", "::1", "::ffff:127.0.0.1"]) assert.equal(isLoopback(address), true);
   for (const address of [undefined, "10.0.0.1", "100.64.0.1", "::ffff:192.168.1.2"]) assert.equal(isLoopback(address), false);
   for (const headers of [{}, { "x-ripple-local": "wrong" }, { "x-forwarded-for": "127.0.0.1" }]) {
-    assert.equal((await fetch(`${f.base}/local/status`, { headers })).status, 403);
+    assert.equal((await fetch(`${f.base}/local/status`, { headers })).status, 410);
   }
+  assert.equal(await rawControl(f.dir, "status", { [ADMIN_TOKEN_HEADER]: "wrong" }), 403);
+  assert.equal(await rawControl(f.dir, "status", { "x-clauderipple-instance-id": "b".repeat(32) }), 403);
+  assert.equal(await rawControl(f.dir, "status", { origin: "https://evil.example" }), 403);
+  assert.equal(await rawControl(f.dir, "status", { host: "evil.example" }), 403);
   assert.equal((await f.call("status")).status, 200);
-  // Socket boundary, not X-Forwarded-For: emulate a LAN socket even with a correct secret.
+  // A plaintext socket never becomes authenticated TLS through forwarded headers.
   const lan = http.createServer((req, res) => {
     Object.defineProperty(req.socket, "remoteAddress", { value: "192.168.1.23" });
     void f.local.handle(req, res);
@@ -100,17 +125,46 @@ test("a specific interface bind adds only local control on IPv4 loopback", async
   assert.equal((await f.call("status")).status, 200);
   assert.equal((await fetch(`${f.base}/healthz`)).status, 404);
   assert.equal((await fetch(`http://[::1]:${f.host.address().port}/healthz`)).status, 200);
-  assert.equal((await fetch(`${f.base}/local/status`)).status, 403);
+  assert.equal((await fetch(`${f.base}/local/status`)).status, 410);
 });
 
-test("pairing returns direct or relay URL and QR SVG without any credential logs", async t => {
+test("retired plaintext local-control routes close an unsent request body without exposing credentials", async t => {
+  const f = await fixture(t);
+  const socket = net.connect({ host: "127.0.0.1", port: f.host.address().port });
+  let received = "";
+  socket.setEncoding("utf8"); socket.on("data", chunk => { received += chunk; });
+  try {
+    await once(socket, "connect", { signal: AbortSignal.timeout(2_000) });
+    const closed = once(socket, "close", { signal: AbortSignal.timeout(2_000) });
+    socket.write(`POST /local/status HTTP/1.1\r\nHost: 127.0.0.1:${f.host.address().port}\r\nContent-Length: 999999\r\nConnection: keep-alive\r\n\r\n`);
+    await closed;
+    assert.match(received, /^HTTP\/1\.1 410 /);
+    assert.match(received, /\r\nconnection: close\r\n/i);
+    assert.equal(received.includes(f.secret), false);
+    assert.equal(received.includes(f.cfg.token), false);
+  } finally { socket.destroy(); }
+});
+
+test("pairing refuses plaintext direct mode and returns only secure relay URLs without credential logs", async t => {
   for (const relay of [undefined, "https://relay.example"]) {
     const f = await fixture(t, relay);
     const response = await f.call("pairing");
     assert.equal(response.headers.get("cache-control"), "no-store");
+    if (!relay) {
+      assert.equal(response.status, 409);
+      const text = await response.text();
+      assert.equal(text.includes(f.cfg.token), false);
+      assert.equal(text.includes("#pair="), false);
+      const status = await (await f.call("status")).json() as { mode: string; pushReady: boolean; reachableFromPhone: boolean };
+      assert.equal(status.mode, "local-only");
+      assert.equal(status.pushReady, false);
+      assert.equal(status.reachableFromPhone, false);
+      continue;
+    }
+    assert.equal(response.status, 200);
     const pairing = await response.json() as { url: string; svg: string };
     const url = new URL(pairing.url);
-    assert.equal(url.origin, relay ?? `http://127.0.0.1:${f.cfg.port}`);
+    assert.equal(url.origin, relay);
     assert.equal(new URLSearchParams(url.hash.slice(1)).get("pair"), f.cfg.token);
     if (relay) assert.equal(new URLSearchParams(url.hash.slice(1)).get("hpk"), "public-key");
     assert.match(pairing.svg, /^<svg\s/);
@@ -125,9 +179,9 @@ test("pairing returns direct or relay URL and QR SVG without any credential logs
 });
 
 test("rotate immediately drops authenticated sockets, clears push, and refuses the old token", async t => {
-  const f = await fixture(t);
+  const f = await fixture(t, "https://relay.example");
   const old = f.cfg.token;
-  const online = await hello(t, f.host.address().port, old);
+  const online = await hello(t, f.host, old);
   assert.equal(online.frame.t, "ready");
   const status = await (await f.call("status")).json() as { phones: { clientId: string; connected: boolean; push: boolean }[] };
   assert.deepEqual(status.phones.map(p => [p.clientId, p.connected, p.push]), [["offline-phone", false, true], ["online-phone", true, false]]);
@@ -137,16 +191,27 @@ test("rotate immediately drops authenticated sockets, clears push, and refuses t
   assert.notEqual(loadConfig(f.dir, false).token, old);
   assert.deepEqual(f.push.devices(), []);
   assert.deepEqual(new ExpoNotifier({ dir: f.dir, send: async () => "sent", seenRecently: () => false, log: () => {} }).devices(), []);
-  assert.equal((await hello(t, f.host.address().port, old)).frame.t, "denied");
-  assert.equal((await hello(t, f.host.address().port, loadConfig(f.dir, false).token)).frame.t, "ready");
+  assert.equal((await hello(t, f.host, old)).frame.t, "denied");
+  assert.equal((await hello(t, f.host, loadConfig(f.dir, false).token)).frame.t, "ready");
   const pairing = await (await f.call("pairing")).json() as { url: string };
   assert.equal(new URLSearchParams(new URL(pairing.url).hash.slice(1)).get("pair"), f.cfg.token);
+});
+
+test("a legacy unrotated host refuses even a relay pairing URL", async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-pairing-legacy-"));
+  const cfg = loadConfig(dir); cfg.relay = "https://relay.example"; saveConfig(cfg, dir);
+  const local = new LocalControl({ dir, config: cfg, version: "test", hostPublicKey: "public", phones: () => [], rotate() {} });
+  await local.listen(cfg.port);
+  t.after(async () => { await local.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  const response = await localControlRequest(dir, "/local/pairing");
+  assert.equal(response.status, 409);
+  assert.equal((await response.text()).includes(cfg.token), false);
 });
 
 test("inbox routes authenticate, validate and enforce first-wins without logging text", async t => {
   const f = await fixture(t);
   const offered = f.inbox.offer({ sessionId: "cli-1", itemId: "item-1", text: "private inbox text", offeredAt: 123 }, 1000);
-  assert.equal((await fetch(`${f.base}/local/inbox?session=cli-1`)).status, 403);
+  assert.equal((await fetch(`${f.base}/local/inbox?session=cli-1`)).status, 410);
   assert.equal((await f.call("inbox")).status, 400);
   assert.deepEqual(await (await f.call("inbox?session=other")).json(), { offers: [] });
   assert.deepEqual(await (await f.call("inbox?session=cli-1")).json(), { offers: [{ sessionId: "cli-1", itemId: "item-1", text: "private inbox text", offeredAt: 123 }] });
@@ -159,7 +224,7 @@ test("inbox routes authenticate, validate and enforce first-wins without logging
   assert.equal((await f.call("inbox/result", { itemId: "item-1", outcome: "submitted" })).status, 200);
   assert.deepEqual(f.outcomes, ["submitted"]);
   assert.equal((await f.call("inbox/result", { itemId: "item-1", outcome: "submitted" })).status, 409);
-  assert.equal((await fetch(`${f.base}/local/inbox/claim`, { method: "POST", headers: { "x-ripple-local": f.secret }, body: "x".repeat(4097) })).status, 400);
+  assert.equal((await localControlRequest(f.dir, "/local/inbox/claim", { method: "POST", body: "x".repeat(4097) })).status, 400);
   assert.equal(f.logs.join("\n").includes("private inbox text"), false);
 });
 
@@ -172,7 +237,7 @@ test("the mod poll's send time reaches the host as a number, and a malformed one
     reportMoved: () => true,
   };
   const f = await fixture(t, undefined, "127.0.0.1", mod);
-  const poll = (query: string) => fetch(`${f.base}/local/mod/approval?${query}`, { headers: { "x-ripple-local": f.secret } });
+  const poll = (query: string) => localControlRequest(f.dir, `/local/mod/approval?${query}`);
   assert.deepEqual(await (await poll("askId=ask-1&sentAt=1700000000000")).json(), { state: "pending" });
   assert.equal((await poll("askId=ask-1")).status, 200, "a mod that sends no send time is answered as before");
   for (const bad of ["sentAt=", "sentAt=-5", "sentAt=1.5", "sentAt=soon", "sentAt=1&sentAt=2", `sentAt=${"9".repeat(16)}`]) {
@@ -190,7 +255,7 @@ test("mod routes authenticate and validate, hand approvals and move reports to t
     reportMoved: (itemId: string, from: string, to: string) => { calls.push(["moved", itemId, from, to]); return itemId === "claimed"; },
   };
   const f = await fixture(t, undefined, "127.0.0.1", mod);
-  assert.equal((await fetch(`${f.base}/local/mod/approval`, { method: "POST", body: "{}" })).status, 403, "the secret is required");
+  assert.equal((await fetch(`${f.base}/local/mod/approval`, { method: "POST", body: "{}" })).status, 410, "plaintext local control has been removed");
   const valid = { askId: "ask-1", session: "cli-1", tool: "Bash", input: { command: "ls" }, suggestions: [], title: "" };
   assert.deepEqual(await (await f.call("mod/approval", valid)).json(), { state: "hold" });
   for (const bad of [{ ...valid, askId: "bad id" }, { ...valid, input: [] }, { ...valid, session: "" }, { ...valid, tool: "" }, { ...valid, suggestions: "x" }, { ...valid, title: 7 }, null, []]) {
@@ -198,9 +263,9 @@ test("mod routes authenticate and validate, hand approvals and move reports to t
   }
   assert.equal((await f.call("mod/approval", { ...valid, input: { command: "x".repeat(600 * 1024) } })).status, 400, "a request over the cap is refused, never started");
   assert.deepEqual(await (await f.call("mod/approval/poll")).status, 404, "an unknown mod route is not answered");
-  assert.deepEqual(await (await fetch(`${f.base}/local/mod/approval?askId=ask-1`, { headers: { "x-ripple-local": f.secret } })).json(), { state: "pending" });
-  assert.equal((await fetch(`${f.base}/local/mod/approval?askId=bad%20id`, { headers: { "x-ripple-local": f.secret } })).status, 400);
-  assert.equal((await fetch(`${f.base}/local/mod/approval?askId=a&askId=b`, { headers: { "x-ripple-local": f.secret } })).status, 400);
+  assert.deepEqual(await (await f.call("mod/approval?askId=ask-1")).json(), { state: "pending" });
+  assert.equal((await f.call("mod/approval?askId=bad%20id")).status, 400);
+  assert.equal((await f.call("mod/approval?askId=a&askId=b")).status, 400);
   assert.equal((await f.call("mod/approval/done", { askId: "ask-1" })).status, 200);
   assert.equal((await f.call("mod/approval/done", {})).status, 400);
   assert.equal((await f.call("mod/moved", { itemId: "claimed", from: "cli-1", to: "cli-2" })).status, 200);
@@ -225,7 +290,7 @@ test("the approval done route hands a phone answer back to the hook, and says no
 test("settings job routes authenticate, validate and enforce one helper", async t => {
   const f = await fixture(t);
   f.settingsJobs.request({ jobId: "job-1", appSessionId: "local_target", cliSessionId: "cli-1", model: "private-model", createdAt: 1 });
-  assert.equal((await fetch(`${f.base}/local/settings-jobs?exclude=local_helper`)).status, 403);
+  assert.equal((await fetch(`${f.base}/local/settings-jobs?exclude=local_helper`)).status, 410);
   for (const query of ["", "?exclude=bad%20id", "?exclude=a&exclude=b"]) assert.equal((await f.call(`settings-jobs${query}`)).status, 400);
   assert.deepEqual(await (await f.call("settings-jobs?exclude=local_target")).json(), { jobs: [] });
   assert.equal(((await (await f.call("settings-jobs?exclude=local_helper")).json()) as { jobs: unknown[] }).jobs.length, 1);
@@ -237,7 +302,7 @@ test("settings job routes authenticate, validate and enforce one helper", async 
   assert.equal((await f.call("settings-jobs/claim", { jobId: "job-1", helper: "local_helper" })).status, 409);
   assert.equal((await f.call("settings-jobs/result", { jobId: "job-1", outcome: "failed", detail: "refused" })).status, 200);
   assert.deepEqual(f.settingsJobs.status("local_target"), { jobId: "job-1", outcome: "failed", detail: "refused" });
-  assert.equal((await fetch(`${f.base}/local/settings-jobs/claim`, { method: "POST", headers: { "x-ripple-local": f.secret }, body: "x".repeat(4097) })).status, 400);
+  assert.equal((await localControlRequest(f.dir, "/local/settings-jobs/claim", { method: "POST", body: "x".repeat(4097) })).status, 400);
   assert.equal(f.logs.join("\n").includes("private-model"), false);
 });
 
@@ -248,7 +313,7 @@ test("settings validates before saving, preserves secrets and distinguishes runn
     assert.equal((await f.call("settings", bad)).status, 400);
     assert.equal(fs.readFileSync(path.join(f.dir, "host.json"), "utf8"), original);
   }
-  assert.deepEqual(await (await f.call("settings", { relay: "https://relay.example/path", bind: "local" })).json(), { restartRequired: true });
+  assert.deepEqual(await (await f.call("settings", { relay: "https://relay.example", bind: "local" })).json(), { restartRequired: true });
   const saved = loadConfig(f.dir, false);
   assert.equal(saved.relay, "https://relay.example");
   assert.equal(saved.token, f.cfg.token);

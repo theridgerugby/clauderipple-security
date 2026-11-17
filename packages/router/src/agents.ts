@@ -58,15 +58,15 @@ const BODY = [
 
 /**
  * Added to the body when a ChatGPT provider is configured: how a worker makes an image. A worker has
- * no image tool, and `clauderipple` is not on PATH for everyone (a checkout runs from source), so
- * the instruction is the admin endpoint itself, which curl reaches on every platform. A GPT main
+ * no image tool. The CLI reads the local admin credential without putting it in the generated
+ * agent file or a shell command. A source checkout needs its CLI launcher on PATH. A GPT main
  * session gets the same lines in its instructions (proxy.ts).
  */
-export function imageLine(port: number): string {
+export function imageLine(_port: number): string {
   return [
     "이미지가 필요하면 ChatGPT 구독으로 만든다(한 장 30초~수 분):",
-    `\`curl -sS --fail-with-body -o <절대경로>.png -H 'content-type: application/json' -d '{"prompt":"…"}' http://127.0.0.1:${port}/api/image\``,
-    "선택 키: aspect(square·landscape·portrait), background(transparent), format(png·jpeg·webp), images(참고 이미지 data: URL 목록). 해상도·품질은 지정할 수 없다. 실패하면 그 파일에 오류 JSON이 담긴다. 만든 뒤 Read로 확인한다.",
+    "`clauderipple image '…' -o <절대경로>.png`",
+    "선택 옵션: --aspect square|landscape|portrait, --transparent, --format png|jpeg|webp, --ref <참고 이미지 경로>(반복 가능). 해상도·품질은 지정할 수 없다. CLI가 로컬 인증을 처리하므로 토큰을 명령줄에 넣지 않는다. 만든 뒤 Read로 확인한다.",
   ].join("\n");
 }
 

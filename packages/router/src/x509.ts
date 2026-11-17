@@ -13,6 +13,7 @@
 // and the tests cross-check every field against openssl.
 
 import crypto from "node:crypto";
+import net from "node:net";
 
 // ---- DER writing ------------------------------------------------------------------------
 
@@ -204,9 +205,34 @@ function subjectKeyIdentifier(spki: Buffer): Buffer {
   return extension("2.5.29.14", false, tlv(TAG.OCTET_STRING, hash));
 }
 
-/** dNSName is [2] IMPLICIT IA5String inside GeneralNames. */
+/** GeneralName iPAddress uses network-order bytes, never a DNS string containing an IP. */
+function ipAddressBytes(host: string): Buffer | undefined {
+  const family = net.isIP(host);
+  if (!family) return undefined;
+  if (host.includes("%")) throw new Error("certificate IP addresses cannot contain a scope identifier");
+  if (family === 4) return Buffer.from(host.split(".").map(Number));
+  // net.isIP validates the grammar before expanding :: and the optional IPv4 suffix.
+  let normalized = host;
+  if (host.includes(".")) {
+    const colon = host.lastIndexOf(":");
+    const bytes = host.slice(colon + 1).split(".").map(Number);
+    normalized = host.slice(0, colon + 1) + ((bytes[0]! << 8) | bytes[1]!).toString(16) + ":" + ((bytes[2]! << 8) | bytes[3]!).toString(16);
+  }
+  const halves = normalized.split("::");
+  const left = halves[0] ? halves[0].split(":") : [];
+  const right = halves[1] ? halves[1].split(":") : [];
+  const words = halves.length === 1 ? left : [...left, ...Array<string>(8 - left.length - right.length).fill("0"), ...right];
+  const bytes = Buffer.alloc(16);
+  words.forEach((word, index) => bytes.writeUInt16BE(Number.parseInt(word, 16), index * 2));
+  return bytes;
+}
+
+/** dNSName is [2] IA5String; iPAddress is [7] OCTET STRING inside GeneralNames. */
 function subjectAltName(hosts: string[]): Buffer {
-  return extension("2.5.29.17", false, seq(...hosts.map((h) => tlv(0x82, Buffer.from(h, "ascii")))));
+  return extension("2.5.29.17", false, seq(...hosts.map((h) => {
+    const ip = ipAddressBytes(h);
+    return ip ? tlv(0x87, ip) : tlv(0x82, Buffer.from(h, "ascii"));
+  })));
 }
 
 export type Issued = { certPem: string; keyPem: string };

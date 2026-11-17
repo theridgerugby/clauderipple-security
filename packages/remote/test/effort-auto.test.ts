@@ -32,11 +32,11 @@ test("Auto is written with the revision that was read, leaving every other setti
   const { calls, fetch } = recording((_url, init) => init?.method === "PUT"
     ? reply(200, { settings: { ...settings, effortAuto: true }, revision: 8 })
     : reply(200, { settings, revision: 7 }));
-  assert.equal(await new RouterClient("http://router/", fetch).setEffortAuto(true), true);
+  assert.equal(await new RouterClient("http://127.0.0.1:8792/", fetch).setEffortAuto(true), true);
   assert.equal(calls.length, 2);
   assert.equal(calls[0]!.init?.method, undefined, "the read is a plain GET");
   const put = calls[1]!;
-  assert.equal(put.url, "http://router/api/mod-settings");
+  assert.equal(put.url, "http://127.0.0.1:8792/api/mod-settings");
   assert.equal(put.init?.method, "PUT");
   assert.equal(put.init?.headers?.["content-type"], "application/json");
   assert.deepEqual(JSON.parse(put.init!.body!), { schemaVersion: 2, revision: 7, settings: { ...settings, effortAuto: true } });
@@ -50,7 +50,7 @@ test("a stale save retries from the 409 snapshot, at most three attempts", async
     if (init?.method !== "PUT") return reply(200, first);
     return puts++ === 0 ? reply(409, second) : reply(200, { settings: { ...second.settings, effortAuto: true }, revision: 6 });
   });
-  assert.equal(await new RouterClient("http://router", fetch).setEffortAuto(true), true);
+  assert.equal(await new RouterClient("http://127.0.0.1:8792", fetch).setEffortAuto(true), true);
   assert.deepEqual(calls.map(call => call.init?.method ?? "GET"), ["GET", "PUT", "PUT"]);
   assert.equal(JSON.parse(calls[1]!.init!.body!).revision, 3);
   assert.deepEqual(JSON.parse(calls[2]!.init!.body!), { schemaVersion: 2, revision: 5, settings: { effortAuto: true, floor: "high" } });
@@ -59,17 +59,17 @@ test("a stale save retries from the 409 snapshot, at most three attempts", async
   const always = recording((_url, init) => init?.method !== "PUT"
     ? reply(200, first)
     : reply(409, { settings: first.settings, revision: ++stale }));
-  await assert.rejects(new RouterClient("http://router", always.fetch).setEffortAuto(false), /revision changed too often/);
+  await assert.rejects(new RouterClient("http://127.0.0.1:8792", always.fetch).setEffortAuto(false), /revision changed too often/);
   assert.equal(always.calls.filter(call => call.init?.method === "PUT").length, 3, "three attempts, then it stops");
 });
 
 test("a router that refuses the write or has no settings is an error, not a silent success", async () => {
   const refused = recording((_url, init) => init?.method === "PUT" ? reply(500, { error: "no" }) : reply(200, { settings: { effortAuto: false }, revision: 1 }));
-  await assert.rejects(new RouterClient("http://router", refused.fetch).setEffortAuto(true), /HTTP 500/);
+  await assert.rejects(new RouterClient("http://127.0.0.1:8792", refused.fetch).setEffortAuto(true), /HTTP 500/);
   assert.equal(refused.calls.filter(call => call.init?.method === "PUT").length, 1, "a 500 is not retried");
 
   const empty = recording(() => reply(200, { revision: 1 }));
-  await assert.rejects(new RouterClient("http://router", empty.fetch).setEffortAuto(true), /no mod settings/);
+  await assert.rejects(new RouterClient("http://127.0.0.1:8792", empty.fetch).setEffortAuto(true), /no mod settings/);
 });
 
 // ---- the host's answer to the phone -----------------------------------------------------------

@@ -9,6 +9,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { withFileLock, writeJsonAtomic } from "../locked-file.ts";
+import { readPrivateFile } from "../private-file.ts";
 import { readClaudeAuthFile, removeClaudeAuthFile } from "./anthropic-token-file.ts";
 
 export type ClaudeOAuthAccountGrant = {
@@ -99,7 +100,7 @@ function validAccount(value: unknown): value is ClaudeOAuthAccount {
 
 function parseClaudeAccountsFile(home: string): ClaudeOAuthAccount[] | null {
   try {
-    const parsed = JSON.parse(fs.readFileSync(claudeAccountsPath(home), "utf8")) as Partial<ClaudeAccountsFile>;
+    const parsed = JSON.parse(readPrivateFile(claudeAccountsPath(home)).toString("utf8")) as Partial<ClaudeAccountsFile>;
     if (parsed.version !== 1 || !Array.isArray(parsed.accounts) || !parsed.accounts.every(validAccount)) return null;
     const seen = new Set<string>();
     return parsed.accounts.filter((account) => !seen.has(account.id) && seen.add(account.id)).map((account) => ({ ...account }));

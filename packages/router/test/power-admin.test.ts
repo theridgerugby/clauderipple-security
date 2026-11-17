@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, awakeSettings, ssidProblem, tetherSettings, validate, type Config } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
-import { startAdmin } from "../src/admin.ts";
+import { startAdmin, fetch } from "./admin-client.ts";
 import { RequestLog } from "../src/requestlog.ts";
 import { parsePowerChange, persistPowerChange, type PowerApi, type PowerStatus } from "../src/power.ts";
 

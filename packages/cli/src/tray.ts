@@ -16,7 +16,7 @@ import { bundleIdOf, findIcon } from "./launcher.ts";
 import { runtime } from "./runtime.ts";
 
 /** Electron version to fetch on request. Kept in step with the one the app is developed against. */
-const ELECTRON_RANGE = "^38.1.0";
+export const ELECTRON_VERSION = "45.3.3";
 
 /**
  * Where Electron is fetched to: ClaudeRipple's home, not the package. Until 0.6 it went into the
@@ -39,9 +39,9 @@ function resolveElectron(from: string): string | null {
 }
 
 /** The Electron executable to run the tray with, or null when none has been fetched. */
-export function electronPath(): string | null {
+export function electronPath(home: string = homeDir()): string | null {
   // A checkout or an install from before 0.6 resolves it next to us.
-  return resolveElectron(path.join(trayRuntimeDir(), "package.json")) ?? resolveElectron(import.meta.url);
+  return resolveElectron(path.join(home, "tray-runtime", "package.json")) ?? resolveElectron(import.meta.url);
 }
 
 /** Our own name, identifier and icon for the tray's bundle. */
@@ -329,7 +329,7 @@ export function trayRuntimeRange(dir = trayRuntimeDir()): string | null {
  * never updated by `npm install` of ClaudeRipple itself: the runtime lives in the home folder, not
  * in the package (B15). A copy without the record cannot be proved current, so it is replaced.
  */
-export function trayRuntimeMatches(range = ELECTRON_RANGE, dir = trayRuntimeDir()): boolean {
+export function trayRuntimeMatches(range = ELECTRON_VERSION, dir = trayRuntimeDir()): boolean {
   return trayRuntimeRange(dir) === range;
 }
 
@@ -385,13 +385,25 @@ export type TrayInstallDeps = {
   platform?: NodeJS.Platform;
 };
 
+type ElectronInstaller = (program: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; stdio: "inherit" }) => { status: number | null };
+
+/** Fetch a version pin without dependency lifecycle hooks, then run only Electron's downloader. */
+export function installElectronPackage(staging: string, npm: string, run: ElectronInstaller = spawnSync): number | null {
+  const options = { cwd: staging, env: npmEnv(), stdio: "inherit" as const };
+  const installed = run(process.execPath, [npm, "install", "--prefix", staging, "--no-package-lock", "--save-exact", "--registry", "https://registry.npmjs.org", "--ignore-scripts", "--loglevel", "error", `electron@${ELECTRON_VERSION}`], options);
+  if (installed.status !== 0) return installed.status;
+  // install.js is the explicitly reviewed entry point from this exact Electron package. npm's
+  // other hooks, including transitive postinstall scripts, are never enabled for this fetch.
+  return run(process.execPath, [path.join(staging, "node_modules", "electron", "install.js")], options).status;
+}
+
 /** Fetches Electron into this installation so the tray can run. Prints npm's own progress. */
 export function installTrayRuntime(options: { refresh?: boolean } & TrayInstallDeps = {}): TrayStart {
   const target = options.target ?? trayRuntimeDir();
   // A refresh replaces a runtime an older ClaudeRipple fetched; without one, an existing copy is
   // what the tray runs and is left alone.
   const existing = options.existing === undefined ? electronPath() : options.existing;
-  if (existing && (!options.refresh || trayRuntimeMatches(ELECTRON_RANGE, target))) return { ok: true, message: "✓ Electron is already installed" };
+  if (existing && (!options.refresh || trayRuntimeMatches(ELECTRON_VERSION, target))) return { ok: true, message: "✓ Electron is already installed" };
   const cli = npmCli();
   if (!cli && !options.install) return { ok: false, message: `found no npm next to ${process.execPath}; install Electron yourself: npm install electron` };
   // Into a copy of its own first: npm failing (offline, a locked file) must leave the tray runnable.
@@ -401,11 +413,7 @@ export function installTrayRuntime(options: { refresh?: boolean } & TrayInstallD
   fs.mkdirSync(staging, { recursive: true });
   const status = options.install
     ? options.install(staging)
-    : spawnSync(process.execPath, [cli!, "install", "--prefix", staging, "--no-package-lock", "--loglevel", "error", `electron@${ELECTRON_RANGE}`], {
-      cwd: staging,
-      env: npmEnv(),
-      stdio: "inherit",
-    }).status;
+    : installElectronPackage(staging, cli!);
   if (status !== 0) {
     try { fs.rmSync(staging, { recursive: true, force: true }); } catch { /* left for the next run */ }
     return { ok: false, message: `npm could not install Electron into ${staging}` };

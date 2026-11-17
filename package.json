@@ -25,9 +25,14 @@
     "build": "node scripts/build-npm.mjs"
   },
   "devDependencies": {
+    "@electron/fuses": "1.8.0",
     "@types/node": "^24.3.0",
     "@types/proper-lockfile": "^4.1.4",
+    "electron-builder": "26.18.0",
     "typescript": "^5.9.2"
+  },
+  "overrides": {
+    "minimatch@>=9 <11": "11.0.9"
   },
   "type": "module",
   "bin": {
@@ -83,8 +88,8 @@
     "tweetnacl": "1.0.3",
     "web-push": "3.6.7",
     "ws": "8.21.3",
-    "zod": "4.1.12",
+    "zod": "4.6.7",
     "proper-lockfile": "^4.1.2",
-    "undici": "7.24.4"
+    "undici": "7.30.2"
   }
 }

@@ -1,7 +1,7 @@
 #!/bin/sh
 # ClaudeRipple installer for macOS and Linux.
 #
-#   curl -fsSL https://raw.githubusercontent.com/PBJ-2/clauderipple/main/scripts/install.sh | sh
+# Run a reviewed local copy from the intended release: sh ./install.sh
 #
 # Installing from npm needs npm, which needs Node, which is the one thing a first-time user is not
 # guaranteed to have. So this script brings its own: it uses a Node 24+ already on PATH when there
@@ -26,6 +26,10 @@ RUNTIME="$PREFIX/runtime"
 say() { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# Literal paths become shell source in the command shim and the user's profile. Single-quote
+# every byte, escaping an apostrophe by ending the quote, writing it escaped, then reopening it.
+shell_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
 # The previous runtime survives until npm and the command wrapper have both succeeded. Record the
 # backup name before the first rename so even a failure immediately after that rename rolls back.
@@ -88,7 +92,7 @@ download_node() {
     *) die "unsupported processor: $(uname -m). Install Node $NODE_MAJOR+ yourself, then: npm install -g clauderipple" ;;
   esac
   version="$(curl -fsSL https://nodejs.org/dist/index.json 2>/dev/null |
-    tr ',' '\n' | grep -o '"v24\.[0-9]*\.[0-9]*"' | head -1 | tr -d '"')"
+    tr ',' '\n' | grep -Eo '"v24\.[0-9]+\.[0-9]+"' | head -1 | tr -d '"')"
   [ -n "$version" ] || version="$NODE_FALLBACK"
   name="node-$version-$os-$arch"
   base="https://nodejs.org/dist/$version"
@@ -98,7 +102,7 @@ download_node() {
   curl -fsSL "$base/$name.tar.gz" -o "$tmp/node.tar.gz" || die "could not download Node from $base"
   # The download is verified against the release's own checksum file before anything is unpacked.
   curl -fsSL "$base/SHASUMS256.txt" -o "$tmp/SHASUMS256.txt" || die "could not download the Node checksums"
-  expected="$(grep " $name.tar.gz\$" "$tmp/SHASUMS256.txt" | cut -d' ' -f1)"
+  expected="$(awk -v file="$name.tar.gz" '$2 == file && length($1) == 64 && $1 !~ /[^0-9a-fA-F]/ {print tolower($1)}' "$tmp/SHASUMS256.txt")"
   [ -n "$expected" ] || die "no checksum published for $name.tar.gz"
   if command -v shasum >/dev/null 2>&1; then actual="$(shasum -a 256 "$tmp/node.tar.gz" | cut -d' ' -f1)"
   elif command -v sha256sum >/dev/null 2>&1; then actual="$(sha256sum "$tmp/node.tar.gz" | cut -d' ' -f1)"
@@ -156,7 +160,7 @@ if [ -d "$OLD_ELECTRON" ] && [ ! -e "$NEW_ELECTRON" ]; then
 fi
 
 say "Installing ${PACKAGE}..."
-"$NODE" "$NPM_CLI" install --global --prefix "$PREFIX" --loglevel error "$PACKAGE"
+"$NODE" "$NPM_CLI" install --global --prefix "$PREFIX" --registry https://registry.npmjs.org --ignore-scripts --loglevel error "$PACKAGE"
 
 # Keep the install method with the prefix, even when CLAUDERIPPLE_PREFIX was set only once.
 "$NODE" -e 'const fs = require("node:fs"); const path = require("node:path"); const prefix = path.resolve(process.argv[1]); fs.writeFileSync(path.join(prefix, "clauderipple-install.json"), JSON.stringify({kind:"script", prefix}) + "\n");' "$PREFIX"
@@ -173,7 +177,7 @@ case "$NODE" in
     [ -f "$ENTRY" ] || die "the installed package has no entry point at $ENTRY"
     # Replaced by rename: an interrupted write leaves the command that was there, not half a file.
     WRAPPER="$BIN/.clauderipple.new.$$"
-    printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' "$NODE" "$ENTRY" > "$WRAPPER"
+    printf '#!/bin/sh\nexec %s %s "$@"\n' "$(shell_quote "$NODE")" "$(shell_quote "$ENTRY")" > "$WRAPPER"
     chmod +x "$WRAPPER"
     mv -f "$WRAPPER" "$BIN/clauderipple"
     ;;
@@ -208,7 +212,7 @@ if on_path; then
   :
 else
   profile="$(profile_file)"
-  line="export PATH=\"$BIN:\$PATH\""
+  line="export PATH=$(shell_quote "$BIN"):\"\$PATH\""
   if [ -f "$profile" ] && grep -Fq "$BIN" "$profile"; then
     say "$BIN is already in $profile; open a new terminal to pick it up."
   else

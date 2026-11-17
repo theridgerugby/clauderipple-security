@@ -3,20 +3,30 @@
 // dashboard died with it, exactly when it was needed (2026-10-20). Now only the data needs the
 // router; a router that does not answer gives a 503 the dashboard reads as "Ripple is down".
 
-import { protocol } from "electron";
+import { protocol, session, type OnBeforeRequestListenerDetails, type WebContents } from "electron";
 import fs from "node:fs";
-import http from "node:http";
 import path from "node:path";
-import { Readable } from "node:stream";
 
 import { routeRequest } from "./status-model";
+import { fetchAdmin, localAdminBaseUrl } from "./admin-auth";
+import { ADMIN_TLS_REQUEST_LIMIT } from "./admin-transport-client";
+import { DASHBOARD_CSP, isAppUrl, ORIGIN, SCHEME, trustedTopFrame } from "./security";
 
-export const SCHEME = "ripple";
-export const ORIGIN = `${SCHEME}://app`;
+export { SCHEME, ORIGIN } from "./security";
 
 /** Before app ready: a standard, secure scheme gets an origin, localStorage, fetch and the page's CSP 'self'. */
 export function registerScheme(): void {
-  protocol.registerSchemesAsPrivileged([{ scheme: SCHEME, privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } }]);
+  protocol.registerSchemesAsPrivileged([{ scheme: SCHEME, privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true } }]);
+}
+
+/**
+ * Only the dashboard's own top-level frame may use the main-process capability. A referrer alone is not
+ * an authority: an absent/detached frame, another window, and iframe requests all fail closed.
+ */
+export function trustedAdminRequester(details: Pick<OnBeforeRequestListenerDetails, "webContentsId" | "frame" | "resourceType">, owned: Pick<WebContents, "id" | "mainFrame"> | null): boolean {
+  try {
+    return details.resourceType === "xhr" && trustedTopFrame(details.webContentsId, details.frame, owned);
+  } catch { return false; }
 }
 
 const MIME: Record<string, string> = {
@@ -28,10 +38,6 @@ const MIME: Record<string, string> = {
   ".json": "application/json",
   ".ico": "image/x-icon",
 };
-
-/** Bound connection setup separately from waiting for approval, a login or a provider probe. */
-const CONNECT_TIMEOUT_MS = 4_000;
-const IDLE_TIMEOUT_MS = 180_000;
 
 function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
@@ -45,55 +51,37 @@ export function routerDownResponse(): Response {
  * The admin API, asked as the CLI and the tray ask it: no Origin header (the router turns away a
  * cross-site Origin on writes, and a custom scheme's would be one) and a Host it accepts.
  */
-async function forward(request: Request, admin: URL): Promise<Response> {
+async function forward(request: Request, admin: URL, home: string): Promise<Response> {
   const url = new URL(request.url);
-  const body = request.method === "GET" || request.method === "HEAD" ? null : Buffer.from(await request.arrayBuffer());
-  const headers: Record<string, string> = { host: `127.0.0.1:${admin.port}`, accept: request.headers.get("accept") ?? "*/*" };
+  let body: Buffer | undefined;
+  if (request.body && request.method !== "GET" && request.method !== "HEAD") {
+    const reader = request.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        size += value.length;
+        if (size > ADMIN_TLS_REQUEST_LIMIT) {
+          await reader.cancel().catch(() => {});
+          return json(413, { error: "admin request body too large" });
+        }
+        chunks.push(value);
+      }
+    } finally { reader.releaseLock(); }
+    body = Buffer.concat(chunks, size);
+  }
+  const headers: Record<string, string> = {
+    accept: request.headers.get("accept") ?? "*/*",
+  };
   const type = request.headers.get("content-type");
   if (type) headers["content-type"] = type;
-  if (body) headers["content-length"] = String(body.length);
-  return new Promise((resolve) => {
-    let settled = false;
-    const done = (response: Response) => {
-      if (settled) return;
-      settled = true;
-      resolve(response);
-    };
-    const req = http.request(
-      // A connection of its own per request: the idle timer below is set on the socket, and on a
-      // pooled socket those timers piled up (MaxListenersExceededWarning, measured here).
-      { host: admin.hostname, port: admin.port, method: request.method, path: `${url.pathname}${url.search}`, headers, agent: false },
-      (res) => {
-        const out = new Headers();
-        for (const name of ["content-type", "cache-control", "content-disposition"]) {
-          const value = res.headers[name];
-          if (typeof value === "string") out.set(name, value);
-        }
-        const status = res.statusCode ?? 502;
-        const nullBody = status === 204 || status === 304 || request.method === "HEAD";
-        if (nullBody) res.resume();
-        done(new Response(nullBody ? null : (Readable.toWeb(res) as unknown as ReadableStream), { status, headers: out }));
-      },
-    );
-    const connectTimer = setTimeout(() => {
-      req.destroy();
-      done(routerDownResponse());
-    }, CONNECT_TIMEOUT_MS);
-    req.once("socket", (socket) => {
-      if (socket.connecting) socket.once("connect", () => clearTimeout(connectTimer));
-      else clearTimeout(connectTimer);
+  try {
+    return await fetchAdmin(admin.origin, `${url.pathname}${url.search}`, home, {
+      method: request.method, headers, body, signal: request.signal,
     });
-    // ClientRequest starts the socket idle timeout after connecting, including the wait for
-    // response headers. Certificate approval can legitimately take more than four seconds.
-    req.setTimeout(IDLE_TIMEOUT_MS, () => req.destroy());
-    req.once("close", () => clearTimeout(connectTimer));
-    req.on("error", () => {
-      clearTimeout(connectTimer);
-      done(routerDownResponse());
-    });
-    if (body) req.write(body);
-    req.end();
-  });
+  } catch { return routerDownResponse(); }
 }
 
 async function serveFile(root: string, rel: string): Promise<Response> {
@@ -101,20 +89,44 @@ async function serveFile(root: string, rel: string): Promise<Response> {
   if (full !== root && !full.startsWith(root.endsWith(path.sep) ? root : root + path.sep)) return json(400, { error: "invalid path" });
   try {
     const data = await fs.promises.readFile(full);
-    return new Response(data, { status: 200, headers: { "content-type": MIME[path.extname(full).toLowerCase()] ?? "application/octet-stream", "cache-control": "no-cache" } });
+    return new Response(data, { status: 200, headers: {
+      "content-type": MIME[path.extname(full).toLowerCase()] ?? "application/octet-stream", "cache-control": "no-cache",
+      "content-security-policy": DASHBOARD_CSP, "x-content-type-options": "nosniff", "referrer-policy": "no-referrer",
+    } });
   } catch {
     return json(404, { error: "not found" });
   }
 }
 
 /** After app ready. `admin` is read per request, so a port changed in config.json is followed. */
-export function handleScheme(uiRoot: string, admin: () => string): void {
+export function handleScheme(uiRoot: string, admin: () => string, home: string, ownedContents: () => WebContents | null): void {
+  // This session belongs to the dashboard; there are no other onBeforeRequest listeners.
+  // Frame identity prevents same-origin iframes and other windows from borrowing this capability.
+  session.defaultSession.webRequest.onBeforeRequest({ urls: [`${SCHEME}://*/*`] }, (details, callback) => {
+    let allowed = isAppUrl(details.url);
+    if (allowed) {
+      const route = routeRequest(new URL(details.url).pathname);
+      allowed = !!route && (route.kind !== "api" || trustedAdminRequester(details, ownedContents()));
+    }
+    callback({ cancel: !allowed });
+  });
   protocol.handle(SCHEME, async (request) => {
     const url = new URL(request.url);
-    if (url.host !== "app") return json(404, { error: "not found" });
+    if (!isAppUrl(request.url)) return json(404, { error: "not found" });
     const route = routeRequest(url.pathname);
     if (!route) return json(400, { error: "invalid path" });
-    if (route.kind === "api") return forward(request, new URL(admin()));
+    if (route.kind === "api") {
+      // The pinned patched runtime supplies this browser-owned property. Missing/opaque or
+      // foreign initiators fail closed even if a request bypasses webRequest dispatch.
+      if ((request as Request & { initiatorOrigin?: string }).initiatorOrigin !== ORIGIN) {
+        return json(403, { error: "untrusted initiator" });
+      }
+      const origin = request.headers.get("origin");
+      if (origin !== null && origin !== ORIGIN) return json(403, { error: "untrusted origin" });
+      try { return await forward(request, localAdminBaseUrl(admin()), home); }
+      catch { return json(503, { error: "local admin credentials or endpoint are unavailable" }); }
+    }
+    if (request.method !== "GET" && request.method !== "HEAD") return json(405, { error: "method not allowed" });
     return serveFile(uiRoot, route.rel);
   });
 }
