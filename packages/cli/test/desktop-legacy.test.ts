@@ -78,11 +78,12 @@ test("picker off migrates a verified legacy Desktop entry before disabling picke
 test("picker off preserves picker and CA trust when legacy Desktop ownership cannot be verified", t => {
   const f = fixture(t);
   f.service(f.other);
-  const before = fs.readFileSync(path.join(f.home, "config.json"), "utf8");
+  const configFile = path.join(f.home, "config.json");
+  const before = JSON.parse(readPrivateFile(configFile).toString("utf8"));
   const command = pickerOffCommand(f);
   assert.throws(command.run, /설치 소유권을 확인하지 못해/);
   assert.equal(currentAppProxy().egressProxyUrl, f.url);
-  assert.equal(fs.readFileSync(path.join(f.home, "config.json"), "utf8"), before);
+  assert.deepEqual(JSON.parse(readPrivateFile(configFile).toString("utf8")), before);
   assert.equal(command.trustRemovals(), 0);
   assert.deepEqual(command.messages, []);
 });

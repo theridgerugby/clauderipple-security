@@ -310,15 +310,15 @@ test("PUT /api/config persists credential control flags and refuses invalid or d
   await withAdmin(cfg, async ({ port, configFile }) => {
     const put = (value: unknown) => fetch(`${base()}:${port}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(value) });
     assert.equal((await put(cfg)).status, 200);
-    const saved = fs.readFileSync(configFile, "utf8");
-    assert.deepEqual((JSON.parse(saved) as Config).providers, cfg.providers);
+    const saved = fs.readFileSync(configFile);
+    assert.deepEqual((JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers, cfg.providers);
     for (const credentials of [
       [{ id: "a", headers: {}, preferred: "yes" }],
       [{ id: "a", headers: {}, paused: 1 }],
       [{ id: "a", headers: {}, preferred: true }, { id: "b", headers: {}, preferred: true }],
     ]) {
       assert.equal((await put({ ...cfg, providers: { p: { type: "openai-compatible", url: "http://127.0.0.1:1", credentials } } })).status, 400);
-      assert.equal(fs.readFileSync(configFile, "utf8"), saved, "invalid edits leave the stored config unchanged");
+      assert.deepEqual(fs.readFileSync(configFile), saved, "invalid edits leave the stored config unchanged");
     }
   });
 });

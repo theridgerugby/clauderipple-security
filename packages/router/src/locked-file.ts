@@ -11,9 +11,10 @@ import { hasNativeSecretProtection, isSealedSecret, sealSecretBytes, secretStore
 
 const LOCK_STALE_MS = 30_000;
 const LOCK_WAIT_MS = 100;
-// Windows private-file checks use the OS security descriptor and can take longer than chmod.
-// Keep waiting bounded while allowing queued account writers to complete those checks.
-const LOCK_TIMEOUT_MS = process.platform === "win32" ? 10_000 : 2_000;
+// Windows private-file checks and DPAPI sealing both involve native security work. Eight
+// concurrent processes can legitimately queue behind several such writes; 10 seconds refused
+// an account addition under Windows CI load. Bound the wait while preserving every mutation.
+const LOCK_TIMEOUT_MS = process.platform === "win32" ? 30_000 : 2_000;
 
 /**
  * Whether taking the lock failed only because another writer holds it or is letting it go. On
@@ -24,7 +25,7 @@ const LOCK_TIMEOUT_MS = process.platform === "win32" ? 10_000 : 2_000;
 export function lockBusy(code: string | undefined, platform: NodeJS.Platform = process.platform): boolean {
   return code === "ELOCKED" || (platform === "win32" && (code === "EPERM" || code === "EACCES" || code === "EBUSY"));
 }
-/** Wait for another writer for at most two seconds (ten on Windows), then run `mutate`. */
+/** Wait for another writer for at most two seconds (thirty on Windows), then run `mutate`. */
 export function withFileLock<T>(file: string, mutate: () => T): T {
   ensureStorageDirectory(path.dirname(file));
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
