@@ -178,7 +178,7 @@ test("Windows ACL invocation keeps arbitrary paths out of executable source and 
     assert.ok(args.every(argument => !argument.includes(file)));
     assert.deepEqual(JSON.parse(options.input), { path: file, directory: false });
     assert.equal(options.windowsHide, true);
-    assert.ok(options.timeout <= 10_000);
+    assert.equal(options.timeout, 30_000, "Private ACL changes keep a bounded Windows cold-start allowance");
     return { status: 0, stdout: "private-acl-ok" };
   }, "C:\\Windows");
   assert.equal(called, true);
