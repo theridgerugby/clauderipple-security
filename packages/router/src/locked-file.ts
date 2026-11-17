@@ -9,12 +9,16 @@ import { lockSync } from "proper-lockfile";
 import { applyWindowsPrivateAcl, assertPrivateTarget, ensurePrivateDirectory, ensureStorageDirectory, notePrivateDirectoryMutation, readPrivateFileStored, rememberPrivateFileCreated } from "./private-file.ts";
 import { hasNativeSecretProtection, isSealedSecret, sealSecretBytes, secretStoredBytesLimit, unsealSecretBytes, type SecretProtector } from "./secret-storage.ts";
 
-const LOCK_STALE_MS = 30_000;
+// These are synchronous critical sections. While a caller holds one, its event loop cannot
+// run proper-lockfile's periodic mtime refresh. The stale threshold must outlive the longest
+// permitted contender wait, or a second process can steal an active lock on a busy Windows PC.
+const LOCK_STALE_MS = 120_000;
 const LOCK_WAIT_MS = 100;
-// Windows private-file checks and DPAPI sealing both involve native security work. Eight
-// concurrent processes can legitimately queue behind several such writes; 10 seconds refused
-// an account addition under Windows CI load. Bound the wait while preserving every mutation.
-const LOCK_TIMEOUT_MS = process.platform === "win32" ? 30_000 : 2_000;
+const LOCK_TIMEOUT_MS = process.platform === "win32" ? 10_000 : 2_000;
+// Windows DPAPI and ACL work is slow enough that eight legitimate account writers can take more
+// than ten seconds to drain. Give *account stores* a longer bounded wait; unrelated agent/config
+// mutations must still refuse a busy lock promptly.
+const ACCOUNT_LOCK_TIMEOUT_MS = process.platform === "win32" ? 30_000 : 2_000;
 
 /**
  * Whether taking the lock failed only because another writer holds it or is letting it go. On
@@ -25,10 +29,9 @@ const LOCK_TIMEOUT_MS = process.platform === "win32" ? 30_000 : 2_000;
 export function lockBusy(code: string | undefined, platform: NodeJS.Platform = process.platform): boolean {
   return code === "ELOCKED" || (platform === "win32" && (code === "EPERM" || code === "EACCES" || code === "EBUSY"));
 }
-/** Wait for another writer for at most two seconds (thirty on Windows), then run `mutate`. */
-export function withFileLock<T>(file: string, mutate: () => T): T {
+function withTimedFileLock<T>(file: string, mutate: () => T, timeoutMs: number): T {
   ensureStorageDirectory(path.dirname(file));
-  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
   let release: () => void;
   for (;;) {
     try {
@@ -45,6 +48,16 @@ export function withFileLock<T>(file: string, mutate: () => T): T {
     release!();
     notePrivateDirectoryMutation(path.dirname(file));
   }
+}
+
+/** Normal mutations wait at most two seconds (ten on Windows), then refuse contention. */
+export function withFileLock<T>(file: string, mutate: () => T): T {
+  return withTimedFileLock(file, mutate, LOCK_TIMEOUT_MS);
+}
+
+/** Windows credential-store writers may queue for 30 seconds behind DPAPI-protected peers. */
+export function withAccountFileLock<T>(file: string, mutate: () => T): T {
+  return withTimedFileLock(file, mutate, ACCOUNT_LOCK_TIMEOUT_MS);
 }
 
 const RENAME_RETRY_BUDGET_MS = 2_000;

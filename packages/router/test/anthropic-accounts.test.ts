@@ -128,7 +128,9 @@ test("a stale process lock is recovered without leaving lock files", () => {
   try {
     const lock = `${claudeAccountsPath(dir)}.lock`;
     fs.mkdirSync(lock, { mode: 0o700 });
-    const old = new Date(Date.now() - 60_000);
+    // A synchronous holder cannot refresh its mtime until its mutation returns. Only a lock
+    // older than the conservative stale threshold is safe to reclaim after a crashed writer.
+    const old = new Date(Date.now() - 180_000);
     fs.utimesSync(lock, old, old);
     const account = saveClaudeOAuthAccount(dir, grant("recovered"));
     assert.equal(listClaudeAccounts(dir)[0]!.id, account.id);

@@ -8,7 +8,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { migrateSecretFile, withFileLock, writeSecretJsonAtomic } from "../locked-file.ts";
+import { migrateSecretFile, withAccountFileLock, writeSecretJsonAtomic } from "../locked-file.ts";
 import { readPrivateFile } from "../private-file.ts";
 import { readClaudeAuthFile, removeClaudeAuthFile } from "./anthropic-token-file.ts";
 
@@ -47,7 +47,7 @@ type ClaudeAccountsFile = { version: 1; accounts: ClaudeOAuthAccount[] };
 
 function withAccountLock<T>(home: string, mutate: () => T): T {
   migrateSecretFile(claudeAccountsPath(home));
-  return withFileLock(claudeAccountsPath(home), mutate);
+  return withAccountFileLock(claudeAccountsPath(home), mutate);
 }
 
 export type ClaudeAccountSummary = {

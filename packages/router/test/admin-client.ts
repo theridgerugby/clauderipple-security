@@ -36,7 +36,11 @@ export async function startAdmin(deps: AdminDeps): ReturnType<typeof startServer
     const transport: FixtureTransport = {
       headers: { ...adminAuthHeaders(home), [ADMIN_INSTANCE_HEADER]: endpoint.instanceId },
       tlsPort: server.tlsPort, ca: identity.caCertPem, checkServerIdentity,
-      agent: new Agent({ connect: { ca: identity.caCertPem, rejectUnauthorized: true, checkServerIdentity } }),
+      // Windows DPAPI/ACL assertions can block this test process for seconds between requests.
+      // Reusing an idle TLS socket across those synchronous OS calls races the server's idle
+      // timeout and produces an unrelated `fetch failed` (ECONNRESET) under hosted CI load.
+      // Every fixture request still performs certificate verification and the same API checks.
+      agent: new Agent({ connect: { ca: identity.caCertPem, rejectUnauthorized: true, checkServerIdentity }, pipelining: 0 }),
       endpoint, identity,
     };
     const origins = ["127.0.0.1", "localhost", "[::1]"].flatMap(host => [

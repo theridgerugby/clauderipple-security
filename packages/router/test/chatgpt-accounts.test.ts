@@ -209,7 +209,11 @@ function call(conversation: string, text?: string): Promise<{ status: number; bo
   const req: AnthropicRequest = { model: "claude-opus-5", stream: true, metadata: { user_id: conversation }, system: "sys", messages };
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(req);
-    const r = http.request({ host: "127.0.0.1", port: frontPort, method: "POST", path: "/v1/messages", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(data) } }, (res) => {
+    // Node 24's global agent keeps sockets alive. Windows DPAPI account updates synchronously
+    // block this fixture's event loop long enough for a previous idle socket to expire;
+    // reusing it turns an otherwise valid next turn into an unrelated ECONNRESET. Give each
+    // synthetic client turn its own connection while preserving all adapter/rotation assertions.
+    const r = http.request({ host: "127.0.0.1", port: frontPort, method: "POST", path: "/v1/messages", agent: false, headers: { "content-type": "application/json", "content-length": Buffer.byteLength(data) } }, (res) => {
       let body = "";
       res.on("data", (c: Buffer) => (body += c.toString()));
       res.on("end", () => resolve({ status: res.statusCode ?? 0, body, headers: res.headers }));
