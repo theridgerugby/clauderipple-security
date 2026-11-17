@@ -4,8 +4,8 @@ Original upstream review base: `PBJ-2/clauderipple` v0.12.36,
 `e7420ab5dc14c9569fed3439bc43e68a989c7055`.
 Integrated upstream revision: `7fe108c847428694e6fd05f5991c7a37c3c992fb`.
 Original local validation checkpoint: `f3057ccadf4afcccd53ea37610fc9da559420e1a`.
-Latest recorded hosted checkpoint: `9f79dee98402952423783038fc166c962b0b902b`,
-tree `ea522a14a85d73410aee3819a008d807905fba67`.
+Latest recorded hosted checkpoint: `30b6af2604766e44517a3d0c126d836388f38ac5`,
+tree `d91211d43c2316f078ea33e1b89b4cea38623349`.
 Validation date: 2026-11-16 (America/Toronto).
 Environment: Linux cloud workspace, Node 24.22.1, npm 11.9.0.
 
@@ -27,6 +27,49 @@ handoff. A test that runs only through a command mock is not evidence of native
 Windows/macOS execution.
 
 ## Hosted validation and resulting fixes
+
+### Complete Windows run and platform-specific follow-up
+
+Run [44028779467](https://github.com/theridgerugby/clauderipple-security/actions/runs/44028779467)
+used `30b6af26`. Its completed results:
+
+| Job | Observed result |
+| --- | --- |
+| Ubuntu full suite | 4,077 tests: 4,046 passed, 31 skipped, zero failures/cancellations; audit, typecheck, mod check and build passed |
+| macOS full suite | 4,077 tests: 4,052 passed, 25 skipped, zero failures/cancellations; audit, typecheck, mod check and build passed |
+| Windows full suite | 4,077 tests: 3,944 passed, 30 failed, 4 cancelled, 99 skipped; audit, typecheck and mod check passed; build was not reached |
+| macOS/Windows Electron harness | Passed, including parent-bridge borrowing and exact-port wrong-certificate takeover |
+| Additional Windows ACL/control gate | 66 tests: 65 passed, one POSIX-only test skipped, zero failures/cancellations; real four-file strict ACL batch used one process and measured 336 ms in this run |
+| Ubuntu Electron harness | Failed before app initialization on the same protected-sandbox-helper prerequisite described below |
+
+The full Windows run exposed a release-source root-path string comparison defect
+(16 failures), a test credential-reader guard that also rejected the legitimate
+private-file ACL helper (12 failures), and forecast/proxy timing fixtures (two
+failures and four cancellations). The real Windows ACL and Remote generation,
+deadline, phone and receipt cases passed. Failures and cancellations are retained;
+the next candidate must pass the affected tests and the full suite.
+
+The follow-up checks compare physical Git-root directory identity without
+case-folding path names, preserve the test prohibition on OS credential readers
+while allowing only the fixed ACL helper in temporary fixtures, and separate
+native fixture preparation from request/profile timing. A dedicated Windows
+quick gate runs these regressions in addition to the unchanged complete matrix.
+No production network deadline, ACL requirement or sandbox prerequisite is relaxed.
+
+The follow-up candidate's local combined run recorded 4,092 tests: 4,060 passed,
+31 explicit platform skips, the same retained cloud loopback failure, and zero
+cancellations. Typecheck, mod check, generated transport/ACL parity, build and a
+fresh npm audit (zero reported vulnerabilities) passed. Release-source tests
+passed 25/25; request-log tests passed 34/34, including seven request-only timeout
+subtests that retain their 5,000 ms bound. The unanswered-profile test retains its
+1,000 ms bound after a real verified TLS warm-up with zero model requests/log rows.
+These local results do not replace the follow-up candidate's hosted Windows run.
+
+An additional read-only agent review of the IPC/TLS boundary reran 57 local tests
+with zero failures or skips and found no new blocking defect in that scope. This
+does not substitute for independent external assessment or signed-artifact testing.
+
+### IPC repair checkpoint
 
 Run [44027136750](https://github.com/theridgerugby/clauderipple-security/actions/runs/44027136750)
 used `9f79dee`. Its recorded results:
@@ -85,13 +128,14 @@ fixture-cleanup defects were fixed before this hosted checkpoint; an old failing
 run is not evidence against the later patch, and a later green run does not erase
 the earlier findings.
 
-### Follow-up changes awaiting their exact-commit hosted run
+### Async control and release-source changes exercised by the next run
 
 Combined local regression after these changes: 4,077 tests, 4,045 passed,
 31 explicit platform skips, the one retained cloud loopback failure below, and
 zero cancellations. Typecheck, mod check, generated transport/ACL parity and build
-passed. The independent Remote/phone/lifecycle subset passed 58/58. These counts
-do not substitute for the next Windows/macOS native run.
+passed. The independent Remote/phone/lifecycle subset passed 58/58. The subsequent
+`30b6af26` hosted results above show which native checks passed and which further
+Windows fixes were required.
 
 - Remote verifies endpoint, TLS identity, capability and host configuration in one
   fresh four-file asynchronous Windows ACL process per attempt. All descriptors

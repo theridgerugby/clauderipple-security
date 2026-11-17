@@ -40,6 +40,16 @@ function fixture(t: TestContext): string {
   return directory;
 }
 
+function reportedRoot(root: string) {
+  return (executable: string, args: string[], options: SpawnSyncOptionsWithStringEncoding) => {
+    const result = spawnSync(executable, args, options);
+    if (args[5] === "rev-parse" && args[6] === "--show-toplevel" && result.status === 0) {
+      return { ...result, stdout: `${root}\n` };
+    }
+    return result;
+  };
+}
+
 test("clean source records the exact Git commit/tree and lock digest without a CI or attestation claim", t => {
   const directory = fixture(t);
   const source = captureReleaseSource(directory);
@@ -49,6 +59,72 @@ test("clean source records the exact Git commit/tree and lock digest without a C
   assert.deepEqual(Object.keys(releaseSourceReceipt(source)).sort(), ["commit", "lockfileSha256", "tree"]);
   assert.equal(Object.isFrozen(source), true);
   assert.doesNotThrow(() => assertReleaseSourceUnchanged(directory, source));
+});
+
+test("Git root spelling differences pass only when they resolve to the same real directory", t => {
+  const directory = fixture(t);
+  const canonical = path.normalize(fs.realpathSync.native(directory));
+  const rootStat = fs.lstatSync(canonical, { bigint: true });
+  const variants = new Set([`${directory}${path.sep}.`, `${directory}${path.sep}`]);
+  if (process.platform === "win32") {
+    // Drive-letter case and Git's forward slashes do not change the Windows volume.
+    variants.add(canonical.replace(/^[A-Za-z]:/, value => value.toLowerCase()).replace(/\\/g, "/"));
+    variants.add(canonical.replace(/^[A-Za-z]:/, value => value.toUpperCase()).replace(/\\/g, "/"));
+    // Component case is equivalent only when this actual filesystem says it is. Do not
+    // assume that every Windows directory is case-insensitive or enable that feature here.
+    const upper = canonical.toUpperCase();
+    try {
+      const stat = fs.lstatSync(upper, { bigint: true });
+      if (stat.dev === rootStat.dev && stat.ino === rootStat.ino) variants.add(upper);
+    } catch { /* A case-sensitive directory need not have this alternate spelling. */ }
+  }
+  for (const variant of variants) {
+    const stat = fs.lstatSync(variant, { bigint: true });
+    assert.equal(stat.dev, rootStat.dev);
+    assert.equal(stat.ino, rootStat.ino);
+    const source = captureReleaseSource(directory, reportedRoot(variant));
+    assert.equal(source.directory, canonical);
+    assert.equal(source.directoryIdentity, `${rootStat.dev}:${rootStat.ino}`);
+  }
+});
+
+test("a different Git root is refused even when all Git commands would otherwise succeed", t => {
+  const directory = fixture(t);
+  const other = fixture(t);
+  assert.throws(() => captureReleaseSource(directory, reportedRoot(other)), /checkout root/);
+  assert.throws(() => captureReleaseSource(directory, reportedRoot(".")), /checkout root/);
+});
+
+test("case-sensitive sibling directories cannot become equivalent through path case folding", t => {
+  const directory = fixture(t);
+  const other = path.join(path.dirname(directory), path.basename(directory).toUpperCase());
+  try { fs.mkdirSync(other); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") { t.skip("fixture volume is case-insensitive"); return; }
+    throw error;
+  }
+  t.after(() => fs.rmSync(other, { recursive: true, force: true }));
+  const before = fs.lstatSync(directory, { bigint: true });
+  const after = fs.lstatSync(other, { bigint: true });
+  assert.notEqual(`${before.dev}:${before.ino}`, `${after.dev}:${after.ino}`);
+  assert.throws(() => captureReleaseSource(directory, reportedRoot(other)), /checkout root/);
+});
+
+test("unavailable directory file IDs fail closed while a zero device ID is not rejected alone", t => {
+  const directory = fixture(t);
+  const canonical = path.normalize(fs.realpathSync.native(directory));
+  const original = fs.lstatSync;
+  let inode: bigint | undefined = 0n;
+  t.mock.method(fs, "lstatSync", (file: fs.PathLike, options?: fs.StatSyncOptions) => {
+    const stat = original(file, options);
+    if (file === canonical) return { ...stat, dev: 0n, ino: inode, isDirectory: () => true, isSymbolicLink: () => false };
+    return stat;
+  });
+  for (inode of [0n, undefined]) {
+    assert.throws(() => captureReleaseSource(directory), /stable file-system directory identity/);
+  }
+  inode = 123n;
+  assert.doesNotThrow(() => captureReleaseSource(directory));
 });
 
 for (const kind of ["tracked", "staged", "untracked"] as const) {
@@ -178,6 +254,37 @@ test("moving the checked-out source directory prevents receipt promotion", t => 
   assert.throws(() => assertReleaseSourceUnchanged(moved, source), /changed during the build/);
 });
 
+test("a case-only source directory rename cannot inherit the preceding build receipt", t => {
+  const directory = fixture(t);
+  const source = captureReleaseSource(directory);
+  const intermediate = `${directory}-renaming`;
+  const renamed = path.join(path.dirname(directory), path.basename(directory).toUpperCase());
+  t.after(() => {
+    fs.rmSync(intermediate, { recursive: true, force: true });
+    fs.rmSync(renamed, { recursive: true, force: true });
+  });
+  // The intermediate name makes the rename genuine even on case-insensitive Windows volumes.
+  fs.renameSync(directory, intermediate);
+  fs.renameSync(intermediate, renamed);
+  assert.equal(captureReleaseSource(renamed).directoryIdentity, source.directoryIdentity);
+  assert.throws(() => assertReleaseSourceUnchanged(renamed, source), /changed during the build/);
+});
+
+test("a replacement directory at the same source path cannot inherit a matching commit and tree", t => {
+  const directory = fixture(t);
+  const source = captureReleaseSource(directory);
+  const previous = `${directory}-previous`;
+  t.after(() => fs.rmSync(previous, { recursive: true, force: true }));
+  fs.renameSync(directory, previous);
+  fs.cpSync(previous, directory, { recursive: true });
+  const replacement = captureReleaseSource(directory);
+  assert.equal(replacement.directory, source.directory);
+  assert.equal(replacement.commit, source.commit);
+  assert.equal(replacement.tree, source.tree);
+  assert.notEqual(replacement.directoryIdentity, source.directoryIdentity);
+  assert.throws(() => assertReleaseSourceUnchanged(directory, source), /changed during the build/);
+});
+
 for (const flag of ["--assume-unchanged", "--skip-worktree"]) {
   test(`hidden index state ${flag} cannot conceal dirty source`, t => {
     const directory = fixture(t);
@@ -198,7 +305,7 @@ test("Git inspection uses bounded fixed read-only commands without ambient repos
     captureReleaseSource(directory, (executable: string, args: string[], options: SpawnSyncOptionsWithStringEncoding) => {
       assert.equal(executable, "git");
       assert.deepEqual(args.slice(0, 5), ["--no-pager", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false"]);
-      assert.equal(options.cwd, fs.realpathSync(directory));
+      assert.equal(options.cwd, path.normalize(fs.realpathSync.native(directory)));
       assert.equal(options.shell, false);
       assert.equal(options.timeout, 10_000);
       assert.equal(options.maxBuffer, 8 * 1024 * 1024);

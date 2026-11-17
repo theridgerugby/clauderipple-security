@@ -51,7 +51,16 @@ function head(directory, run) {
 function directoryIdentity(directory) {
   const stat = fs.lstatSync(directory, { bigint: true });
   if (!stat.isDirectory() || stat.isSymbolicLink()) fail("Release source must be an existing Git checkout directory");
+  // An unavailable file ID cannot establish equality between two paths. A zero device ID
+  // can be valid; the per-device directory ID must be present and nonzero.
+  if (typeof stat.dev !== "bigint" || typeof stat.ino !== "bigint" || stat.ino <= 0n) {
+    fail("Release source requires a stable file-system directory identity");
+  }
   return `${stat.dev}:${stat.ino}`;
+}
+
+function canonicalDirectory(directory) {
+  return path.normalize(fs.realpathSync.native(directory));
 }
 
 function lockDigest(directory) {
@@ -83,10 +92,15 @@ function lockDigest(directory) {
 /** Read-only commands only. Generated/installed paths ignored by the repository stay allowed. */
 export function captureReleaseSource(checkout, run = spawnSync) {
   try {
-    const directory = fs.realpathSync(checkout);
+    const directory = canonicalDirectory(checkout);
     const identity = directoryIdentity(directory);
     const reported = git(directory, ["rev-parse", "--show-toplevel"], run).trim();
-    if (!reported || fs.realpathSync(reported) !== directory) fail("Release source must be the Git checkout root");
+    // Git for Windows and Node can spell the same directory differently, including drive
+    // and component case. Case folding would also merge distinct case-sensitive directories.
+    // Resolve both paths natively, then require the same actual volume/file identity.
+    if (!reported || !path.isAbsolute(reported) || directoryIdentity(canonicalDirectory(reported)) !== identity) {
+      fail("Release source must be the Git checkout root");
+    }
     const initial = head(directory, run);
     const entries = git(directory, ["ls-files", "-v", "-z"], run).split("\0").filter(Boolean);
     // assume-unchanged/skip-worktree can conceal tracked edits from status. A release checkout

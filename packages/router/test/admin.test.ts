@@ -3956,8 +3956,7 @@ test("GET /api/limits lists a MiniMax plan's five-hour and weekly windows", asyn
 });
 
 test("GET /api/limits forecasts a window whose average pace reaches 100% before its reset, and no other", async () => {
-  const now = Date.now();
-  const nowS = Math.floor(now / 1000);
+  let nowS = 0;
   const cfg = makeCfg({ providers: {
     mini: { type: "anthropic-compatible", preset: "minimax", url: "https://api.minimax.io/anthropic", credentials: [{ id: "key-a", label: "A", headers: { "x-api-key": "hidden-a" } }] },
   } });
@@ -3973,10 +3972,16 @@ test("GET /api/limits forecasts a window whose average pace reaches 100% before 
     // ...but it is 54% after 110.4 h of 168, so the week is projected at 82% for its reset.
     assert.equal(weekly!.projected_percent, 82);
   }, {
-    minimaxUsage: async (name: string, credentialId?: string) => name === "mini" && credentialId === "key-a" ? [
-      { kind: "five_hour", used_percent: 60, window_minutes: 300, reset_at: nowS + 4 * 3600 },
-      { kind: "seven_day", used_percent: 54, window_minutes: 10080, reset_at: nowS + Math.round(57.6 * 3600) },
-    ] : [],
+    minimaxUsage: async (name: string, credentialId?: string) => {
+      if (name !== "mini" || credentialId !== "key-a") return [];
+      // This is a fresh usage reading, taken after TLS/ACL fixture setup and client
+      // authentication. Their cold-start cost must not move the window's reference time.
+      nowS = Math.floor(Date.now() / 1000);
+      return [
+        { kind: "five_hour", used_percent: 60, window_minutes: 300, reset_at: nowS + 4 * 3600 },
+        { kind: "seven_day", used_percent: 54, window_minutes: 10080, reset_at: nowS + Math.round(57.6 * 3600) },
+      ];
+    },
   });
 });
 

@@ -100,3 +100,11 @@ jobs:
         # These also run in the full matrix. Keep a quick, real-Windows gate for fresh ACL
         # batches, caller cancellation, TLS generation races, phone proxying and shutdown receipts.
         run: node --test --test-reporter=tap packages/cli/test/bounded-exec.test.ts packages/router/test/private-file-batch.test.ts packages/router/test/windows-private-acl.test.ts packages/router/test/phone.test.ts packages/remote/test/local-control-deadline.test.ts packages/remote/test/local-transport.test.ts
+      - name: Native Windows release and request regressions
+        if: runner.os == 'Windows'
+        # Keep full-file platform regressions visible before the larger suite finishes.
+        run: node --test --test-reporter=tap packages/app/test/release-source.test.ts packages/router/test/chatgpt-sidecall-timeout.test.ts packages/router/test/proxy-requestlog.test.ts
+      - name: Native Windows limits forecast regression
+        if: runner.os == 'Windows'
+        # The full matrix still runs every admin test; isolate fresh and cached reading semantics.
+        run: node --test --test-reporter=tap --test-name-pattern="GET /api/limits forecasts a window|GET /api/limits judges a cached reading" packages/router/test/admin.test.ts
