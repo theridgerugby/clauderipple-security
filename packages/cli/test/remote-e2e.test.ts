@@ -10,6 +10,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
+import { readPrivateFile } from "../../router/src/private-file.ts";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -91,7 +92,7 @@ test("remote add → CONNECT through the reverse tunnel → remote remove, again
   // Imported after the environment is set: homeDir() and friends read it.
   const { generateCerts } = await import("../src/certs.ts");
   const { remoteAdd, remoteRemove } = await import("../src/remote.ts");
-  const { ConfigStore } = await import("../../router/src/config.ts");
+  const { DEFAULTS } = await import("../../router/src/config.ts");
   const { startAdmin } = await import("../../router/src/admin.ts");
   const { Logger } = await import("../../router/src/log.ts");
   const { RequestLog } = await import("../../router/src/requestlog.ts");
@@ -135,8 +136,9 @@ test("remote add → CONNECT through the reverse tunnel → remote remove, again
     fs.writeFileSync(path.join(home, "generated-agents.json"), JSON.stringify({ agents: ["gpt-e2e"] }));
     fs.writeFileSync(path.join(remoteHome, ".claude", "settings.json"), JSON.stringify({ model: "opus", env: { FOO: "1" } }, null, 2));
 
-    // The router's half, wired as index.ts wires it, pointed at the throwaway proxy.
-    const store = new ConfigStore(configFile);
+    // Retained low-level SSH library regression only. Production ConfigStore enables the
+    // personal policy and refuses remote activation; do not introduce a runtime bypass.
+    const store = { get: () => ({ ...DEFAULTS, ...JSON.parse(readPrivateFile(configFile).toString("utf8")) }) };
     const log = new Logger(null, 1_000_000, 1, false);
     const assets = () => readLocalAssets({ home, agentDir });
     tunnels = new RemoteTunnels({
@@ -199,7 +201,7 @@ test("remote add → CONNECT through the reverse tunnel → remote remove, again
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(remoteHome, ".claude", "settings.json"), "utf8")), { model: "opus", env: { FOO: "1" } });
     assert.equal(fs.existsSync(path.join(remoteHome, ".claude", "agents", "gpt-e2e.md")), false);
     assert.equal(fs.existsSync(path.join(remoteHome, ".clauderipple-remote")), false);
-    assert.equal(JSON.parse(fs.readFileSync(configFile, "utf8")).remote, undefined);
+    assert.equal(JSON.parse(readPrivateFile(configFile).toString("utf8")).remote, undefined);
   } finally {
     tunnels?.stopAll();
     admin?.close();

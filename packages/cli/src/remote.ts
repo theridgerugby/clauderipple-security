@@ -9,7 +9,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { defaultAgentDir } from "../../router/src/agents.ts";
 import { ConfigStore, adminPort, configPath, homeDir } from "../../router/src/config.ts";
-import { writeJsonAtomic } from "../../router/src/locked-file.ts";
+import { withFileLock, writeSecretJsonAtomic } from "../../router/src/locked-file.ts";
+import { readPrivateFile } from "../../router/src/private-file.ts";
 import {
   DEFAULT_REMOTE_PORT, REMOTE_DIR, SETTINGS_BACKUP_SUFFIX, SshConnectError, assetLines, hostProblem, inspectRemote, planAgents, portProblem,
   readLocalAssets, remoteCaPath, remoteProxyUrl, runRemoteScript, script, settingsGuardLine, settingsWriteLines, spawnSsh,
@@ -100,7 +101,7 @@ type HostEntry = { host: string; port: number };
 
 export function configuredHosts(configFile: string): HostEntry[] {
   try {
-    const raw = JSON.parse(fs.readFileSync(configFile, "utf8")) as { remote?: { hosts?: unknown } };
+    const raw = JSON.parse(readPrivateFile(configFile).toString("utf8")) as { remote?: { hosts?: unknown } };
     const hosts = raw.remote?.hosts;
     return Array.isArray(hosts) ? hosts.filter((h): h is HostEntry => !!h && typeof h.host === "string" && typeof h.port === "number") : [];
   } catch {
@@ -111,12 +112,14 @@ export function configuredHosts(configFile: string): HostEntry[] {
 /** Rewrite `remote.hosts` in config.json, everything else as it was; atomic, as the router hot-reloads it. */
 function updateHosts(configFile: string, mutate: (hosts: HostEntry[]) => HostEntry[]): void {
   if (!fs.existsSync(configFile)) throw new Error(`no config at ${configFile}; run \`clauderipple install\` first`);
-  const raw = JSON.parse(fs.readFileSync(configFile, "utf8")) as Record<string, unknown>;
-  const remote = (raw.remote && typeof raw.remote === "object" ? raw.remote : {}) as Record<string, unknown>;
-  const hosts = mutate(Array.isArray(remote.hosts) ? (remote.hosts as HostEntry[]) : []);
-  if (hosts.length > 0) raw.remote = { ...remote, hosts };
-  else delete raw.remote;
-  writeJsonAtomic(configFile, raw);
+  withFileLock(configFile, () => {
+    const raw = JSON.parse(readPrivateFile(configFile).toString("utf8")) as Record<string, unknown>;
+    const remote = (raw.remote && typeof raw.remote === "object" ? raw.remote : {}) as Record<string, unknown>;
+    const hosts = mutate(Array.isArray(remote.hosts) ? (remote.hosts as HostEntry[]) : []);
+    if (hosts.length > 0) raw.remote = { ...remote, hosts };
+    else delete raw.remote;
+    writeSecretJsonAtomic(configFile, raw);
+  });
 }
 
 // ---- the router ----------------------------------------------------------------------------

@@ -5,6 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { certsExist, generateCerts } from "../src/certs.ts";
 import { CertStore } from "../../router/src/certs.ts";
+import { writePrivateFileAtomic } from "../../router/src/locked-file.ts";
+import { readPrivateFile } from "../../router/src/private-file.ts";
+import { SECRET_FILE_PREFIX } from "../../router/src/secret-storage.ts";
 
 test("certificate generation and cached leaf issuance keep private files restricted", t => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-certificate-test-"));
@@ -41,4 +44,28 @@ test("cached leaf keys cannot alias an unrelated file", { skip: process.platform
   fs.renameSync(cachedKey, path.join(home, "unrelated"));
   fs.symlinkSync(path.join(home, "unrelated"), cachedKey);
   assert.throws(() => new CertStore(home).contextFor("claude.ai"), /regular/);
+});
+
+test("Windows interception CA, native leaf and cached leaf private keys use CurrentUser DPAPI", { skip: process.platform !== "win32" }, t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-certificate-dpapi-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const files = generateCerts(home);
+  const expectedKey = readPrivateFile(files.caKey, 64 * 1024);
+  assert.match(expectedKey.toString(), /BEGIN PRIVATE KEY/);
+  for (const file of [files.caKey, files.leafKey]) {
+    const stored = fs.readFileSync(file);
+    assert.ok(stored.toString().startsWith(SECRET_FILE_PREFIX));
+    assert.equal(stored.includes(Buffer.from("BEGIN PRIVATE KEY")), false);
+  }
+  const store = new CertStore(home);
+  assert.ok(store.contextFor("claude.ai"));
+  const cached = path.join(home, "certs", "claude.ai.key");
+  assert.ok(fs.readFileSync(cached).toString().startsWith(SECRET_FILE_PREFIX));
+
+  // A legacy owner-private key is migrated before a new router can consume it.
+  writePrivateFileAtomic(files.caKey, expectedKey);
+  assert.equal(fs.readFileSync(files.caKey).includes(Buffer.from("BEGIN PRIVATE KEY")), true);
+  assert.equal(certsExist(home), true);
+  assert.ok(fs.readFileSync(files.caKey).toString().startsWith(SECRET_FILE_PREFIX));
+  assert.deepEqual(readPrivateFile(files.caKey, 64 * 1024), expectedKey);
 });

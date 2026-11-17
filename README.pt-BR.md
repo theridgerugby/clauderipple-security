@@ -2,6 +2,10 @@
 
 <p align="center"><a href="README.md">English</a> · <a href="README.ko.md">한국어</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.es.md">Español</a> · <b>Português (BR)</b></p>
 
+> **Personal security fork.** Use the [fixed-source Windows installation guide](docs/personal-windows-install.md). This fork denies unapproved data destinations and disables remote features and executable auto-updates. The upstream install commands, npm package, store links and feature claims retained below do not describe this personal build. Bootstrap installers are disabled; do not overwrite it with an upstream installation.
+>
+> Before connecting real accounts or research data, verify the test results for the exact full commit and complete the guide's local acceptance checks.
+
 <p align="center">
   <b>O chat continua Claude. Só o Code vira GPT.</b><br>
   A configuração do próprio Claude Desktop para outros modelos troca o <b>app inteiro</b> — o chat, o Remote

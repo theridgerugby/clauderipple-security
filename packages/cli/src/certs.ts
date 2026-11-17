@@ -7,7 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createCa, createLeaf } from "../../router/src/x509.ts";
 import { assertPrivateTarget, ensurePrivateDirectory, readPrivateFile } from "../../router/src/private-file.ts";
-import { withFileLock, writePrivateFileAtomic } from "../../router/src/locked-file.ts";
+import { migrateSecretFile, withFileLock, writePrivateFileAtomic, writeSecretFileAtomic } from "../../router/src/locked-file.ts";
 
 export type CertPaths = { caPem: string; caKey: string; leafPem: string; leafKey: string };
 
@@ -29,9 +29,11 @@ export function generateCerts(home: string, upstream = "api.anthropic.com", days
     const ca = createCa({ days });
     const leaf = createLeaf({ host: upstream, caCertPem: ca.certPem, caKeyPem: ca.keyPem, days: Math.min(days, 825) });
     writePrivateFileAtomic(p.caPem, ca.certPem);
-    writePrivateFileAtomic(p.caKey, ca.keyPem);
+    // The interception CA can mint a trusted Anthropic leaf. Never leave its signing key
+    // as plaintext on a Windows personal installation, including during atomic staging.
+    writeSecretFileAtomic(p.caKey, ca.keyPem);
     writePrivateFileAtomic(p.leafPem, leaf.certPem);
-    writePrivateFileAtomic(p.leafKey, leaf.keyPem);
+    writeSecretFileAtomic(p.leafKey, leaf.keyPem);
   });
   return p;
 }
@@ -39,6 +41,10 @@ export function generateCerts(home: string, upstream = "api.anthropic.com", days
 export function certsExist(home: string): boolean {
   const p = certPaths(home);
   if (![p.caPem, p.caKey, p.leafPem, p.leafKey].every((f) => fs.existsSync(f))) return false;
+  // Upgrade owner-only legacy keys before the router uses them. Migration never makes a
+  // plaintext backup, and any DPAPI/ACL failure aborts startup rather than using old bytes.
+  migrateSecretFile(p.caKey);
+  migrateSecretFile(p.leafKey);
   // Validate and tighten existing key files too, not only freshly generated certificates.
   for (const file of Object.values(p)) readPrivateFile(file, 64 * 1024);
   return true;

@@ -158,14 +158,14 @@ test("an expired login is logged once and told to phones once, and its end too",
 
 // 2026-10-20: the CLI's keychain login was emptied while the Claude app worked, and the phone said
 // the login had expired. The login the router saw the app use stands in for it.
-test("the Claude app's login the router observed stands in for the CLI's, while it is recent", async () => {
+test("a legacy observed login on disk is never reused by Remote", async () => {
   const { loadObservedAuth, OBSERVED_FRESH_MS, OBSERVED_TTL_MS } = await import("../src/bridge-client.ts");
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "observed-auth-"));
   const now = 5_000_000_000;
   assert.equal(loadObservedAuth(now, home), null, "no file, no login");
   const write = (value: unknown) => fs.writeFileSync(path.join(home, "claude-auth-observed.json"), JSON.stringify(value));
   write({ authorization: "Bearer sk-ant-oat01-abc", observedAt: now - 60_000 });
-  assert.deepEqual(loadObservedAuth(now, home), { accessToken: "sk-ant-oat01-abc", expiresAt: now + OBSERVED_TTL_MS });
+  assert.equal(loadObservedAuth(now, home), null, "even a fresh valid-looking legacy token is ignored");
   write({ authorization: "Bearer sk-ant-oat01-abc", observedAt: now - OBSERVED_FRESH_MS - 1 });
   assert.equal(loadObservedAuth(now, home), null, "too old to trust");
   write({ authorization: "Basic xyz", observedAt: now });

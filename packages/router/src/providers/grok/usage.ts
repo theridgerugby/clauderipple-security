@@ -11,6 +11,8 @@
 // The body is protobuf JSON, which leaves zero values out: `creditUsagePercent` was absent at 0%
 // use, so absent reads as 0. Its scale (0–100, by its name) is not yet seen on a non-zero week.
 
+import { guardEgressFetch, isEgressPolicyError } from "../../egress.ts";
+
 /** One window `/api/limits` reads, as the OpenCode Go reader gives it. */
 /**
  * `read_at` (epoch milliseconds) is when the request for the reading was sent: internal, kept while a
@@ -67,7 +69,7 @@ export class GrokUsage {
   private async fetchOne(url: string, headers: () => Promise<Record<string, string>>): Promise<GrokWindow[]> {
     const readAt = (this.opts.now ?? Date.now)();
     try {
-      const res = await (this.opts.fetch ?? fetch)(`${url.replace(/\/+$/, "")}/billing?format=credits`, {
+      const res = await guardEgressFetch(this.opts.fetch)(`${url.replace(/\/+$/, "")}/billing?format=credits`, {
         method: "GET",
         headers: { accept: "application/json", ...(await headers()) },
         signal: AbortSignal.timeout(this.opts.timeoutMs ?? 5000),
@@ -80,6 +82,7 @@ export class GrokUsage {
       if (windows) this.last = windows.map((w) => ({ ...w, read_at: readAt }));
       return this.last;
     } catch (e) {
+      if (isEgressPolicyError(e)) throw e;
       this.opts.warn?.(`grok usage ${this.name}: ${(e as Error).message}`);
       return this.last;
     }

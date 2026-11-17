@@ -42,7 +42,7 @@ function setup() {
   const apply = (home: string) => applyProxyEnv({ home, proxyUrl, caPath: path.join(home, "ca.pem"), force: false, models: { smallFast: "routed-model" } });
   return { a, b, apply, proxyUrl, settings: process.env.CLAUDE_SETTINGS_PATH };
 }
-const deps = (home: string, routerStatus = async () => ({ version: "test" })) => ({ home, version: "test", routerStatus, supervisor: {
+const deps = (home: string, routerStatus = async () => ({ version: "test", runtimeVerified: true })) => ({ home, version: "test", routerStatus, supervisor: {
   inspect(): never { throw new Error("unexpected supervisor inspection"); },
   register(): never { throw new Error("unexpected registration"); },
   start(): never { throw new Error("unexpected service start"); },
@@ -149,7 +149,7 @@ test("direct off rechecks delayed health responses and never overwrites explicit
   directOn(c.a);
   await assert.rejects(directOff(deps(c.a, async () => {
     fs.writeFileSync(c.settings, JSON.stringify({ env: { ANTHROPIC_SMALL_FAST_MODEL: "user-edited" } }));
-    return { version: "test" };
+    return { version: "test", runtimeVerified: true };
   })), /changed/);
   assert.equal(settingsEnv().ANTHROPIC_SMALL_FAST_MODEL, "user-edited");
   assert.equal(fs.existsSync(directStatePath(c.a)), true);

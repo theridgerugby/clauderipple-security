@@ -4406,6 +4406,39 @@ async function probeProviders(providers, onUpdate) {
     }
   }));
 }
+async function loadPersonalSecurityPanel() {
+  const panel = $("#personal-security-panel");
+  if (!panel) return;
+  try {
+    const policy = await api("/api/security-policy");
+    const origin = el("input", { type: "url", placeholder: "https://your-approved-api.example", "aria-label": "Exact HTTPS origin" });
+    const consent = el("input", { type: "checkbox", "aria-label": "Approve credential and conversation sharing" });
+    const save = el("button", { class: "btn", type: "button", text: "Approve destination" });
+    const explanation = el("p", { text: "Personal sensitive-data mode: HTTPS destinations require explicit approval. Conversation history, system prompts and tool results may be sent to the selected provider. Cross-provider fallback, remote access and request-body debug dumps are disabled." });
+    const notice = el("p", { text: "Approve only a service you are permitted to use for your data. Origin approval does not change that provider's retention or training policies." });
+    const label = el("label", {}, [consent, el("span", { text: " I authorize sending credentials and conversation context to this exact HTTPS origin." })]);
+    const list = el("div");
+    for (const value of policy.approvedOrigins || []) {
+      const revoke = el("button", { class: "btn", type: "button", text: "Revoke" });
+      revoke.addEventListener("click", async () => {
+        revoke.disabled = true;
+        try { await api("/api/security-policy", { method: "POST", body: JSON.stringify({ action: "revoke", origin: value }) }); await loadPersonalSecurityPanel(); }
+        catch (error) { revoke.disabled = false; toast(error.message, true); }
+      });
+      list.appendChild(el("div", {}, [el("code", { text: value }), revoke]));
+    }
+    const suggestions = el("p", { text: "Configured destinations: " + ((policy.candidates || []).join(", ") || "none yet") });
+    save.addEventListener("click", async () => {
+      if (!consent.checked) { toast("Confirm data-sharing permission before approving a destination.", true); return; }
+      save.disabled = true;
+      try {
+        await api("/api/security-policy", { method: "POST", body: JSON.stringify({ action: "approve", origin: origin.value.trim(), acknowledgeDataSharing: true }) });
+        await loadPersonalSecurityPanel();
+      } catch (error) { save.disabled = false; toast(error.message, true); }
+    });
+    panel.replaceChildren(el("h2", { text: "Sensitive data destinations" }), explanation, notice, list, suggestions, origin, label, save);
+  } catch (error) { panel.replaceChildren(el("p", { text: "Security policy unavailable: " + error.message })); }
+}
 async function loadProviders() {
   providersLoaded = true;
   // Before the first config the rail and the detail hold bars, not the "no provider selected" text.
@@ -4421,6 +4454,7 @@ async function loadProviders() {
     // in the config. A router too old to answer leaves the note off rather than breaking the screen.
     pickerContextWindows = await api("/api/context-windows").catch(() => pickerContextWindows);
     renderProviderWorkspace();
+    await loadPersonalSecurityPanel();
     void probeProviders(currentConfig.providers, () => {
       if ($("#view-providers").classList.contains("active")) renderProviderWorkspace();
     });

@@ -1,11 +1,9 @@
-// Claude Code OAuth observed while transparently passing a real CLI request. Kept in RAM and,
-// when a file path is given, mirrored to that file (mode 0600, owner's home) so the OpenAI ingress
-// keeps working right after a router restart or a reboot — otherwise nothing works until the next
-// Code-tab request happens to pass through. No diagnostics or listing surface exists.
+// Claude Code OAuth observed while transparently passing a real CLI request. RAM only: normal
+// traffic never creates another persistent token copy. An explicit local logout prevents even
+// RAM re-capture until the user explicitly authorizes reuse. No diagnostics/listing surface exists.
 
-import fs from "node:fs";
-import { readPrivateFile } from "../private-file.ts";
-import { writeJsonAtomic } from "../locked-file.ts";
+import path from "node:path";
+import { authorizeClaudeLocalAuth, readClaudeLocalAuthState, removeLegacyObservedClaudeAuth, revokeClaudeLocalAuth } from "./anthropic-local-auth.ts";
 import { parseClaudeCliVersion } from "./claude-cli-version.ts";
 
 export const OBSERVED_CLAUDE_CODE_TTL_MS = 12 * 60 * 60 * 1_000;
@@ -49,31 +47,19 @@ export class ObservedClaudeCodeAuth {
    * sign-in and is adopted normally.
    */
   private rejected: string | null = null;
-  private readonly file: string | null;
-  /** Last successfully saved freshness, independent of the timestamp moved by every use. */
-  private persistedAt = Number.NEGATIVE_INFINITY;
+  private readonly home: string | null;
+  private readonly legacyFile: string | null;
+  /** A failed attempt to publish the refusal still blocks this running process. */
+  private locallyRevoked = false;
+  private consentGeneration: string | undefined;
   private cliVersionSeen: string | null = null;
   private cliVersionAt = 0;
 
   constructor(file?: string) {
-    this.file = file ?? null;
-    if (this.file) {
-      try {
-        const raw = JSON.parse(readPrivateFile(this.file, 64 * 1024).toString("utf8")) as ObservedClaudeCodeAuthSnapshot;
-        if (raw && typeof raw.authorization === "string" && bearerToken(raw.authorization) && raw.headers &&
-          !Array.isArray(raw.headers) && typeof raw.observedAt === "number" && Number.isFinite(raw.observedAt)) {
-          const headers = Object.fromEntries(Object.entries(raw.headers).filter(([name, value]) =>
-            isObservedHeader(name) && typeof value === "string" && !/[\r\n\0]/.test(value) &&
-            (name.toLowerCase() !== "authorization" || value === raw.authorization)));
-          if (!Object.keys(headers).some(name => name.toLowerCase() === "authorization")) headers.authorization = raw.authorization;
-          this.snapshot = { authorization: raw.authorization, headers: Object.freeze(headers), observedAt: raw.observedAt };
-          this.persistedAt = raw.observedAt;
-          this.recordCliVersion(headers, raw.observedAt);
-        }
-      } catch {
-        /* no file yet or unreadable: start empty */
-      }
-    }
+    this.home = file ? path.dirname(file) : null;
+    this.legacyFile = file ?? null;
+    // Never deserialize or re-import the old extra copy. Failed cleanup is visible to the caller.
+    if (this.home && this.legacyFile) removeLegacyObservedClaudeAuth(this.home, this.legacyFile);
   }
 
   /** Keeps only the version token from `user-agent`, never the rest of the header set. */
@@ -89,23 +75,53 @@ export class ObservedClaudeCodeAuth {
     }
   }
 
-  private persist(): void {
-    if (!this.file || !this.snapshot) return;
-    try {
-      writeJsonAtomic(this.file, this.snapshot);
-      this.persistedAt = this.snapshot.observedAt;
-    } catch {
-      /* best effort */
+  isRevoked(): boolean {
+    let revoked = this.locallyRevoked;
+    if (this.home) {
+      try {
+        const state = readClaudeLocalAuthState(this.home);
+        if (this.consentGeneration !== undefined && this.consentGeneration !== state.generation) this.clear();
+        this.consentGeneration = state.generation;
+        revoked ||= !state.allowed;
+      } catch { revoked = true; }
     }
+    if (revoked) this.clear();
+    return revoked;
+  }
+
+  private clear(): void {
+    this.snapshot = null;
+    this.rejected = null;
+    this.cliVersionSeen = null;
+    this.cliVersionAt = 0;
+  }
+
+  /** Drop in-memory authority immediately, persist refusal, and retire only our legacy copy. */
+  revoke(): void {
+    this.locallyRevoked = true;
+    this.clear();
+    if (this.home) revokeClaudeLocalAuth(this.home);
+    if (this.home && this.legacyFile) removeLegacyObservedClaudeAuth(this.home, this.legacyFile);
+    // Once durable, the shared consent generation is authoritative. A later explicit CLI
+    // authorization can resume a running router too; failed publication keeps the RAM latch set.
+    if (this.home) this.locallyRevoked = false;
+  }
+
+  /** Explicit local consent. Old in-memory credentials are never revived by authorization. */
+  authorize(): void {
+    this.clear();
+    if (this.home) authorizeClaudeLocalAuth(this.home);
+    this.locallyRevoked = false;
   }
 
   observe(rawHeaders: readonly string[], observedAt = Date.now()): void {
+    if (this.isRevoked() || !Number.isFinite(observedAt)) return;
     const headers: Record<string, string> = {};
     let authorization: string | null = null;
     for (let index = 0; index + 1 < rawHeaders.length; index += 2) {
       const name = rawHeaders[index]!;
       const value = rawHeaders[index + 1]!;
-      if (!isObservedHeader(name)) continue;
+      if (!isObservedHeader(name) || /[\r\n\0]/.test(value)) continue;
       if (name.toLowerCase() === "authorization") {
         if (!/^Bearer\s+\S+$/i.test(value)) continue;
         authorization = value;
@@ -116,7 +132,6 @@ export class ObservedClaudeCodeAuth {
     // A 401 already proved this token dead (see forget); the client may keep sending it until it
     // signs in again, which must not make the accounts list flap in and out per request.
     if (this.rejected !== null && bearerToken(authorization) === this.rejected) return;
-    const changed = !this.snapshot || this.snapshot.authorization !== authorization || observedAt - this.persistedAt > 5 * 60_000;
     this.snapshot = {
       authorization,
       headers: Object.freeze({ ...headers }),
@@ -125,7 +140,6 @@ export class ObservedClaudeCodeAuth {
     // A different token is a sign-in or account switch; the previous token's refusal no longer applies.
     this.rejected = null;
     this.recordCliVersion(headers, observedAt);
-    if (changed) this.persist();
   }
 
   /**
@@ -135,12 +149,11 @@ export class ObservedClaudeCodeAuth {
    * left the login forgotten because only an un-routed request used to refresh it).
    */
   noteUsed(authorization: string, at = Date.now()): void {
+    if (this.isRevoked() || !Number.isFinite(at)) return;
     const snapshot = this.snapshot;
     const token = bearerToken(authorization);
     if (!snapshot || !token || bearerToken(snapshot.authorization) !== token || at < snapshot.observedAt) return;
-    const persistDue = at - this.persistedAt > 5 * 60_000;
     this.snapshot = { ...snapshot, observedAt: at };
-    if (persistDue) this.persist();
   }
 
   /**
@@ -153,7 +166,6 @@ export class ObservedClaudeCodeAuth {
     if (!snapshot || !token || bearerToken(snapshot.authorization) !== token) return;
     this.rejected = token;
     this.snapshot = null;
-    if (this.file) fs.rmSync(this.file, { force: true });
   }
 
   /**
@@ -161,16 +173,17 @@ export class ObservedClaudeCodeAuth {
    * fallback headers' `user-agent`. A bare version only: the header set itself is never exposed.
    */
   cliVersion(now = Date.now()): string | null {
+    if (this.isRevoked()) return null;
     if (!this.cliVersionSeen || now < this.cliVersionAt || now - this.cliVersionAt >= OBSERVED_CLAUDE_CODE_TTL_MS) return null;
     return this.cliVersionSeen;
   }
 
   getFresh(now = Date.now()): ObservedClaudeCodeAuthSnapshot | null {
+    if (this.isRevoked()) return null;
     const snapshot = this.snapshot;
     if (!snapshot) return null;
     if (now < snapshot.observedAt || now - snapshot.observedAt >= OBSERVED_CLAUDE_CODE_TTL_MS) {
       this.snapshot = null;
-      if (this.file) fs.rmSync(this.file, { force: true });
       return null;
     }
     return snapshot;

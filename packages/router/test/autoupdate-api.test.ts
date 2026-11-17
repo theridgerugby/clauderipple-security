@@ -9,7 +9,7 @@ import { ConfigStore, DEFAULTS, type Config } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
 import { RequestLog } from "../src/requestlog.ts";
 
-test("status, hot config and manual POST share the router's automatic-update coordinator", async (t) => {
+test("personal update checks remain read-only and both automatic and manual executable updates are refused", async (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-auto-api-"));
   const oldHome = process.env.CLAUDERIPPLE_HOME;
   const oldSettings = process.env.CLAUDE_SETTINGS_PATH;
@@ -41,20 +41,19 @@ test("status, hot config and manual POST share the router's automatic-update coo
     assert.equal((await status()).enabled, false);
     const config = (await (await fetch(`${url}/api/config`)).json()) as Config;
     const optIn = await fetch(`${url}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...config, autoUpdate: true }) });
-    assert.equal(optIn.status, 200); assert.equal((await status()).enabled, true);
+    assert.equal(optIn.status, 400); assert.equal((await status()).enabled, false);
     const updatedConfig = (await (await fetch(`${url}/api/config`)).json()) as Config;
     const put = await fetch(`${url}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...updatedConfig, autoUpdate: false }) });
     assert.equal(put.status, 200); assert.equal((await status()).enabled, false);
     await fetch(`${url}/api/update`);
     assert.equal((await status()).available, "1.1.0");
-    // Manual updates remain available with autoUpdate off, but concurrent launches are serialized.
+    // No admin path may replace the reviewed fork with an upstream executable.
     const requests = await Promise.all([fetch(`${url}/api/update`, { method: "POST" }), fetch(`${url}/api/update`, { method: "POST" })]);
-    assert.deepEqual(requests.map((r) => r.status).sort(), [202, 409]);
-    assert.equal(launches, 1); assert.equal((await status()).running, true);
-    assert.throws(() => updater.install(check), /already running/);
+    assert.deepEqual(requests.map((r) => r.status).sort(), [403, 403]);
+    assert.equal(launches, 0); assert.equal((await status()).running, false);
     assert.equal((await status()).lastUpdatedFrom, undefined, "intent is not a completion notice");
     const successor = new AutoUpdater({ home, version: "1.1.0", enabled: () => false, activity: () => ({ inFlight: 0 }), log, runCli, startCliDetached: () => assert.fail("must not launch") });
-    assert.equal(successor.status().lastUpdatedFrom, "1.0.0");
-    assert.equal(successor.status().lastUpdatedTo, "1.1.0");
+    assert.equal(successor.status().lastUpdatedFrom, undefined);
+    assert.equal(successor.status().lastUpdatedTo, undefined);
   } finally { admin.close(); }
 });

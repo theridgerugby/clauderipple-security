@@ -361,6 +361,11 @@ async function main(): Promise<void> {
   // Refuse before install's authenticated shutdown or any state initialization, not just saveConfig.
   rejectLegacyTokenRotation();
   const sub = process.argv[2] && !process.argv[2].startsWith("--") ? process.argv[2] : null;
+  // This fork is a single-user local deployment. Guard the executable too, including an old
+  // service that invokes it directly, so the CLI wrapper cannot be bypassed to expose a relay.
+  if (sub === null || ["install", "refresh", "pair"].includes(sub)) {
+    throw new Error("Remote activation is disabled in this personal-security build; only status, help and explicit uninstall are available");
+  }
   switch (sub) {
     case null: return runHost();
     case "install": return installCmd();

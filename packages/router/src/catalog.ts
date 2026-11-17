@@ -18,6 +18,8 @@
 // The catalogue is community-maintained and a new model can arrive a day late; a model it does not
 // list is measured exactly as before.
 
+import { guardEgressFetch } from "./egress.ts";
+
 /** Which models.dev provider describes the endpoint a preset points at. Only presets whose base URL
  * is the one the catalogue entry names (`api`) are listed, so the catalogue never describes a
  * different endpoint from the one the request goes to. */
@@ -148,7 +150,7 @@ let cached: { at: number; catalog: unknown } | undefined;
 export async function loadModelCatalog(fetchImpl: typeof fetch = fetch): Promise<unknown> {
   if (cached && Date.now() - cached.at < CATALOG_TTL_MS) return cached.catalog;
   try {
-    const response = await fetchImpl(CATALOG_URL, { signal: AbortSignal.timeout(CATALOG_TIMEOUT_MS) });
+    const response = await guardEgressFetch(fetchImpl)(CATALOG_URL, { signal: AbortSignal.timeout(CATALOG_TIMEOUT_MS) });
     if (!response.ok) return cached?.catalog;
     const catalog = await response.json() as unknown;
     cached = { at: Date.now(), catalog };

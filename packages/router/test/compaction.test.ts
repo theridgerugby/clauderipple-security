@@ -223,6 +223,31 @@ test("missing target, unset setting and corrupt setting all retain a response on
   } finally { await r.stop(); }
 });
 
+for (const wire of ["anthropic", "openai"] as const) test(`compaction ${wire} redirect refusals reach the client without an original-destination fallback`, async () => {
+  const r = await rig();
+  try {
+    // Leave this direct library fixture without personal mode: it deliberately exercises the
+    // legacy deferred-error wrapper as well as the terminal policy boundary. Production personal
+    // mode disables automatic cross-provider fallback independently.
+    if (wire === "openai") {
+      const url = (r.cfg.providers.local as { url: string }).url;
+      r.cfg.providers.local = { type: "openai-compatible", url, wire: "chat", headers: { authorization: "Bearer synthetic-only" }, models: [{ id: "summary" }] };
+    }
+    r.settings("summary");
+    for (const status of [302, 304, 307]) {
+      const before = r.routed.length;
+      r.fail(status);
+      const text = await r.send();
+      assert.match(text, /HTTP\/1.1 502/);
+      assert.match(text, /redirect/i);
+      assert.doesNotMatch(text, /core summary|compact target refused|synthetic-only/);
+      assert.equal(r.routed.length, before + 1, "the configured provider is contacted once");
+      assert.equal(r.native.length, 0, "the original destination receives no prompt or credential");
+      assert.equal(r.proxy.stats.inFlight, 0, "a swallowed deferred error cannot leave the turn pending");
+    }
+  } finally { await r.stop(); }
+});
+
 for (const scenario of ['success', 'refusal', 'started-stream'] as const) test(`translated compaction ${scenario} uses ordinary adapter and response commitment`, async () => {
   const r = await rig();
   try {

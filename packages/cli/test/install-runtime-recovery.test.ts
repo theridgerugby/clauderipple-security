@@ -32,7 +32,15 @@ function fixture(t: { after(fn: () => void): void }, prefixName = "prefix") {
   const osName = process.platform === "darwin" ? "darwin" : "linux";
   const arch = process.arch === "arm64" ? "arm64" : "x64";
   const env = { HOME: home, SHELL: "/bin/sh", PATH: `${bin}:/usr/bin:/bin`, CLAUDERIPPLE_HOME: prefix, CLAUDERIPPLE_PREFIX: prefix, CLAUDE_CONFIG_DIR: path.join(root, "claude"), TMPDIR: path.join(root, "tmp"), CLAUDERIPPLE_NO_SETUP: "1", CLAUDERIPPLE_NO_TRAY: "1", TEST_PREFIX: prefix, TEST_ARCHIVE: archive, TEST_CHECKSUM: checksum, TEST_OS: osName, TEST_ARCH: arch };
-  const run = (point: string) => spawnSync("/bin/sh", [installer], { env: { ...env, FAIL_POINT: point }, encoding: "utf8" });
+  // Keep exercising the dormant upstream recovery library in an isolated copy. The shipping
+  // entry point is fail-closed and has its own no-side-effects test; there is no runtime flag
+  // that bypasses its personal-fork guard.
+  const source = fs.readFileSync(installer, "utf8");
+  const marker = "# LEGACY_INSTALLER_BODY: retained for isolated regression fixtures; unreachable in this fork.";
+  assert.equal(source.split(marker).length, 2);
+  const legacyFixture = path.join(root, "legacy-installer-fixture.sh");
+  fs.writeFileSync(legacyFixture, source.slice(source.indexOf(marker) + marker.length));
+  const run = (point: string) => spawnSync("/bin/sh", [legacyFixture], { env: { ...env, FAIL_POINT: point }, encoding: "utf8" });
   const preserved = () => {
     assert.equal(fs.readFileSync(path.join(prefix, "runtime/identity"), "utf8"), "previous-runtime");
     assert.equal(fs.existsSync(path.join(prefix, "runtime/bin/node")), true);

@@ -163,14 +163,16 @@ function taskDefinitionMatchesExceptPriority(value: unknown, expected: { execute
  * the exit is non-zero, so the loop above relaunches it exactly as after a crash. Any HTTP answer
  * counts as alive (an older router has no /api/ping and answers 404), the process under a stream is
  * still answered by the same loop, a router that has never answered gets 5 minutes to start, and the
- * port is read from config.json when the router is launched, as the router reads it. A config that
- * cannot be read switches the probe off for that launch rather than guessing a port.
+ * port is read through the canonical private/DPAPI config reader when the router is launched.
+ * A config that cannot be read switches the probe off for that launch rather than guessing a port.
  */
 export function renderLauncher(opts: { program: string; args: string[]; home: string; env?: Record<string, string>; watchdog?: boolean }): string {
   const logDir = path.join(opts.home, "logs");
   const watchdog = opts.watchdog !== false;
   const env = { CLAUDERIPPLE_HOME: opts.home, ...(opts.env ?? {}) };
   const quoteArg = (arg: string): string => ps(`"${arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1')}"`);
+  const cli = runtime().cli;
+  const portReader = path.join(path.dirname(cli), `watchdog-port${path.extname(cli)}`);
   // No `$ErrorActionPreference = 'Stop'`: one failed Start-Process (a locked log file, say) would end
   // the loop and leave the router or host unsupervised; the loop retries instead.
   // Windows PowerShell 5.1 decodes -File as ANSI unless the UTF-8 BOM is present.
@@ -190,17 +192,36 @@ export function renderLauncher(opts: { program: string; args: string[]; home: st
     "} catch {}",
     ...(watchdog ? [
       `$watchdogLog = ${ps(path.join(logDir, "launcher-watchdog.log"))}`,
-      // The admin port the router will bind: config.admin.port, else listen.port + 1, else the defaults
-      // (8790 / 8791) when there is no config. 0 = cannot be told, so there is no probing.
+      // A fixed native helper understands both legacy and DPAPI-sealed config. The program is
+      // the same absolute runtime the installer registered; no PATH lookup or script evaluation.
+      // It only prints the public liveness port. Bound the wait and read six characters at most
+      // (five digits is the maximum valid response), without exposing config/errors in a log.
       "function Get-AdminPort {",
-      "  $file = Join-Path $env:CLAUDERIPPLE_HOME 'config.json'",
-      "  if (-not (Test-Path -LiteralPath $file)) { return 8791 }",
+      "  $readerProcess = $null",
       "  try {",
-      "    $cfg = Get-Content -Raw -LiteralPath $file -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop",
-      "    if ($cfg.admin -and $cfg.admin.port) { return [int]$cfg.admin.port }",
-      "    if ($cfg.listen -and $cfg.listen.port) { return [int]$cfg.listen.port + 1 }",
-      "    return 8791",
-      "  } catch { return 0 }",
+      "    $info = New-Object System.Diagnostics.ProcessStartInfo",
+      `    $info.FileName = ${ps(opts.program)}`,
+      `    $info.Arguments = ${quoteArg(portReader)}`,
+      "    $info.UseShellExecute = $false",
+      "    $info.CreateNoWindow = $true",
+      "    $info.RedirectStandardOutput = $true",
+      "    $info.RedirectStandardError = $true",
+      "    $readerProcess = [System.Diagnostics.Process]::Start($info)",
+      "    [char[]]$buffer = New-Object char[] 6",
+      "    $reading = $readerProcess.StandardOutput.ReadBlockAsync($buffer, 0, 6)",
+      "    if (-not $readerProcess.WaitForExit(30000)) { return 0 }",
+      "    if (-not $reading.Wait(1000) -or $readerProcess.ExitCode -ne 0) { return 0 }",
+      "    $text = [string]::new($buffer, 0, $reading.Result)",
+      "    if ($text -notmatch '^[1-9][0-9]{0,4}$') { return 0 }",
+      "    $port = [int]$text",
+      "    if ($port -gt 65535) { return 0 }",
+      "    return $port",
+      "  } catch { return 0 } finally {",
+      "    if ($null -ne $readerProcess) {",
+      "      try { if (-not $readerProcess.HasExited) { $readerProcess.Kill(); $null = $readerProcess.WaitForExit(1000) } } catch {}",
+      "      $readerProcess.Dispose()",
+      "    }",
+      "  }",
       "}",
       // Alive = any HTTP answer, whatever its status. Refused, reset and timed out = no answer.
       // The proxy is bypassed: in picker mode the system proxy is this very router.

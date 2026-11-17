@@ -1,8 +1,9 @@
-# Typecheck and test every pull request and every push to main, on macOS, Linux and Windows.
+# This personal fork currently supports Windows only. Run the full functional suite and
+# native security gates for every candidate; this does not establish macOS/Linux acceptance.
 #
 # `pull_request` (not `pull_request_target`) runs a fork's code with a read-only token and no
 # secrets, so nothing here may need one. The tests must keep to temporary homes: a runner is a
-# throwaway VM, but the same tests also run on a maintainer's Mac next to the live install.
+# throwaway VM, but the same tests may run next to the owner's live installation.
 #
 name: CI
 
@@ -11,7 +12,7 @@ on:
   push:
     branches: [main]
   workflow_call:
-  # A maintainer can request the same mandatory three-OS native gates without publishing.
+  # The owner can request the same mandatory Windows gates without publishing.
   workflow_dispatch:
 
 permissions:
@@ -29,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
+        os: [windows-latest]
     env:
       # Dependency hooks remain disabled. Only the pinned Electron downloader below is invoked.
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
@@ -64,11 +65,11 @@ jobs:
   native-security:
     name: native security (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
+        os: [windows-latest]
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
     steps:
@@ -85,15 +86,7 @@ jobs:
           ELECTRON_SKIP_BINARY_DOWNLOAD: ""
         run: node node_modules/electron/install.js
       - run: npm run build
-      - name: Native Electron boundary tests (Linux)
-        if: runner.os == 'Linux'
-        env:
-          # Use the image's installed Chromium sandbox helper; keep AppArmor and all
-          # sandbox flags intact. run.mjs rejects unsafe ownership/modes or a missing file.
-          CHROME_DEVEL_SANDBOX: /opt/google/chrome/chrome-sandbox
-        run: xvfb-run -a npm run test:native --workspace @clauderipple/app
-      - name: Native Electron boundary tests (Windows and macOS)
-        if: runner.os != 'Linux'
+      - name: Native Windows Electron boundary tests
         run: npm run test:native --workspace @clauderipple/app
       - name: Native Windows ACL and control deadlines
         if: runner.os == 'Windows'
@@ -108,3 +101,15 @@ jobs:
         if: runner.os == 'Windows'
         # The full matrix still runs every admin test; isolate fresh and cached reading semantics.
         run: node --test --test-reporter=tap --test-name-pattern="GET /api/limits forecasts a window|GET /api/limits judges a cached reading" packages/router/test/admin.test.ts
+      - name: Native Windows personal sensitive-data gates
+        if: runner.os == 'Windows'
+        # Synthetic secrets only: real CurrentUser DPAPI, cross-process reads, native-app
+        # config decoding, exact-origin refusal and verified installation/recovery identity.
+        run: node --test --test-reporter=tap packages/router/test/secret-storage.test.ts packages/app/test/config-secrets.test.ts packages/router/test/personal-policy.test.ts packages/router/test/personal-profile-smoke.test.ts packages/router/test/admin-personal-policy.test.ts packages/router/test/admin-credential-origin.test.ts packages/router/test/anthropic-local-auth.test.ts packages/cli/test/install-runtime.test.ts packages/cli/test/security-command.test.ts packages/cli/test/watchdog-port.test.ts packages/cli/test/personal-bootstrap.test.ts
+      - name: Hosted Windows scheduled-task installation and rollback boundary
+        if: runner.os == 'Windows'
+        env:
+          CLAUDERIPPLE_WINDOWS_SERVICE_ACCEPTANCE: "1"
+        # Unique disposable task, synthetic DPAPI key and private client-settings path.
+        # Never imports a CA into the Windows trust store or touches an installed Claude app.
+        run: node --test --test-reporter=tap packages/cli/test/windows-personal-install.test.ts

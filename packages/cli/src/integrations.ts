@@ -20,7 +20,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { configPath } from "../../router/src/config.ts";
-import { withFileLock, writeJsonAtomic } from "../../router/src/locked-file.ts";
+import { withFileLock, writeSecretJsonAtomic } from "../../router/src/locked-file.ts";
+import { readPrivateFile } from "../../router/src/private-file.ts";
 import { defaultAgentDir, removeGeneratedAgentFiles } from "../../router/src/agents.ts";
 import { certPaths } from "./certs.ts";
 import { codexRemove } from "./codex.ts";
@@ -50,7 +51,7 @@ function worst(outcomes: IntegrationOutcome[]): IntegrationOutcome {
 /** The proxy port this installation's Claude Desktop entry points at, from its own config. */
 function listenPort(home: string): number | undefined {
   try {
-    const port = (JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8")) as { listen?: { port?: unknown } }).listen?.port;
+    const port = (JSON.parse(readPrivateFile(path.join(home, "config.json")).toString("utf8")) as { listen?: { port?: unknown } }).listen?.port;
     return typeof port === "number" ? port : undefined;
   } catch {
     return undefined;
@@ -64,11 +65,11 @@ function listenPort(home: string): number | undefined {
  */
 export function setPickerEnabled(enabled: boolean, file = configPath()): void {
   withFileLock(file, () => {
-    const raw: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
+    const raw: unknown = JSON.parse(readPrivateFile(file).toString("utf8"));
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`${file} is not a JSON object; left untouched`);
     const next = { ...(raw as Record<string, unknown>) };
     next.picker = { ...((next.picker as Record<string, unknown> | undefined) ?? {}), enabled };
-    writeJsonAtomic(file, next);
+    writeSecretJsonAtomic(file, next);
   });
 }
 

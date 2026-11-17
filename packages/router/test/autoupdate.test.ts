@@ -276,7 +276,7 @@ test("stopping or opting out during a pending check prevents automatic installat
   resolve({ ok: true, output: JSON.stringify(f.check) }); await f.clock.flush();
   assert.equal(f.launches, 0); assert.equal(f.clock.tasks.length, 0);
 });
-test("autoUpdate validates booleans and installs only after an explicit opt-in", (t) => {
+test("library update flags validate booleans, while personal ConfigStore never activates executable updates", (t) => {
   const { f } = fixture(t);
   for (const autoUpdate of [true, false]) assert.deepEqual(validate({ ...DEFAULTS, autoUpdate }), []);
   for (const autoUpdate of [null, 0, "false", {}]) {
@@ -286,7 +286,8 @@ test("autoUpdate validates booleans and installs only after an explicit opt-in",
   const file = path.join(f.home, "config.json"); fs.writeFileSync(file, "{}");
   const store = new ConfigStore(file); assert.equal(autoUpdateEnabled(store.get()), false);
   fs.writeFileSync(file, '{"autoUpdate":true}'); fs.utimesSync(file, 4000, 4000);
-  assert.equal(autoUpdateEnabled(store.get()), true);
+  assert.equal(autoUpdateEnabled(store.get()), false);
+  assert.deepEqual(store.get().security, { mode: "personal", approvedOrigins: [] });
   fs.writeFileSync(file, '{"autoUpdate":false}'); fs.utimesSync(file, 5000, 5000);
   assert.equal(autoUpdateEnabled(store.get()), false);
   fs.writeFileSync(file, '{}'); fs.utimesSync(file, 6000, 6000);

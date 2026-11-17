@@ -12,13 +12,16 @@ export class Logger {
   private readonly maxBytes: number;
   private readonly keep: number;
   private readonly echo: boolean;
+  private readonly memoryOnly: boolean;
+  private readonly recent: string[] = [];
 
-  constructor(file: string | null, maxBytes: number, keep: number, echo: boolean) {
-    this.file = file;
+  constructor(file: string | null, maxBytes: number, keep: number, echo: boolean, memoryOnly = false) {
+    this.memoryOnly = memoryOnly;
+    this.file = memoryOnly ? null : file;
     this.maxBytes = maxBytes;
     this.keep = keep;
-    this.echo = echo;
-    if (file) {
+    this.echo = !memoryOnly && echo;
+    if (this.file) {
       this.open();
     }
   }
@@ -53,6 +56,11 @@ export class Logger {
     const ts = `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; // local time, like the app's own logs
     const safeMessage = redactErrorText(msg.replace(/[\u0000-\u0008\u000b-\u001f\u007f\u0085\u2028\u2029]/g, " "), [], 16 * 1024);
     const out = `${ts} ${level === "info" ? "" : level.toUpperCase() + " "}${safeMessage}\n`;
+    if (this.memoryOnly) {
+      this.recent.push(out);
+      if (this.recent.length > 500) this.recent.shift();
+      return;
+    }
     if (this.echo || this.fd === null) process.stdout.write(out);
     if (this.fd !== null) {
       try {
@@ -76,6 +84,12 @@ export class Logger {
   }
   error(msg: string): void {
     this.line("error", msg);
+  }
+
+  /** Personal mode never persists or echoes potentially sensitive provider error diagnostics. */
+  memoryTail(n: number): string | null {
+    const count = Number.isFinite(n) ? Math.max(0, Math.min(500, Math.floor(n))) : 0;
+    return this.memoryOnly ? (count === 0 ? "" : this.recent.slice(-count).join("")) : null;
   }
 
   close(): void {

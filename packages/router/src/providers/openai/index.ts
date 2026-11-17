@@ -12,6 +12,7 @@ import { CLOUDFLARE_FINGERPRINT_BLOCK, retryAfterMs } from "../../pool.ts";
 import { credentialHeaderValues, redactErrorText } from "../../redact.ts";
 import { SseParser } from "../chatgpt/sse.ts";
 import { fetchWithRetry } from "../retry.ts";
+import { isEgressPolicyError } from "../../egress.ts";
 import { StartInputs } from "../start-input.ts";
 import { estimateTokens, formatSse, OpenAiStreamMapper, toOpenAiRequest, type ChatRequest, type ResponsesRequest } from "./translate.ts";
 import { refusesReplayedReasoning, requiresThinkingReplay } from "../../reasoning.ts";
@@ -287,6 +288,7 @@ export class OpenAiCompatibleAdapter {
     } catch (error) {
       res.off("close", onClose);
       if (controller.signal.aborted) return { status: 0, bytes: 0, note: "client closed" };
+      if (isEgressPolicyError(error)) throw error;
       // fetch names an invalid header value in full, credential included; the message also reaches the
       // request log through whoever catches this.
       (error as Error).message = redact((error as Error).message);

@@ -9,6 +9,7 @@ import { CredentialPool, pinnedCredential, retryAfterMs } from "../../pool.ts";
 import { CODEX_LOGIN_ID, ChatGptAccountPool, type ChatGptAccountSummary, type ChatGptCredential, type FetchLike } from "./accounts.ts";
 import { SseParser } from "./sse.ts";
 import { fetchWithRetry } from "../retry.ts";
+import { egressFetch, isEgressPolicyError } from "../../egress.ts";
 import { StartInputs } from "../start-input.ts";
 import { looksLikeAuth } from "../openai/index.ts";
 import { StreamMapper, conversationKey, estimateTokens, formatSse, serverToolNames, toResponsesRequest, toolNameRestoreMap, type AnthropicRequest, type TranslateOptions } from "./translate.ts";
@@ -439,7 +440,7 @@ export class ChatGptAdapter {
     };
     const timeout = AbortSignal.timeout(60_000);
     const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-    const res = await fetch(`${(this.cfg.url ?? DEFAULT_BASE).replace(/\/$/, "")}/codex/responses`, {
+    const res = await egressFetch(`${(this.cfg.url ?? DEFAULT_BASE).replace(/\/$/, "")}/codex/responses`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -459,7 +460,7 @@ export class ChatGptAdapter {
     this.noteRateLimits(tokens, rateLimitsFromHeaders(res.headers));
     if (!res.ok || !res.body) {
       const text = await res.text().catch(() => "");
-      if (res.status === 401) void this.accounts.forceRefresh(tokens.ownerId);
+      if (res.status === 401) await this.accounts.forceRefresh(tokens.ownerId);
       throw new Error(`ChatGPT web search: HTTP ${res.status}${text ? ` ${redactErrorText(text, [tokens.accessToken], 200)}` : ""}`);
     }
 
@@ -555,7 +556,7 @@ export class ChatGptAdapter {
     };
     const timeout = AbortSignal.timeout(IMAGE_TIMEOUT_MS);
     const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-    const res = await fetch(`${(this.cfg.url ?? DEFAULT_BASE).replace(/\/$/, "")}/codex/responses`, {
+    const res = await egressFetch(`${(this.cfg.url ?? DEFAULT_BASE).replace(/\/$/, "")}/codex/responses`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -575,7 +576,7 @@ export class ChatGptAdapter {
     this.noteRateLimits(tokens, rateLimitsFromHeaders(res.headers));
     if (!res.ok || !res.body) {
       const text = await res.text().catch(() => "");
-      if (res.status === 401) void this.accounts.forceRefresh(tokens.ownerId);
+      if (res.status === 401) await this.accounts.forceRefresh(tokens.ownerId);
       throw new Error(`ChatGPT image generation: HTTP ${res.status}${text ? ` ${redactErrorText(text, [tokens.accessToken], 200)}` : ""}`);
     }
 
@@ -636,8 +637,8 @@ export class ChatGptAdapter {
    * response headers. Without this, `/api/status` shows the last time GPT traffic flowed — 11
    * hours stale in one measurement (2026-09-20) — and the product's GPT budget read is wrong.
    * Every account is asked, so the dashboard can show each one and an account that is already
-   * spent leaves rotation before a turn finds out the hard way. Never throws and never clears a
-   * good snapshot; returns the active account's new one, or null when none could be read.
+   * spent leaves rotation before a turn finds out the hard way. Never clears a good snapshot;
+   * ordinary lookup failures return null, while security policy refusals remain terminal.
    */
   fetchRateLimits(): Promise<Record<string, unknown> | null> {
     if (this.rateLimitsInFlight) return this.rateLimitsInFlight;
@@ -663,7 +664,7 @@ export class ChatGptAdapter {
     let res: Response;
     let body: unknown;
     try {
-      res = await fetch(`${(this.cfg.url ?? DEFAULT_BASE).replace(/\/$/, "")}${USAGE_PATH}`, {
+      res = await egressFetch(`${(this.cfg.url ?? DEFAULT_BASE).replace(/\/$/, "")}${USAGE_PATH}`, {
         method: "GET",
         headers: {
           authorization: `Bearer ${tokens.accessToken}`,
@@ -676,6 +677,7 @@ export class ChatGptAdapter {
       // Headers do not finish the lookup: the same deadline must bound the JSON body too.
       if (res.ok) body = await res.json().catch(() => null);
     } catch (e) {
+      if (isEgressPolicyError(e)) throw e;
       this.log.warn(`chatgpt ${this.name}: rate-limit fetch failed: ${(e as Error).message}`);
       return null;
     } finally {
@@ -715,7 +717,7 @@ export class ChatGptAdapter {
   /**
    * The models this subscription can actually reach, from the backend's own catalogue. Without it
    * a model OpenAI ships is invisible here until a router release names it (gpt-6-sol and gpt-6-luna,
-   * 2026-09-23). Never throws; null on any failure, and null
+   * 2026-09-23). Null on ordinary lookup failure; security refusals remain terminal. Null
    * rather than [] when parsing yields nothing, so the caller falls back instead of showing nothing.
    */
   fetchModels(): Promise<ProviderModel[] | null> {
@@ -741,7 +743,7 @@ export class ChatGptAdapter {
     let res: Response;
     let body: unknown;
     try {
-      res = await fetch(`${(this.cfg.url ?? DEFAULT_BASE).replace(/\/$/, "")}${MODELS_PATH}?client_version=${encodeURIComponent(version)}`, {
+      res = await egressFetch(`${(this.cfg.url ?? DEFAULT_BASE).replace(/\/$/, "")}${MODELS_PATH}?client_version=${encodeURIComponent(version)}`, {
         method: "GET",
         headers: {
           authorization: `Bearer ${tokens.accessToken}`,
@@ -754,6 +756,7 @@ export class ChatGptAdapter {
       // Keep the original request deadline until the body has finished, not just its headers.
       if (res.ok) body = await res.json().catch(() => null);
     } catch (e) {
+      if (isEgressPolicyError(e)) throw e;
       this.log.warn(`chatgpt ${this.name}: model-catalog fetch failed: ${(e as Error).message}`);
       return null;
     } finally {
@@ -761,7 +764,7 @@ export class ChatGptAdapter {
     }
     if (!res.ok) {
       // The status only: the body can echo the request, and the token rides on it.
-      if (res.status === 401) void this.accounts.forceRefresh(tokens.ownerId);
+      if (res.status === 401) await this.accounts.forceRefresh(tokens.ownerId);
       this.log.warn(`chatgpt ${this.name}: model-catalog fetch HTTP ${res.status}`);
       return null;
     }
@@ -859,6 +862,7 @@ export class ChatGptAdapter {
         }, { log: (line) => this.log.info(`chatgpt ${this.name}: ${line}`) });
       } catch (e) {
         if (spec.signal.aborted) return { kind: "aborted" };
+        if (isEgressPolicyError(e)) throw e;
         this.pool.penalise(this.name, credential.id, 0);
         tried.add(credential.ownerId);
         lastThrown = e as Error;
@@ -958,7 +962,7 @@ export class ChatGptAdapter {
         if (clientTurnState && issuer && issuer !== credential.ownerId) delete out["x-codex-turn-state"];
         return out;
       },
-    });
+    }).catch((error: unknown) => { res.off("close", onClose); throw error; });
 
     let upstream: Response;
     let owner: string | null = null;
@@ -981,7 +985,7 @@ export class ChatGptAdapter {
         const callerHeaders = { ...forwarded };
         if (clientTurnState && this.turnStateIssuer.has(clientTurnState)) delete callerHeaders["x-codex-turn-state"];
         try {
-          upstream = await fetch(`${(this.cfg.url ?? DEFAULT_BASE).replace(/\/$/, "")}/codex${subPath}`, {
+          upstream = await egressFetch(`${(this.cfg.url ?? DEFAULT_BASE).replace(/\/$/, "")}/codex${subPath}`, {
             method,
             headers: { ...callerHeaders, authorization: String(req.headers.authorization), "chatgpt-account-id": String(req.headers["chatgpt-account-id"]) },
             ...(body ? { body } : {}),
@@ -990,6 +994,7 @@ export class ChatGptAdapter {
         } catch (e) {
           res.off("close", onClose);
           if (ac.signal.aborted) return { status: 0, bytes: 0, note: "client closed" };
+          if (isEgressPolicyError(e)) throw e;
           return sendOpenAiError(res, 502, "api_error", `ChatGPT backend unreachable: ${(e as Error).message}`, "caller login unreachable");
         }
       } else {
@@ -1141,7 +1146,7 @@ export class ChatGptAdapter {
           ...(turnState ? { "x-codex-turn-state": turnState } : {}),
         };
       },
-    });
+    }).catch((error: unknown) => { res.off("close", onClose); throw error; });
     let sent = await ask();
     // A 4xx that names reasoning is the backend refusing the sealed reasoning we replayed — the blob
     // was minted by the model that is no longer answering, or by another account. The summary is

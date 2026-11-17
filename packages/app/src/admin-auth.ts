@@ -6,12 +6,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { verifyWindowsPrivateAcl } from "./windows-private-acl.ts";
 import { adminTlsFetch, validateAdminPath, type AdminEndpoint, type AdminPublicIdentity } from "./admin-transport-client.ts";
+import { secretStoredBytesLimit, unsealSecretBytes, type SecretProtector } from "./secret-storage.ts";
 
 export const ADMIN_TOKEN_HEADER = "x-clauderipple-admin";
 
 /** Never creates or repairs transport state. Exposed credentials must be rotated. */
-function privateAdminText(home: string, name: string, limit: number): string | undefined {
+function privateAdminText(home: string, name: string, limit: number, secret?: { protector?: SecretProtector }): string | undefined {
   const file = path.join(home, name);
+  const storedLimit = secret ? secretStoredBytesLimit(limit) : limit;
   let fd: number;
   let before: fs.Stats;
   try {
@@ -26,7 +28,7 @@ function privateAdminText(home: string, name: string, limit: number): string | u
     const stat = fs.fstatSync(fd);
     if (!stat.isFile() || stat.nlink !== 1) throw new Error("admin credential must be a regular private file");
     if (stat.dev !== before.dev || stat.ino !== before.ino) throw new Error("admin credential changed while opening it");
-    if (stat.size > limit) throw new Error("invalid private admin state file");
+    if (stat.size > storedLimit) throw new Error("invalid private admin state file");
     if (process.platform !== "win32") {
       if (typeof process.getuid === "function" && stat.uid !== process.getuid()) throw new Error("admin credential must belong to the current user");
       if ((stat.mode & 0o077) !== 0) throw new Error("admin credential permissions must be owner-only (0600)");
@@ -40,18 +42,47 @@ function privateAdminText(home: string, name: string, limit: number): string | u
       }
     }
     // A writer growing the file after fstat cannot turn credential reading into an unbounded allocation.
-    const bytes = Buffer.alloc(limit + 1);
+    const chunks: Buffer[] = [];
     let total = 0;
-    while (total < bytes.length) {
-      const count = fs.readSync(fd, bytes, total, bytes.length - total, null);
+    for (;;) {
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, storedLimit + 1 - total));
+      const count = fs.readSync(fd, chunk, 0, chunk.length, null);
       if (!count) break;
       total += count;
+      if (total > storedLimit) throw new Error("invalid private admin state file");
+      chunks.push(chunk.subarray(0, count));
     }
-    if (total > limit) throw new Error("invalid private admin state file");
-    return bytes.subarray(0, total).toString("utf8");
+    const bytes = Buffer.concat(chunks, total);
+    const unchanged = (): void => {
+      for (const current of [fs.lstatSync(file), fs.fstatSync(fd)]) {
+        if (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1 ||
+            current.dev !== stat.dev || current.ino !== stat.ino || current.ctimeMs !== stat.ctimeMs ||
+            current.mtimeMs !== stat.mtimeMs || current.size !== stat.size || current.mode !== stat.mode || current.uid !== stat.uid) {
+          throw new Error("private application state changed while reading it");
+        }
+      }
+    };
+    unchanged();
+    const clear = secret ? unsealSecretBytes(file, bytes, limit, secret.protector) : bytes;
+    unchanged();
+    return clear.toString("utf8");
   } finally {
     fs.closeSync(fd);
   }
+}
+
+/** Only non-secret routing ports leave this verified main-process reader. No renderer API. */
+export function readPrivateConfigPorts(home: string, options: { protector?: SecretProtector } = {}): { proxy: number; admin: number } {
+  const text = privateAdminText(home, "config.json", 8 * 1024 * 1024, options);
+  if (text === undefined) return { proxy: 8790, admin: 8791 };
+  try {
+    const value: unknown = JSON.parse(text);
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
+    const c = value as { listen?: { port?: unknown }; admin?: { port?: unknown } };
+    const proxy = c.listen?.port ?? 8790, admin = c.admin?.port ?? (typeof proxy === "number" ? proxy + 1 : undefined);
+    if (!Number.isSafeInteger(proxy) || !Number.isSafeInteger(admin) || typeof proxy !== "number" || typeof admin !== "number" || proxy < 1 || proxy > 65535 || admin < 1 || admin > 65535) throw new Error();
+    return { proxy, admin };
+  } catch { throw new Error("invalid private application config"); }
 }
 
 /** The old HTTP-only client's token is deliberately a different file and is never accepted. */

@@ -17,6 +17,9 @@ concurrency:
 
 jobs:
   verify:
+    # This private-use fork is distributed from reviewed source only. Inherited tags or
+    # manual dispatch must not activate the upstream package-publication pipeline here.
+    if: github.repository == 'PBJ-2/clauderipple'
     uses: ./.github/workflows/ci.yml
 
   package:

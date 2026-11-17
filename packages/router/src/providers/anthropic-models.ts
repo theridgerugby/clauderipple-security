@@ -6,6 +6,7 @@
 // Code login as well as an API key, newest first, and each entry states its effort ladder and
 // context window (measured 2026-10-08 with the observed login: 14 models, `claude-haiku-5-5` first).
 import type { ProviderModel } from "../config.ts";
+import { guardEgressFetch, isEgressPolicyError } from "../egress.ts";
 import type { Credential } from "../pool.ts";
 
 export type ClaudeModel = ProviderModel & {
@@ -98,6 +99,7 @@ export class ClaudeModelCatalog {
     try {
       credential = (await this.source.credentials())[0];
     } catch (e) {
+      if (isEgressPolicyError(e)) throw e;
       this.opts.warn?.(`claude models: no credentials: ${(e as Error).message}`);
       return this.last;
     }
@@ -106,6 +108,7 @@ export class ClaudeModelCatalog {
       const models = await fetchClaudeModels(`https://${this.opts.upstream()}`, credential.headers, this.opts.fetch, this.opts.timeoutMs);
       if (models.length) this.last = models;
     } catch (e) {
+      if (isEgressPolicyError(e)) throw e;
       this.opts.warn?.(`claude models: ${(e as Error).message}`);
     }
     return this.last;
@@ -114,7 +117,7 @@ export class ClaudeModelCatalog {
 
 /** One `GET /v1/models` with the given credentials. Throws on anything but a usable answer. */
 export async function fetchClaudeModels(origin: string, headers: Record<string, string>, fetchImpl: FetchLike = fetch, timeoutMs = 8000): Promise<ClaudeModel[]> {
-  const res = await fetchImpl(`${origin}/v1/models?limit=100`, {
+  const res = await guardEgressFetch(fetchImpl)(`${origin}/v1/models?limit=100`, {
     method: "GET",
     headers: { "anthropic-version": "2023-06-01", ...headers, accept: "application/json" },
     signal: AbortSignal.timeout(timeoutMs),

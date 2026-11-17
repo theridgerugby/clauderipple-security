@@ -9,6 +9,7 @@
 // doc/source-derived and unmeasured. That is recorded in docs/ARCHITECTURE.md §4d.
 
 import crypto from "node:crypto";
+import { guardEgressFetch, isEgressPolicyError } from "../../egress.ts";
 import type { ProviderModel } from "../../config.ts";
 
 // ── OAuth + Cloud Code Assist endpoints ─────────────────────────────────────────────────────────
@@ -797,7 +798,7 @@ export async function discoverProject(accessToken: string, fetchImpl: FetchLike 
 
 async function loadCodeAssistProject(accessToken: string, fetchImpl: FetchLike, signal?: AbortSignal): Promise<string | undefined> {
   try {
-    const response = await fetchImpl(`${GOOGLE_OAUTH.prodApi}/${GOOGLE_OAUTH.apiVersion}:loadCodeAssist`, {
+    const response = await guardEgressFetch(fetchImpl)(`${GOOGLE_OAUTH.prodApi}/${GOOGLE_OAUTH.apiVersion}:loadCodeAssist`, {
       method: "POST",
       headers: { authorization: `Bearer ${accessToken}`, accept: "*/*", "content-type": "application/json", "user-agent": antigravityUserAgent() },
       body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }),
@@ -805,7 +806,8 @@ async function loadCodeAssistProject(accessToken: string, fetchImpl: FetchLike, 
     });
     if (!response.ok) return undefined;
     return extractProjectId((await response.json().catch(() => undefined)) as Record<string, unknown> | undefined);
-  } catch {
+  } catch (error) {
+    if (isEgressPolicyError(error)) throw error;
     return undefined;
   }
 }
@@ -818,13 +820,14 @@ async function onboardProject(accessToken: string, fetchImpl: FetchLike, signal:
     if (signal?.aborted) return undefined;
     let response: Response;
     try {
-      response = await fetchImpl(`${GOOGLE_OAUTH.dailyApi}/${GOOGLE_OAUTH.apiVersion}:onboardUser`, {
+      response = await guardEgressFetch(fetchImpl)(`${GOOGLE_OAUTH.dailyApi}/${GOOGLE_OAUTH.apiVersion}:onboardUser`, {
         method: "POST",
         headers: { authorization: `Bearer ${accessToken}`, accept: "*/*", "content-type": "application/json", "user-agent": antigravityUserAgent() },
         body: JSON.stringify({ tier_id: "free-tier", metadata: { ide_type: "ANTIGRAVITY", ide_name: "antigravity", ide_version: ANTIGRAVITY_IDE_VERSION } }),
         signal: signalFor(signal),
       });
-    } catch {
+    } catch (error) {
+      if (isEgressPolicyError(error)) throw error;
       return undefined;
     }
     if (!response.ok) {
@@ -845,7 +848,7 @@ async function onboardProject(accessToken: string, fetchImpl: FetchLike, signal:
 /** The account email from Google's pinned userinfo endpoint. Never persisted as a token. */
 export async function fetchUserEmail(accessToken: string, fetchImpl: FetchLike = fetch, signal?: AbortSignal): Promise<string | undefined> {
   try {
-    const response = await fetchImpl(GOOGLE_OAUTH.userinfoUrl, {
+    const response = await guardEgressFetch(fetchImpl)(GOOGLE_OAUTH.userinfoUrl, {
       method: "GET",
       headers: { authorization: `Bearer ${accessToken}`, accept: "application/json" },
       signal: signalFor(signal),
@@ -853,7 +856,8 @@ export async function fetchUserEmail(accessToken: string, fetchImpl: FetchLike =
     if (!response.ok) return undefined;
     const body = (await response.json().catch(() => undefined)) as { email?: unknown } | undefined;
     return typeof body?.email === "string" && body.email.length > 0 ? body.email.toLowerCase() : undefined;
-  } catch {
+  } catch (error) {
+    if (isEgressPolicyError(error)) throw error;
     return undefined;
   }
 }
@@ -861,7 +865,7 @@ export async function fetchUserEmail(accessToken: string, fetchImpl: FetchLike =
 /** `failed` hears why a null came back: the status, or the error's name or code, never a body or message. */
 async function fetchAnswerAs(userAgent: string, accessToken: string, projectId: string, host: string, fetchImpl: FetchLike, signal?: AbortSignal, failed?: (reason: string) => void): Promise<CatalogueAnswer | null> {
   try {
-    const response = await fetchImpl(`${host}/${GOOGLE_OAUTH.apiVersion}:fetchAvailableModels`, {
+    const response = await guardEgressFetch(fetchImpl)(`${host}/${GOOGLE_OAUTH.apiVersion}:fetchAvailableModels`, {
       method: "POST",
       headers: { authorization: `Bearer ${accessToken}`, accept: "*/*", "content-type": "application/json", "user-agent": userAgent },
       body: JSON.stringify({ project: projectId }),
@@ -875,6 +879,7 @@ async function fetchAnswerAs(userAgent: string, accessToken: string, projectId: 
     if (!answer) failed?.("unreadable answer");
     return answer;
   } catch (error) {
+    if (isEgressPolicyError(error)) throw error;
     failed?.(signal?.aborted ? "cut off" : ((error as NodeJS.ErrnoException).code ?? (error as Error).name ?? "error"));
     return null;
   }
@@ -884,7 +889,8 @@ async function fetchAnswerAs(userAgent: string, accessToken: string, projectId: 
 export const CLI_CATALOGUE_GRACE_MS = 3_000;
 
 /**
- * Both client families' answers of one host, or null when the IDE one cannot be read. Never throws.
+ * Both client families' answers of one host, or null when the IDE one cannot be read. Security
+ * policy refusals remain terminal and are never converted into an unreadable catalogue.
  * Each model is listed from the answer to the User-Agent it will be called with: the IDE answer gives
  * every model as before, and a second ask under the CLI UA adds the models served to the CLI family
  * alone (`catalogueFrom`). An unreadable IDE answer is null as before, so a CLI-only list never
@@ -897,15 +903,24 @@ async function readHost(accessToken: string, projectId: string, host: string, fe
   const cliAbort = new AbortController();
   const cliSignal = signal ? AbortSignal.any([signal, cliAbort.signal]) : cliAbort.signal;
   let cliFailure: string | undefined;
-  const pendingCli = fetchAnswerAs(antigravityCliUserAgent(), accessToken, projectId, host, fetchImpl, cliSignal, (reason) => { cliFailure = reason; });
-  const ide = await fetchAnswerAs(antigravityUserAgent(), accessToken, projectId, host, fetchImpl, signal);
+  // Observe rejection immediately: the other family may still be pending. A security refusal
+  // must neither become an unhandled promise nor disappear behind the optional-CLI fallback.
+  const pendingCli = fetchAnswerAs(antigravityCliUserAgent(), accessToken, projectId, host, fetchImpl, cliSignal, (reason) => { cliFailure = reason; })
+    .then(result => ({ result }), error => ({ error }));
+  let ide: CatalogueAnswer | null;
+  try { ide = await fetchAnswerAs(antigravityUserAgent(), accessToken, projectId, host, fetchImpl, signal); }
+  catch (error) { cliAbort.abort(); throw error; }
   if (!ide) {
     cliAbort.abort();
+    const cli = await pendingCli;
+    if ("error" in cli) throw cli.error;
     return null;
   }
   const grace = setTimeout(() => cliAbort.abort(), cliGraceMs);
-  const cli = await pendingCli;
-  clearTimeout(grace);
+  let result: Awaited<typeof pendingCli>;
+  try { result = await pendingCli; } finally { clearTimeout(grace); }
+  if ("error" in result) throw result.error;
+  const cli = result.result;
   if (!cli && cliFailure && !signal?.aborted) cliFailed?.(cliFailure);
   return { ide, cli };
 }

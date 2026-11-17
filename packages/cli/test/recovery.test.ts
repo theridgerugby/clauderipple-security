@@ -20,6 +20,12 @@ import { syncAgentFiles } from "../../router/src/agents.ts";
 import { DEFAULTS } from "../../router/src/config.ts";
 import { ADMIN_TOKEN_HEADER } from "../../router/src/admin-auth.ts";
 import { adminTlsFixture } from "../../router/test/admin-tls-fixture.ts";
+import { readPrivateFile } from "../../router/src/private-file.ts";
+import { writeSecretJsonAtomic } from "../../router/src/locked-file.ts";
+import { ensureInstallationId } from "../../router/src/installation-id.ts";
+import { VERSION } from "../../router/src/version.ts";
+import { captureRouterCodeIdentity } from "../src/install-runtime.ts";
+import { runtime } from "../src/runtime.ts";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "cr-recovery-"));
 const label = `com.clauderipple.check-${crypto.randomBytes(4).toString("hex")}`;
@@ -129,7 +135,8 @@ function fakeSupervisor(view: Partial<SupervisorView>, opts: { start?: "already-
   return { ops, calls };
 }
 
-const answering = (version = "9.9.9") => async () => ({ version });
+// These injected health fixtures stand in for the complete locally verified TLS proof.
+const answering = (version = "9.9.9") => async () => ({ version, runtimeVerified: true });
 const silent = async () => null;
 const noSleep = async () => {};
 
@@ -186,7 +193,7 @@ test("uninstall clears picker and Codex settings before purge, even if trust rem
     assert.equal(currentAppProxy().egressProxyUrl, null);
     assert.equal(codexEnabled(), false);
     assert.equal(fs.existsSync(path.join(process.env.CODEX_HOME, "clauderipple.config.toml")), false);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(ctx.home, "config.json"), "utf8")).picker.enabled, false);
+    assert.equal(JSON.parse(readPrivateFile(path.join(ctx.home, "config.json")).toString("utf8")).picker.enabled, false);
     assert.equal(untrusted, true);
   } finally {
     if (oldHome === undefined) delete process.env.CLAUDERIPPLE_HOME;
@@ -313,7 +320,7 @@ test("doctor: shape, mode and proxies on a healthy install", async () => {
   const d = await doctor({ home, version: "9.9.9", supervisor: ops, routerStatus: answering("9.9.9"), remoteHostInstalled: () => false });
   assert.deepEqual(d, {
     mode: "ripple",
-    router: { responding: true, version: "9.9.9", pid: 77, url: proxyUrl, adminUrl: "http://127.0.0.1:18792" },
+    router: { responding: true, runtimeVerified: true, version: "9.9.9", pid: 77, url: proxyUrl, adminUrl: "http://127.0.0.1:18792" },
     supervisor: { registered: true, program: process.execPath, programExists: true, state: "running", installedHome: null },
     desktop: { proxy: "ripple", url: proxyUrl },
     cli: { proxy: "ripple", url: proxyUrl },
@@ -333,12 +340,14 @@ test("doctor authenticates over TLS using an existing recovery fixture home", as
     res.end('{"version":"9.9.9"}');
   }, { home });
   const file = path.join(home, "config.json");
-  const config = JSON.parse(fs.readFileSync(file, "utf8"));
-  fs.writeFileSync(file, JSON.stringify({ ...config, admin: { port: fixture.endpoint.publicPort } }));
+  const config = JSON.parse(readPrivateFile(file).toString("utf8"));
+  writeSecretJsonAtomic(file, { ...config, admin: { port: fixture.endpoint.publicPort } });
   const { ops, calls } = fakeSupervisor({});
   const result = await doctor({ home, version: "9.9.9", supervisor: ops, remoteHostInstalled: () => false });
   assert.equal(result.router.responding, true);
   assert.equal(result.router.version, "9.9.9");
+  assert.equal(result.router.runtimeVerified, false, "authenticated liveness alone does not prove source identity");
+  assert.ok(result.problems.some(problem => problem.code === "router-code-mismatch"));
   assert.deepEqual(received, ["/api/status"]);
   assert.deepEqual(calls, [], "a healthy TLS diagnostic must not repair or start a service");
 });
@@ -377,7 +386,7 @@ test("repair re-registers a plist whose program is gone, starts it and waits for
     home,
     version: "1.0.0",
     supervisor: launchdSupervisor(reg, home, lc.run),
-    routerStatus: async () => (lc.isRunning() ? { version: "1.0.0" } : null),
+    routerStatus: async () => (lc.isRunning() ? { version: "1.0.0", runtimeVerified: true } : null),
     sleep: noSleep,
     healthBudgetMs: 2_000,
     remoteHostInstalled: () => false,
@@ -470,6 +479,45 @@ test("repair moves Claude settings that are ours on an old port, and only those"
   assert.ok(r2.doctor.problems.some((p) => p.code === "cli-foreign-proxy"));
 });
 
+test("repair never rewrites stale client settings after failed startup or unverified same-version code", async () => {
+  for (const unavailable of [false, true]) {
+    const { home, settings, ca } = scratch();
+    fs.writeFileSync(settings, JSON.stringify({ env: { HTTPS_PROXY: "http://127.0.0.1:9999", NODE_EXTRA_CA_CERTS: ca, KEEP: "1" } }));
+    applyAppProxy("http://127.0.0.1:9999", home);
+    const original = fs.readFileSync(settings, "utf8"), desktop = currentAppProxy();
+    const { ops } = fakeSupervisor({}, { start: "failed" });
+    const result = await repair({ home, version: "1.0.0", supervisor: ops,
+      routerStatus: async () => unavailable ? null : { version: "1.0.0", runtimeVerified: false },
+      sleep: noSleep, healthBudgetMs: 0, remoteHostInstalled: () => false });
+    assert.equal(result.ok, false);
+    assert.equal(result.doctor.router.runtimeVerified, false);
+    assert.ok(result.steps.some(step => step.name === "identity" && !step.ok));
+    assert.equal(result.steps.some(step => ["cli-proxy", "desktop-proxy"].includes(step.name)), false);
+    assert.equal(fs.readFileSync(settings, "utf8"), original);
+    assert.deepEqual(currentAppProxy(), desktop);
+  }
+});
+
+test("repair revalidates code and destination after its initial diagnostic", async () => {
+  for (const change of ["identity", "destination", "client"] as const) {
+    const { home, settings, ca } = scratch();
+    fs.writeFileSync(settings, JSON.stringify({ env: { HTTPS_PROXY: "http://127.0.0.1:9999", NODE_EXTRA_CA_CERTS: ca } }));
+    const original = fs.readFileSync(settings, "utf8");
+    const { ops } = fakeSupervisor({});
+    let reads = 0;
+    const result = await repair({ home, version: "1.0.0", supervisor: ops, remoteHostInstalled: () => false,
+      routerStatus: async () => {
+        reads++;
+        if (reads === 2 && change === "destination") writeSecretJsonAtomic(path.join(home, "config.json"), { listen: { host: "127.0.0.1", port: 19991 } });
+        if (reads === 2 && change === "client") fs.writeFileSync(settings, JSON.stringify({ env: { HTTPS_PROXY: "http://corporate.test:3128" } }));
+        return { version: "1.0.0", runtimeVerified: !(reads >= 2 && change === "identity") };
+      } });
+    assert.equal(result.ok, false, change);
+    assert.ok(reads >= 2);
+    assert.equal(fs.readFileSync(settings, "utf8"), change === "client" ? JSON.stringify({ env: { HTTPS_PROXY: "http://corporate.test:3128" } }) : original);
+  }
+});
+
 // ---- direct on / off ---------------------------------------------------------------------
 
 function meta(): Record<string, unknown> {
@@ -533,12 +581,12 @@ test("direct off restores the current configured port, not the saved port", asyn
   const ctx = directSetup();
   directOn(ctx.home);
   const file = path.join(ctx.home, "config.json");
-  const cfg = JSON.parse(fs.readFileSync(file, "utf8"));
+  const cfg = JSON.parse(readPrivateFile(file).toString("utf8"));
   cfg.listen.port = 19991;
-  fs.writeFileSync(file, JSON.stringify(cfg));
+  writeSecretJsonAtomic(file, cfg);
   const { ops } = fakeSupervisor({});
   const checked: string[] = [];
-  const result = await directOff({ home: ctx.home, version: "1.0.0", supervisor: ops, routerStatus: async (url) => { checked.push(url); return { version: "1.0.0" }; } });
+  const result = await directOff({ home: ctx.home, version: "1.0.0", supervisor: ops, routerStatus: async (url) => { checked.push(url); return { version: "1.0.0", runtimeVerified: true }; } });
   assert.equal(result.ok, true, result.detail);
   assert.deepEqual(checked, ["http://127.0.0.1:19992"]);
   assert.equal(JSON.parse(fs.readFileSync(ctx.settings, "utf8")).env.HTTPS_PROXY, "http://127.0.0.1:19991");
@@ -591,10 +639,40 @@ test("direct off repairs a router that is down first, and changes nothing when i
 
   let up = false;
   const { ops: ops2 } = fakeSupervisor({ state: "loaded" }, { start: "started" });
-  const r2 = await directOff({ home: ctx.home, version: "1.0.0", supervisor: { ...ops2, start: () => ((up = true), "started") }, routerStatus: async () => (up ? { version: "1.0.0" } : null), sleep: noSleep });
+  const r2 = await directOff({ home: ctx.home, version: "1.0.0", supervisor: { ...ops2, start: () => ((up = true), "started") }, routerStatus: async () => (up ? { version: "1.0.0", runtimeVerified: true } : null), sleep: noSleep });
   assert.equal(r2.ok, true, r2.detail);
   assert.match(r2.detail, /repaired it first/);
   assert.deepEqual(JSON.parse(fs.readFileSync(ctx.settings, "utf8")), ctx.settingsObj);
+});
+
+test("direct on stays available offline, while off preserves the rollback snapshot for unverified code", async () => {
+  const ctx = directSetup();
+  assert.equal(directOn(ctx.home).ok, true, "direct on does not need any router status or supervisor");
+  const before = fs.readFileSync(ctx.settings, "utf8"), saved = fs.readFileSync(directStatePath(ctx.home), "utf8"), desktop = currentAppProxy();
+  const { ops, calls } = fakeSupervisor({});
+  const result = await directOff({ home: ctx.home, version: "1.0.0", supervisor: ops,
+    routerStatus: async () => ({ version: "1.0.0", runtimeVerified: false }) });
+  assert.equal(result.ok, false);
+  assert.match(result.detail, /source\/runtime could not be verified/);
+  assert.deepEqual(calls, [], "an unverified responder is not restarted or taken over");
+  assert.equal(fs.readFileSync(ctx.settings, "utf8"), before);
+  assert.equal(fs.readFileSync(directStatePath(ctx.home), "utf8"), saved);
+  assert.deepEqual(currentAppProxy(), desktop);
+});
+
+test("direct off refuses a destination changed during the verified status request", async () => {
+  const ctx = directSetup(); directOn(ctx.home);
+  const before = fs.readFileSync(ctx.settings, "utf8"), saved = fs.readFileSync(directStatePath(ctx.home), "utf8"), desktop = currentAppProxy();
+  const { ops } = fakeSupervisor({});
+  await assert.rejects(directOff({ home: ctx.home, version: "1.0.0", supervisor: ops,
+    routerStatus: async () => {
+      const file = path.join(ctx.home, "config.json"), cfg = JSON.parse(readPrivateFile(file).toString("utf8"));
+      cfg.listen.port = 19991; writeSecretJsonAtomic(file, cfg);
+      return { version: "1.0.0", runtimeVerified: true };
+    } }), /destination changed/);
+  assert.equal(fs.readFileSync(ctx.settings, "utf8"), before);
+  assert.equal(fs.readFileSync(directStatePath(ctx.home), "utf8"), saved);
+  assert.deepEqual(currentAppProxy(), desktop);
 });
 
 test("Windows PowerShell launcher files carry a UTF-8 BOM and preserve Korean paths", () => {
@@ -686,6 +764,8 @@ test("CLI: doctor, direct on/off and app print one JSON object each and exit 0",
   fs.writeFileSync(fake, `#!/bin/sh\necho "$*" >> "${calls}"\nexit 113\n`, { mode: 0o755 });
   // A real protected TLS stand-in, so direct off finds a router and repairs nothing.
   // The subprocess uses this home's private identity/endpoint, never plaintext HTTP.
+  const rt = runtime(), codeIdentity = captureRouterCodeIdentity(rt), installId = ensureInstallationId(ctx.home);
+  let status: Record<string, unknown>;
   const received: string[] = [];
   const fixture = await adminTlsFixture(t, (req, res) => {
     assert.equal(req.headers[ADMIN_TOKEN_HEADER], fixture.token);
@@ -693,11 +773,13 @@ test("CLI: doctor, direct on/off and app print one JSON object each and exit 0",
     received.push(req.url!);
     req.resume();
     res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({ version: "0.0.0-test" }));
+    res.end(JSON.stringify(status));
   }, { home: ctx.home });
   const adminPort = fixture.endpoint.publicPort;
-  const cfg = JSON.parse(fs.readFileSync(path.join(ctx.home, "config.json"), "utf8"));
-  fs.writeFileSync(path.join(ctx.home, "config.json"), JSON.stringify({ ...cfg, admin: { port: adminPort } }));
+  const cfg = JSON.parse(readPrivateFile(path.join(ctx.home, "config.json")).toString("utf8"));
+  writeSecretJsonAtomic(path.join(ctx.home, "config.json"), { ...cfg, admin: { port: adminPort } });
+  status = { version: VERSION, installId, pid: process.pid, listen: cfg.listen, upstream: DEFAULTS.upstream,
+    runtime: { node: rt.node, router: rt.router, codeIdentity, startedAt: new Date().toISOString() } };
   const env: NodeJS.ProcessEnv = { ...process.env, CLAUDERIPPLE_HOME: ctx.home, CLAUDERIPPLE_LAUNCHCTL: fake };
   delete env.NODE_OPTIONS;
   const cli = path.resolve(import.meta.dirname, "../src/index.ts");
@@ -709,6 +791,7 @@ test("CLI: doctor, direct on/off and app print one JSON object each and exit 0",
     const d = await run("doctor");
     assert.equal(d.mode, "ripple");
     assert.equal((d.router as { responding: boolean }).responding, true);
+    assert.equal((d.router as { runtimeVerified: boolean }).runtimeVerified, true);
     assert.equal((d.supervisor as { registered: boolean }).registered, false);
     const on = await run("direct", "on");
     assert.deepEqual([on.ok, on.mode, on.restartClaude], [true, "direct", true]);

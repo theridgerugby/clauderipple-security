@@ -5,6 +5,7 @@
 // flight at a time, and the last good windows kept rather than blanked when a read fails.
 
 import { createHash } from "node:crypto";
+import { guardEgressFetch, isEgressPolicyError } from "../egress.ts";
 import { credentialHeaderValues, redactErrorText } from "../redact.ts";
 import type { FetchLike } from "./google/antigravity.ts";
 
@@ -77,7 +78,7 @@ export class UsageCache {
     const keep = () => entry.last;
     const readAt = (this.opts.now ?? Date.now)();
     try {
-      const res = await (this.opts.fetch ?? fetch)(url, {
+      const res = await guardEgressFetch(this.opts.fetch)(url, {
         method: "GET",
         headers: { accept: "application/json", ...headers },
         signal: AbortSignal.timeout(this.opts.timeoutMs ?? 5000),
@@ -93,6 +94,7 @@ export class UsageCache {
       entry.last = windows;
       return windows;
     } catch (e) {
+      if (isEgressPolicyError(e)) throw e;
       const detail = redactErrorText((e as Error).message, credentialHeaderValues(Object.entries(headers)), 300);
       this.opts.warn?.(`${this.opts.label} ${name}: ${detail}`);
       return keep();

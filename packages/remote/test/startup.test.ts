@@ -52,8 +52,8 @@ for (const stored of [false, true]) {
     for (const args of invocations) {
       await assert.rejects(exec(process.execPath, args, { env: isolatedEnv(dir), timeout: 10_000 }), error => {
         assert.ok(error instanceof Error && "stderr" in error);
-        assert.match(String(error.stderr), /--new-token is disabled/);
-        assert.match(String(error.stderr), /authenticated Phone settings/);
+        assert.match(String(error.stderr), /--new-token is disabled|activation is disabled in personal mode/);
+        if (args[0] === main) assert.match(String(error.stderr), /authenticated Phone settings/);
         assert.doesNotMatch(String(error.stderr), /EADDRINUSE|legacy host control|service.*unsupported/);
         return true;
       });
@@ -66,7 +66,7 @@ for (const stored of [false, true]) {
   });
 }
 
-test("a host that cannot bind leaves pending permissions untouched for the real restart's expiry event", async t => {
+test("personal-mode host activation leaves pending permissions untouched for explicit cleanup or recovery", async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-startup-"));
   const occupied = http.createServer((_req, res) => res.end("occupied"));
   await new Promise<void>(resolve => occupied.listen(0, "127.0.0.1", resolve));
@@ -96,7 +96,7 @@ test("a host that cannot bind leaves pending permissions untouched for the real 
   const before = new Map(fs.readdirSync(sessionDir).map(name => [name, fs.readFileSync(path.join(sessionDir, name))]));
   await assert.rejects(exec(process.execPath, [main], { env: isolatedEnv(dir), timeout: 10_000 }), error => {
     assert.ok(error instanceof Error && "stderr" in error);
-    assert.match(String(error.stderr), /EADDRINUSE/);
+    assert.match(String(error.stderr), /Remote activation is disabled/);
     return true;
   });
   assert.equal(fs.readFileSync(path.join(home, "sessions.json"), "utf8"), records);

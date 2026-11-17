@@ -10,6 +10,7 @@ import path from "node:path";
 import zlib from "node:zlib";
 import type { Config, AnthropicCompatibleProvider, AnthropicProvider } from "../config.ts";
 import { providerFor } from "../config.ts";
+import { assertApprovedDestination, personalMode } from "../personal-policy.ts";
 import type { Logger } from "../log.ts";
 import type { HoldGate } from "../hold.ts";
 import { resolve } from "../routing.ts";
@@ -185,6 +186,10 @@ export function openaiPort(cfg: Config): number {
 }
 
 export class OpenAiIngress {
+  setClaudeLocalAuthorization(allow: boolean): void {
+    this.claudeAccounts.setCurrentAuthorization(allow);
+  }
+
   readonly stats: IngressStats = { inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 };
   private readonly server: http.Server;
   private readonly agents = new Map<string, http.Agent | https.Agent>();
@@ -467,6 +472,7 @@ export class OpenAiIngress {
   private async forward(res: http.ServerResponse, provider: AnthropicCompatibleProvider | AnthropicProvider, wire: Json, model: string, chat: boolean, stream: boolean, compaction: boolean, translation: ToolTranslation, served: Served, onTerminal?: (outcome: Outcome) => void): Promise<Outcome> {
     const native = provider.type === "anthropic";
     const upstream = new URL(native ? (this.deps.nativeUpstream ?? "https://api.anthropic.com") : provider.url);
+    if (personalMode(this.deps.config())) assertApprovedDestination(upstream, this.deps.config().security!);
     const protocol = upstream.protocol === "https:" ? "https:" : "http:";
     const body = Buffer.from(JSON.stringify(wire));
     let authentication: Record<string, string>;
@@ -494,12 +500,19 @@ export class OpenAiIngress {
     } else authentication = provider.headers ?? {};
     const headers: Record<string, string> = { "content-type": "application/json", accept: stream ? "text/event-stream" : "application/json", "content-length": String(body.length), ...authentication };
     const lib = protocol === "https:" ? https : http;
+    // Credential refresh above may wait on the network; a revocation during that wait must
+    // prevent this prompt from being sent using the older captured configuration.
+    if (personalMode(this.deps.config())) assertApprovedDestination(upstream, this.deps.config().security!);
     const response = await new Promise<http.IncomingMessage>((resolveP, reject) => {
       const request = lib.request({ protocol, hostname: upstream.hostname, port: Number(upstream.port) || (protocol === "https:" ? 443 : 80), method: "POST", path: `${upstream.pathname.replace(/\/+$/, "")}/v1/messages`, headers, agent: this.agentFor(upstream.origin, protocol), ...(protocol === "https:" ? { servername: upstream.hostname } : {}) }, resolveP);
       request.once("error", reject);
       res.once("close", () => request.destroy());
       request.end(body);
     });
+    if ((response.statusCode ?? 0) >= 300 && (response.statusCode ?? 0) < 400) {
+      response.destroy();
+      return { status: 502, bytes: sendJson(res, 502, openAiError("Upstream redirects are forbidden", "api_error")), note: "upstream redirect refused" };
+    }
     // An answer on the pool's credential is what keeps a login used only by the ingress current;
     // a 401 on it drops the observed copy (issue #123, 2026-11-05).
     if (poolCredential) this.claudeAccounts.noteAnswer(poolCredential.id, response.statusCode ?? 0);

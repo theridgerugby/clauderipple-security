@@ -13,7 +13,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { fetchAdmin } from "./admin-auth";
+import { fetchAdmin, readPrivateConfigPorts } from "./admin-auth";
 import { ADMIN_IPC_CHANNEL, createAdminRequestHandler } from "./admin-ipc";
 import { adminViewFromArgs, adminUserDataPath, prepareAdminUserDataPath } from "./admin-window";
 import { configurePermissions, trustedIpcSender } from "./security";
@@ -783,9 +783,7 @@ let L = STRINGS.en;
 
 function readConfigPorts(): { proxy: number; admin: number } {
   try {
-    const c = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8")) as { listen?: { port?: number }; admin?: { port?: number } };
-    const proxy = c.listen?.port ?? 8790;
-    return { proxy, admin: c.admin?.port ?? proxy + 1 };
+    return readPrivateConfigPorts(home);
   } catch {
     return { proxy: 8790, admin: 8791 };
   }

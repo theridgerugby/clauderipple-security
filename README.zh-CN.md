@@ -2,6 +2,10 @@
 
 <p align="center"><a href="README.md">English</a> · <a href="README.ko.md">한국어</a> · <b>简体中文</b> · <a href="README.ja.md">日本語</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português (BR)</a></p>
 
+> **个人安全分支。** 请使用[固定源码版本的 Windows 安装指南](docs/personal-windows-install.md)。此分支默认拒绝未批准的数据外发，关闭远程功能和自动更新。下方保留的上游安装命令、npm 包、应用商店链接及功能说明不适用于这个个人版本。旧的一键安装脚本已禁用；不要从上游覆盖安装。
+>
+> 接入真实账号或科研资料前，请核对同一完整 commit 的测试结果并完成指南中的本机验收。
+
 <p align="center">
   <b>聊天仍是 Claude，只有 Code 换成 GPT。</b><br>
   Claude Desktop 自带的“使用其他模型”设置会切换<b>整个应用</b>——聊天、手机端 Remote

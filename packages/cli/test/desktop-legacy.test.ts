@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { readPrivateFile } from "../../router/src/private-file.ts";
 import os from "node:os";
 import path from "node:path";
 import { stripTypeScriptTypes } from "node:module";
@@ -69,7 +70,7 @@ test("picker off migrates a verified legacy Desktop entry before disabling picke
   const command = pickerOffCommand(f);
   command.run();
   assert.equal(currentAppProxy().egressProxyUrl, null);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(f.home, "config.json"), "utf8")).picker.enabled, false);
+  assert.equal(JSON.parse(readPrivateFile(path.join(f.home, "config.json")).toString("utf8")).picker.enabled, false);
   assert.equal(command.trustRemovals(), 1);
   assert.equal(command.messages.some(message => message.includes("no ClaudeRipple config library entry")), false);
 });

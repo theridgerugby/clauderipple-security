@@ -22,6 +22,7 @@
 // older `retrieveUserQuota` returns meaningless values and is deliberately not used.
 
 import type { GoogleCredential } from "./accounts.ts";
+import { guardEgressFetch, isEgressPolicyError } from "../../egress.ts";
 import { GOOGLE_OAUTH, antigravityCliUserAgent, antigravityUserAgent, type FetchLike, type LearnedCatalogue } from "./antigravity.ts";
 
 /** The five-hour and weekly window lengths in minutes, for the limits row's `window_minutes`. */
@@ -323,6 +324,7 @@ export class GoogleUsage {
     try {
       credentials = await this.source.credentials();
     } catch (e) {
+      if (isEgressPolicyError(e)) throw e;
       this.opts.warn?.(`google usage: no credentials: ${(e as Error).message}`);
       this.evidence.clear();
       return Object.fromEntries(this.last);
@@ -367,7 +369,7 @@ export class GoogleUsage {
   private async fetchAs(credential: GoogleCredential, host: string, userAgent: string): Promise<{ groups: QuotaGroup[]; strict: QuotaGroup[] | null } | null> {
     const owner = credential.ownerId.slice(0, 8);
     try {
-      const res = await (this.opts.fetch ?? fetch)(`${host}/${GOOGLE_OAUTH.apiVersion}:retrieveUserQuotaSummary`, {
+      const res = await guardEgressFetch(this.opts.fetch)(`${host}/${GOOGLE_OAUTH.apiVersion}:retrieveUserQuotaSummary`, {
         method: "POST",
         headers: { authorization: `Bearer ${credential.accessToken}`, "content-type": "application/json", accept: "*/*", "user-agent": userAgent },
         body: JSON.stringify({ project: credential.projectId }),
@@ -382,6 +384,7 @@ export class GoogleUsage {
       const groups = parseQuotaSummary(body);
       return groups ? { groups, strict: strictQuotaGroups(body) } : null;
     } catch (e) {
+      if (isEgressPolicyError(e)) throw e;
       this.opts.warn?.(`google usage ${owner}: ${(e as Error).message}`);
       return null;
     }

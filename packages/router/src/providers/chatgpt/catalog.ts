@@ -10,6 +10,7 @@
 // the caller on its fallback list, not empty the model picker.
 
 import fs from "node:fs";
+import { guardEgressFetch } from "../../egress.ts";
 import path from "node:path";
 import type { ProviderModel } from "../../config.ts";
 import { codexHome } from "../../../../cli/src/codex.ts";
@@ -138,7 +139,7 @@ export async function latestCodexVersion(fetchImpl: typeof fetch = fetch, now = 
   if (latestCache && latestCache.until > now) return latestCache.version;
   let version: string | null = null;
   try {
-    const res = await fetchImpl(NPM_LATEST, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(3_000) });
+    const res = await guardEgressFetch(fetchImpl)(NPM_LATEST, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(3_000) });
     const value = res.ok ? ((await res.json()) as { version?: unknown }).version : undefined;
     if (typeof value === "string" && /^\d+\.\d+\.\d+/.test(value)) version = value;
   } catch { /* offline or blocked: the floor and the local CLI still answer */ }

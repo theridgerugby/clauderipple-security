@@ -21,6 +21,7 @@ import { CredentialPool } from "../src/pool.ts";
 import { Logger } from "../src/log.ts";
 import type { AnthropicRequest } from "../src/providers/chatgpt/translate.ts";
 import { posixModes } from "../../../test/capabilities.ts";
+import { readPrivateFile } from "../src/private-file.ts";
 
 const log = new Logger(null, 1e9, 0, false);
 const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "cr-gpt-codex-"));
@@ -84,7 +85,7 @@ test("store: rename and pause; an unreadable store is never overwritten", () => 
   assert.equal(readChatGptAccounts(home)[0]!.paused, undefined);
   fs.writeFileSync(chatgptAccountsPath(home), "{broken");
   assert.throws(() => saveChatGptAccount(home, grant("ws-2", "b@example.test")), /unreadable/);
-  assert.equal(fs.readFileSync(chatgptAccountsPath(home), "utf8"), "{broken");
+  assert.equal(readPrivateFile(chatgptAccountsPath(home)).toString("utf8"), "{broken");
 });
 
 test("refresh rejections: only the structured code decides, prose only when there is none", () => {

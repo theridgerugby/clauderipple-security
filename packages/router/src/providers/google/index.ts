@@ -25,6 +25,7 @@ import { CredentialPool, pinnedCredential, retryAfterMs } from "../../pool.ts";
 import { credentialHeaderValues, redactErrorText } from "../../redact.ts";
 import { SseParser } from "../chatgpt/sse.ts";
 import { fetchWithRetry } from "../retry.ts";
+import { egressFetch, isEgressPolicyError } from "../../egress.ts";
 import { FINGERPRINT_BLOCK_HINT, isCloudflareFingerprintBlock } from "../openai/index.ts";
 import { StartInputs } from "../start-input.ts";
 import { estimateTokens, formatSse, GoogleStreamMapper, toGeminiRequest, type GeminiRequest } from "./translate.ts";
@@ -551,7 +552,7 @@ export class GoogleAdapter {
       { model, stream: false, antigravity: { accessToken: credential.accessToken, projectId: credential.projectId, conversationKey: `recheck:${ownerId}` }, antigravityBaseUrl: this.hostFor(model, undefined) },
     );
     try {
-      const upstream = await fetch(built.url, { method: "POST", headers: built.headers, body: built.body, signal: AbortSignal.timeout(30_000) });
+      const upstream = await egressFetch(built.url, { method: "POST", headers: built.headers, body: built.body, signal: AbortSignal.timeout(30_000) });
       const text = await upstream.text().catch(() => "");
       if (upstream.ok) {
         this.verifyUrls.delete(ownerId);
@@ -565,7 +566,8 @@ export class GoogleAdapter {
       // Any other answer is not about verification; the next real turn sorts it out.
       this.log.info(`google ${this.name}: verification recheck of ${ownerId.slice(0, 8)} answered ${upstream.status}`);
       return "unknown";
-    } catch {
+    } catch (error) {
+      if (isEgressPolicyError(error)) throw error;
       return "unknown";
     }
   }
@@ -622,6 +624,7 @@ export class GoogleAdapter {
         cliFailed: (host, reason) => cliReasons.set(host, reason),
       });
     } catch (error) {
+      if (isEgressPolicyError(error)) throw error;
       // An answer is untrusted input. Whatever it does to the parse, it is an unreadable catalogue
       // and never a failed turn (`fetchModels` does not throw, and a turn awaits it).
       this.log.warn(`google ${this.name}: the model catalogue could not be processed (${(error as Error).name}); treated as unreadable`);
@@ -883,6 +886,7 @@ export class GoogleAdapter {
     } catch (error) {
       res.off("close", onClose);
       if (controller.signal.aborted) return { status: 0, bytes: 0, note: "client closed" };
+      if (isEgressPolicyError(error)) throw error;
       (error as Error).message = redact((error as Error).message);
       const out = anthropicError(502, "api_error", `Google provider unreachable: ${(error as Error).message}`);
       if (!res.headersSent) res.writeHead(out.status, { "content-type": "application/json" }).end(out.body);
@@ -939,7 +943,7 @@ export class GoogleAdapter {
         for (const secret of secrets) upstreamSecrets.add(secret);
         return { built };
       },
-    });
+    }).catch((error: unknown) => { res.off("close", onClose); throw error; });
 
     if (sent.kind !== "ok") {
       res.off("close", onClose);
@@ -1160,6 +1164,7 @@ export class GoogleAdapter {
         }, { log: (line) => this.log.info(`google ${this.name}: ${spec.redact(line)}`), stopOn: isModelCapacityExhausted });
       } catch (e) {
         if (spec.signal.aborted) return { kind: "aborted" };
+        if (isEgressPolicyError(e)) throw e;
         this.pool.penalise(this.name, credential.id, 0);
         tried.add(credential.ownerId);
         lastThrown = e as Error;

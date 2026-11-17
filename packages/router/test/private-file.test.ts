@@ -458,14 +458,16 @@ test("owned login storage refuses aliasing without modifying the unrelated targe
   assert.equal(fs.readFileSync(external, "utf8"), "unchanged");
 });
 
-test("observed login persistence ignores the predictable legacy temp-file trap", { skip: process.platform === "win32" }, t => {
+test("RAM-only observed login never follows the predictable legacy temp-file trap", { skip: process.platform === "win32" }, t => {
   const home = fixture(t), file = path.join(home, "observed.json"), target = path.join(home, "unrelated");
   fs.writeFileSync(target, "unchanged", { mode: 0o600 });
   fs.symlinkSync(target, `${file}.tmp-${process.pid}`);
   const auth = new ObservedClaudeCodeAuth(file);
   auth.observe(["authorization", "Bearer dummy-token"], 123);
   assert.equal(fs.readFileSync(target, "utf8"), "unchanged");
-  assert.equal(new ObservedClaudeCodeAuth(file).getFresh(124)?.authorization, "Bearer dummy-token");
+  assert.equal(auth.getFresh(124)?.authorization, "Bearer dummy-token");
+  assert.equal(fs.existsSync(file), false);
+  assert.equal(new ObservedClaudeCodeAuth(file).getFresh(124), null);
 });
 
 test("config diagnostics do not contain JSON parser excerpts or follow symlinks", { skip: process.platform === "win32" }, t => {

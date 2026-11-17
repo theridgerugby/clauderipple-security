@@ -96,20 +96,9 @@ export const OBSERVED_FRESH_MS = 6 * 3_600_000;
 /** How long an observed login is trusted before it is read again (its own expiry is not visible). */
 export const OBSERVED_TTL_MS = 10 * 60_000;
 
-/**
- * The login the Claude app itself is using right now, as the router last saw it on a request it
- * carried (router observedClaudeCodeAuth, `claude-auth-observed.json`), or null when there is none
- * recent. The keychain item belongs to the `claude` CLI and is refreshed only while the CLI runs:
- * working in the desktop app alone left it expired, then emptied (accessToken "", expiresAt 0,
- * 2026-10-20 21:28), and the phone was told the login had expired while the app worked fine.
- */
-export function loadObservedAuth(now = Date.now(), home = process.env.CLAUDERIPPLE_HOME ?? path.join(os.homedir(), ".clauderipple")): { accessToken: string; expiresAt: number } | null {
-  try {
-    const seen = object(JSON.parse(fs.readFileSync(path.join(home, "claude-auth-observed.json"), "utf8")));
-    const token = typeof seen?.authorization === "string" ? /^Bearer\s+(\S+)$/.exec(seen.authorization)?.[1] : undefined;
-    if (!token || typeof seen?.observedAt !== "number" || now - seen.observedAt > OBSERVED_FRESH_MS) return null;
-    return { accessToken: token, expiresAt: now + OBSERVED_TTL_MS };
-  } catch { return null; }
+/** Legacy observed logins are never read from disk. The proxy's optional observation is RAM-only. */
+export function loadObservedAuth(_now = Date.now(), _home = process.env.CLAUDERIPPLE_HOME ?? path.join(os.homedir(), ".clauderipple")): { accessToken: string; expiresAt: number } | null {
+  return null;
 }
 
 export interface BridgeAuthOptions {

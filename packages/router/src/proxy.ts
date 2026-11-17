@@ -53,6 +53,8 @@ import { CLAUDE_SMALL_MODEL, claudeLastResortProviders, effortLevels, isTargetPr
 import { requestConversationKey, ResponseUsageTap, requestId, type RequestLog, type RequestRecord, type RequestUsage } from "./requestlog.ts";
 import { credentialHeaderValues, redactErrorText, redactHeaders } from "./redact.ts";
 import type { ObservedClaudeCodeAuth } from "./providers/anthropic-observed.ts";
+import { approvedOrigin, assertApprovedDestination, personalMode, personalFallbacks } from "./personal-policy.ts";
+import { isEgressPolicyError } from "./egress.ts";
 import { nativeAnthropicHeaders, type ClaudeCodeCredentialReaders } from "./providers/anthropic.ts";
 import { ClaudeAccountAuthPool } from "./providers/anthropic-account-pool.ts";
 import { ClaudeModelCatalog } from "./providers/anthropic-models.ts";
@@ -71,7 +73,32 @@ function loginHeaders(headers: http.IncomingHttpHeaders): Record<string, string>
   }
   return out;
 }
-const HOP_BY_HOP = new Set(["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "host", "content-length"]);
+const HOP_BY_HOP = new Set([
+  "connection", "keep-alive", "proxy-connection", "proxy-authorization", "proxy-authenticate",
+  "transfer-encoding", "te", "trailer", "upgrade", "host", "content-length",
+]);
+// A request to another model vendor must never inherit the Claude session's cookies,
+// observed authentication extensions or client-specific identity headers. User-supplied
+// provider headers are added separately after this filter, from the approved provider config.
+const PERSONAL_ROUTED_HEADERS = new Set([
+  "accept", "accept-encoding", "content-type", "anthropic-version", "anthropic-beta", "user-agent",
+]);
+const PERSONAL_ROUTED_RESPONSE_BLOCKED = new Set([
+  "set-cookie", "set-cookie2", "clear-site-data", "www-authenticate", "proxy-authenticate",
+  "authorization", "x-api-key",
+]);
+/** RFC 9110: Connection can nominate additional hop-by-hop fields on either side. */
+function hopByHopHeaders(raw: readonly string[], base: ReadonlySet<string>): Set<string> {
+  const ignored = new Set(base);
+  for (let i = 0; i < raw.length; i += 2) {
+    if (raw[i]!.toLowerCase() !== "connection") continue;
+    for (const token of raw[i + 1]!.split(",")) {
+      const name = token.trim().toLowerCase();
+      if (name) ignored.add(name);
+    }
+  }
+  return ignored;
+}
 // The caller's own Anthropic credentials. A routed request authenticates as the provider, so these
 // are dropped rather than forwarded: the provider header replaces only the one it happens to share
 // a name with, and the other would otherwise travel to an endpoint that is not Anthropic.
@@ -285,6 +312,8 @@ export type Stats = {
 export class Proxy {
   readonly stats: Stats = { inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 };
   private readonly inFlightSockets = new Set<Duplex>();
+  /** The upstream authority approved before this locally terminated TLS socket was created. */
+  private readonly terminatedAuthorities = new WeakMap<net.Socket, string>();
   /** Set by drain(): new model calls are refused with a retryable 503 so the count can only fall. */
   private draining = false;
   /** Model calls waiting at the hold gate (not yet in `stats`): drain() waits for them too. */
@@ -606,6 +635,11 @@ export class Proxy {
   }
 
   /** ConfigStore calls this on reload; requests also reconcile injected/mutable configs. */
+  setClaudeLocalAuthorization(allow: boolean): void {
+    this.claudeAccounts.setCurrentAuthorization(allow);
+  }
+
+  /** ConfigStore calls this on reload; requests also reconcile injected/mutable configs. */
   reconcileConfig(cfg: Config): void {
     const digest = (value: unknown): string => crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
     for (const [name, provider] of Object.entries(cfg.providers)) {
@@ -662,7 +696,10 @@ export class Proxy {
     this.opencodeUsage = new OpenCodeUsage({ warn: (message) => deps.log.warn(message) });
     this.minimaxUsage = new MiniMaxUsage({ warn: (message) => deps.log.warn(message) });
     this.httpServer = http.createServer({ maxHeaderSize: 64 * 1024 }, (req, res) => {
-      void this.handle(req, res);
+      void this.handle(req, res).catch(error => {
+        if (!res.headersSent) res.writeHead(isEgressPolicyError(error) ? 403 : 502, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "api_error", message: isEgressPolicyError(error) ? (error as Error).message : "request dispatch failed" } }));
+        else res.destroy();
+      });
     });
     this.httpServer.keepAliveTimeout = 65_000;
     this.httpServer.on("clientError", (err, socket) => {
@@ -759,6 +796,14 @@ export class Proxy {
         sock.end("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
         return;
       }
+      if (personalMode(this.deps.config())) {
+        try { assertApprovedDestination(`https://${host}:${port}`, this.deps.config().security!); }
+        catch { sock.end("HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"); return; }
+        if (!terminateHosts(this.deps.config()).includes(host) || port !== 443) {
+          sock.end("HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+          return;
+        }
+      }
       sock.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       if (rest.length > 0) sock.unshift(rest);
       if (terminateHosts(this.deps.config()).includes(host)) {
@@ -772,6 +817,12 @@ export class Proxy {
 
   /** Forward an HTTPS absolute-form request without terminating it through the routing layer. */
   private forwardAbsolute(sock: net.Socket, request: AbsoluteProxyRequest, rest: Buffer): void {
+    if (personalMode(this.deps.config())) {
+      // Byte-splicing cannot enforce response redirects or re-check subsequent requests. Personal
+      // clients must use the locally terminated, authority-bound CONNECT + HTTP path.
+      sock.end("HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+      return;
+    }
     const servername = net.isIP(request.host) ? undefined : request.host;
     const up = request.tls
       ? (this.deps.tlsConnect ?? tls.connect)({ host: request.host, port: request.port, ...(servername ? { servername } : {}), ALPNProtocols: ["http/1.1"] })
@@ -802,6 +853,7 @@ export class Proxy {
     try {
       ctx = this.deps.certs.contextFor(host);
     } catch (e) {
+      if (personalMode(this.deps.config())) { sock.destroy(); return; }
       this.deps.log.error(`no certificate for ${host}: ${(e as Error).message}; tunnelling instead`);
       this.tunnel(sock, host, 443);
       return;
@@ -813,12 +865,14 @@ export class Proxy {
       // Chromium (picker mode) sends SNI; serve whichever terminated host it names.
       SNICallback: (servername, cb) => {
         try {
+          if (personalMode(this.deps.config()) && servername !== host) { cb(new Error("TLS authority does not match CONNECT")); return; }
           cb(null, terminateHosts(this.deps.config()).includes(servername) ? this.deps.certs.contextFor(servername) : ctx);
         } catch (e) {
           cb(e as Error);
         }
       },
     });
+    this.terminatedAuthorities.set(tlsSock, `https://${host}`);
     tlsSock.on("error", (e) => {
       const msg = (e as Error).message;
       if (!/ECONNRESET|ended by the other party/.test(msg)) this.deps.log.warn(`tls error ${msg}`);
@@ -830,6 +884,12 @@ export class Proxy {
   /** WebSocket / other upgrades on a terminated host: re-open TLS upstream and splice the sockets. */
   private upgrade(req: http.IncomingMessage, socket: net.Socket, head: Buffer): void {
     const cfg = this.deps.config();
+    // An Upgrade Host is independent of CONNECT's approved authority. Personal deployments
+    // keep inference on the guarded HTTP/SSE path instead of splicing uninspected sockets.
+    if (personalMode(cfg)) {
+      socket.end("HTTP/1.1 426 Upgrade Required\r\nconnection: close\r\ncontent-length: 0\r\n\r\n");
+      return;
+    }
     const host = (req.headers.host ?? cfg.upstream).split(":")[0]!;
     const up = tls.connect({ host, port: 443, servername: host, ALPNProtocols: ["http/1.1"] });
     const kill = (): void => {
@@ -874,6 +934,15 @@ export class Proxy {
 
   private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const log = this.deps.log;
+    if (personalMode(this.deps.config())) {
+      const expected = this.terminatedAuthorities.get(req.socket);
+      const hosts = req.rawHeaders.filter((_, index) => index % 2 === 0 && req.rawHeaders[index]!.toLowerCase() === "host").length;
+      const actual = typeof req.headers.host === "string" ? approvedOrigin(`https://${req.headers.host}`) : null;
+      if (!expected || hosts !== 1 || actual !== expected || !req.url?.startsWith("/") || req.url.startsWith("//")) {
+        res.writeHead(421, { connection: "close", "content-type": "application/json" }).end(JSON.stringify({ error: { type: "api_error", message: "Request authority does not match the approved CONNECT endpoint" } }));
+        return;
+      }
+    }
     // A network switch is making a gap (hold.ts): a new model call waits here, before its body is
     // read or it is counted, so the switch only waits for calls that were already running. Nothing
     // is written and nothing refused; it goes ahead on release or after the longest hold. A draining
@@ -1140,6 +1209,12 @@ export class Proxy {
         // Fall through on failure: the ordinary path still answers, and a search that quietly
         // returns nothing is worse than one that costs what it always cost.
       }
+      if (personalMode(cfg)) {
+        const out = JSON.stringify({ type: "error", error: { type: "api_error", message: "Configured search provider unavailable; sensitive-data mode forbids another destination" } });
+        res.writeHead(503, { "content-type": "application/json" }).end(out);
+        finish("503", out.length, "search refused without cross-provider fallback", false);
+        return;
+      }
     }
 
     const webFetch = !!searchBackend && kind === "web-fetch";
@@ -1172,6 +1247,12 @@ export class Proxy {
           unwrittenFallbackNote = `fallback to Claude (${settings.provider} unusable)`;
           log.warn(`web fetch via ${settings.provider}: provider unusable; falling back to Claude (${claude.provider}/${claude.model})`);
         } else {
+          if (personalMode(cfg)) {
+            const out = JSON.stringify({ type: "error", error: { type: "api_error", message: "Configured page-reader unavailable; sensitive-data mode forbids another destination" } });
+            res.writeHead(503, { "content-type": "application/json" }).end(out);
+            finish("503", out.length, "page reader refused without fallback", false);
+            return;
+          }
           unwrittenFallbackNote = `web fetch via ${settings.provider} unavailable; original destination fallback`;
           log.warn(`web fetch via ${settings.provider}: provider unusable; leaving the request alone`);
         }
@@ -1196,14 +1277,15 @@ export class Proxy {
     const originalRecord = { ...record };
     const response = res;
     const complete = finish;
+    let terminalPolicyFailure = false;
     // Both overrides use ordinary adapters and may retry only before a response is committed.
     const run = async (override: Override | null): Promise<void> => {
       const fetchTarget = override?.route ?? null;
       let attemptDone = false;
-      const res = override ? deferErrorResponse(response, () => attemptDone) : response;
+      const res = override && !personalMode(cfg) ? deferErrorResponse(response, () => attemptDone, () => terminalPolicyFailure) : response;
       const finish: typeof complete = (status, bytes, note, failed, extra) => {
         if (attemptDone) return;
-        if (override && !response.headersSent && !response.destroyed && !req.aborted && (Number(status) < 200 || Number(status) >= 300 || !Number.isFinite(Number(status)))) {
+        if (override && !personalMode(cfg) && !terminalPolicyFailure && !response.headersSent && !response.destroyed && !req.aborted && (Number(status) < 200 || Number(status) >= 300 || !Number.isFinite(Number(status)))) {
           attemptDone = true;
           // A later local refusal must not claim that no upstream was called on this request.
           searchAttempted ||= extra?.upstreamCalled !== false;
@@ -1299,7 +1381,7 @@ export class Proxy {
       // back along the route's own list (`unwrittenFallback`), never to Claude.
       let placed = resolved;
       let claudeLast = false;
-      if (resolved && !override && cfg.providers[resolved.provider]?.type !== "anthropic" &&
+      if (!personalMode(cfg) && resolved && !override && cfg.providers[resolved.provider]?.type !== "anthropic" &&
           isSmallFastSideRequest(cfg, model, json, kind, requestClass, subagent)) {
         const known = new Set((resolved.fallbacks ?? []).map(f => `${f.provider}/${f.model}`));
         const added = claudeLastResortProviders(cfg).filter(provider => !known.has(`${provider}/${CLAUDE_SMALL_MODEL}`))
@@ -1375,7 +1457,7 @@ export class Proxy {
         // on the app's own login and the model Claude Code asked for, so the request goes on as
         // sent and only the route is dropped — the slot's other requests keep theirs. A model that
         // is not a Claude id would 404 there, so it falls through to the paths below as before.
-        const native = webSearchNative(cfg) && typeof json.model === "string" && json.model.startsWith("claude-");
+        const native = !personalMode(cfg) && webSearchNative(cfg) && typeof json.model === "string" && json.model.startsWith("claude-");
         const claude = native ? null : this.claudeLastResort(cfg);
         if (native) {
           unwrittenFallbackNote = "web search passed to Anthropic (webSearch: native)";
@@ -1472,6 +1554,7 @@ export class Proxy {
               if (!path.startsWith("/v1/messages/count_tokens")) this.providerHealth.observe(route.provider, o.status, o.exhaustion);
               finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...o, ...(searchAttempted ? { upstreamCalled: undefined } : {}) });
             } catch (e) {
+              terminalPolicyFailure ||= isEgressPolicyError(e);
               finish("-", 0, `chatgpt error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
               if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "api_error", message: (e as Error).message } }));
               else res.destroy();
@@ -1522,7 +1605,8 @@ export class Proxy {
               }
               finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...o, ...(searchAttempted ? { upstreamCalled: undefined } : {}) });
             } catch (e) {
-              if (!res.destroyed && !req.aborted) this.pool.penalise(poolName, using.id, 0);
+              terminalPolicyFailure ||= isEgressPolicyError(e);
+              if (!terminalPolicyFailure && !res.destroyed && !req.aborted) this.pool.penalise(poolName, using.id, 0);
               finish("-", 0, `openai error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
               if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "api_error", message: (e as Error).message } }));
               else res.destroy();
@@ -1614,8 +1698,9 @@ export class Proxy {
               }
               finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...o, ...(searchAttempted ? { upstreamCalled: undefined } : {}) });
             } catch (e) {
-              if (using) this.pool.penalise(poolName, using.id, 0);
-              else this.recordOutcome(route.provider, 0);
+              terminalPolicyFailure ||= isEgressPolicyError(e);
+              if (!terminalPolicyFailure && using) this.pool.penalise(poolName, using.id, 0);
+              else if (!terminalPolicyFailure) this.recordOutcome(route.provider, 0);
               finish("-", 0, `google error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
               if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "api_error", message: (e as Error).message } }));
               else res.destroy();
@@ -1642,7 +1727,8 @@ export class Proxy {
               this.recordOutcome(route.provider, o.status);
               finish(String(o.status), o.bytes, o.note, o.status >= 400, { ...(o.usage ? { usage: o.usage } : {}), ...(o.stopReason ? { stopReason: o.stopReason } : {}) });
             } catch (e) {
-              this.recordOutcome(route.provider, 0);
+              terminalPolicyFailure ||= isEgressPolicyError(e);
+              if (!terminalPolicyFailure) this.recordOutcome(route.provider, 0);
               finish("-", 0, `grok error ${(e as NodeJS.ErrnoException).code ?? ""} ${(e as Error).message}`);
               if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "api_error", message: (e as Error).message } }));
               else res.destroy();
@@ -1854,16 +1940,17 @@ export class Proxy {
       const isBootstrap = isCliBootstrap || isPickerBootstrap;
       const headers: string[] = [];
       const raw = req.rawHeaders;
-      // A User-Agent the target sets under any spelling replaces the caller's; `in` below matches only the exact spelling.
-      const targetSetsUserAgent = Object.keys(target.extraHeaders).some((name) => name.toLowerCase() === "user-agent");
+      const ignored = hopByHopHeaders(raw, HOP_BY_HOP);
+      const providerHeaderNames = new Set(Object.keys(target.extraHeaders).map(name => name.toLowerCase()));
       for (let i = 0; i < raw.length; i += 2) {
         const k = raw[i]!;
         const lk = k.toLowerCase();
-        if (HOP_BY_HOP.has(lk)) continue;
+        if (ignored.has(lk)) continue;
         // Bootstrap responses are edited: keep the client's accept-encoding as-is (some edges misbehave without it)
         // and decompress whatever comes back before editing.
-        if (lk in target.extraHeaders || (lk === "user-agent" && targetSetsUserAgent) || target.dropHeaders?.has(lk) || target.dropHeaderPrefixes?.some((prefix) => lk.startsWith(prefix))) continue;
+        if (providerHeaderNames.has(lk) || target.dropHeaders?.has(lk) || target.dropHeaderPrefixes?.some((prefix) => lk.startsWith(prefix))) continue;
         if (target.dropClientAuth && CLIENT_AUTH.has(lk)) continue;
+        if (personalMode(cfg) && target.dropClientAuth && !PERSONAL_ROUTED_HEADERS.has(lk)) continue;
         // Anthropic beta flags opt into features most compatible providers have not implemented.
         if (compatCaps && !forwardCompatibleHeader(lk, compatCaps)) {
           compatChanges.push("anthropic-beta");
@@ -1907,6 +1994,11 @@ export class Proxy {
       let lastAttemptHeaders: string[] = headers;
       let staleRetries = 0;
       const send = (attemptHeaders: string[]): void => {
+        // Query strings and custom headers can also carry secrets. Gate every attempt, including
+        // body-less probes, against the current policy rather than guessing which headers matter.
+        if (personalMode(cfg)) {
+          assertApprovedDestination(`${target.protocol}//${target.host}:${target.port}`, this.deps.config().security!);
+        }
         // Buffered refusal bytes and truncation belong only to the response of this attempt.
         headFilled = false;
         errRaw = Buffer.alloc(0);
@@ -2013,6 +2105,15 @@ export class Proxy {
       const onUpstreamResponse = (upRes: http.IncomingMessage): void => {
         if (target.host === cfg.upstream) this.deps.health.success();
         const status = upRes.statusCode ?? 0;
+        if (status >= 300 && status < 400) {
+          terminalPolicyFailure = true;
+          upRes.destroy();
+          const out = JSON.stringify({ type: "error", error: { type: "api_error", message: "Upstream redirects are forbidden" } });
+          if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" }).end(out);
+          else res.destroy();
+          finish("502", out.length, "upstream redirect refused", true);
+          return;
+        }
         // Read body-dependent refusals before committing headers. A relay 403 can report its own
         // broken upstream, while the narrowly classified workspace-region 400 (#101) rests this key
         // and can be answered by another. Other 400s remain request errors and never walk the pool.
@@ -2150,9 +2251,11 @@ export class Proxy {
         if (native && typeof upRes.headers["request-id"] === "string") record.upstreamRequestId = upRes.headers["request-id"];
         const outHeaders: string[] = [];
         const r = upRes.rawHeaders;
+        const responseIgnored = hopByHopHeaders(r, new Set(["connection", "keep-alive", "proxy-connection", "proxy-authenticate", "transfer-encoding", "te", "trailer", "upgrade"]));
         for (let i = 0; i < r.length; i += 2) {
           const lk = r[i]!.toLowerCase();
-          if (lk === "connection" || lk === "keep-alive" || lk === "transfer-encoding") continue;
+          if (responseIgnored.has(lk)) continue;
+          if (personalMode(cfg) && route && target.dropClientAuth && PERSONAL_ROUTED_RESPONSE_BLOCKED.has(lk)) continue;
           if (isBootstrap && (lk === "content-length" || lk === "content-encoding")) continue;
           if (isPickerBootstrap && (lk === "etag" || lk === "last-modified")) continue;
           // A truncated 403 is forwarded decoded (its bytes are no longer a whole compressed
@@ -2310,6 +2413,7 @@ export class Proxy {
 
       send(headers);
       } catch (error) {
+        terminalPolicyFailure ||= isEgressPolicyError(error);
         finish("502", 0, `request dispatch error: ${(error as Error).message}`);
         if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "api_error", message: "request dispatch failed" } }));
         else res.destroy();
@@ -2388,6 +2492,13 @@ export class Proxy {
       if (outcome.account) record.account = outcome.account;
       if (outcome.borrowedLabel !== undefined) record.borrowedLabel = outcome.borrowedLabel;
     } catch (e) {
+      if (isEgressPolicyError(e)) {
+        const out = JSON.stringify({ type: "error", error: { type: "api_error", message: (e as Error).message } });
+        if (!res.headersSent) res.writeHead(403, { "content-type": "application/json" }).end(out);
+        else res.destroy();
+        finish("403", out.length, "search egress policy refusal", true);
+        return true;
+      }
       this.deps.log.warn(`web search via ${settings.provider}: ${(e as Error).message}`);
       return false;
     }
@@ -2488,6 +2599,7 @@ export class Proxy {
    * rather than the router inventing a refusal, and the answer it gives is what updates the pool.
    */
   private chooseTarget(resolved: Resolved, cfg: Config, log: Logger, ladderKey?: string, why?: { reason?: string }): Resolved {
+    if (personalMode(cfg) && resolved.fallbacks) resolved = { ...resolved, fallbacks: personalFallbacks(cfg, resolved, resolved.fallbacks) };
     if (!resolved.fallbacks?.length) {
       // The turn runs on the primary, so a remembered fallback is over: re-ticking it later must not
       // pull this worker off a primary that is usable. Only the worker's own ladder turn says so: a
@@ -2552,7 +2664,7 @@ export class Proxy {
 
   /** Only configured route fallbacks, not another account or an invented provider. */
   private unwrittenFallback(resolved: Resolved, attempted: Resolved, cfg: Config, why: "prompt" | "capacity"): Resolved | null {
-    for (const f of resolved.fallbacks ?? []) {
+    for (const f of personalFallbacks(cfg, attempted, resolved.fallbacks ?? [])) {
       if (f.provider === attempted.provider && f.model === attempted.model) continue;
       if (!this.targetUsable({ ...f, effort: f.effort ?? resolved.effort }, cfg)) continue;
       return {
@@ -2570,6 +2682,7 @@ export class Proxy {
    * for the side requests Claude Code makes for itself. Null when no signed-in Claude pool is usable.
    */
   private claudeLastResort(cfg: Config): { provider: string; model: string } | null {
+    if (personalMode(cfg)) return null;
     for (const provider of claudeLastResortProviders(cfg)) {
       if (this.targetUsable({ provider, model: CLAUDE_SMALL_MODEL }, cfg)) return { provider, model: CLAUDE_SMALL_MODEL };
     }
@@ -2734,17 +2847,17 @@ function onlyReminders(text: string): boolean {
  * Successful responses stream directly, with real backpressure; no body is buffered. Once a
  * success header is sent this becomes a transparent response, including mid-stream failures.
  */
-function deferErrorResponse(response: http.ServerResponse, discarded: () => boolean): http.ServerResponse {
+function deferErrorResponse(response: http.ServerResponse, discarded: () => boolean, terminal: () => boolean): http.ServerResponse {
   let error = false;
   const guarded = new globalThis.Proxy(response, {
     get(target, key) {
       if (key === "writeHead") return (...args: unknown[]) => {
-        if (discarded()) return guarded;
-        error = typeof args[0] === "number" && (args[0] < 200 || args[0] >= 300) && !target.headersSent;
+        if (discarded() && !terminal()) return guarded;
+        error = !terminal() && typeof args[0] === "number" && (args[0] < 200 || args[0] >= 300) && !target.headersSent;
         return error ? guarded : Reflect.apply(target.writeHead, target, args);
       };
       if (key === "write" || key === "end" || key === "flushHeaders" || key === "destroy") return (...args: unknown[]) => {
-        if (discarded() || error || (key === "destroy" && !target.headersSent)) return guarded;
+        if (!terminal() && (discarded() || error || (key === "destroy" && !target.headersSent))) return guarded;
         return Reflect.apply(target[key], target, args);
       };
       const value: unknown = Reflect.get(target, key, target);

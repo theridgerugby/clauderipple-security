@@ -7,6 +7,7 @@
 
 import fs from "node:fs";
 import { readPrivateFile } from "./private-file.ts";
+import { migrateSecretFile } from "./locked-file.ts";
 import path from "node:path";
 import { codexEnabled, followCodexCache, writeCodexCatalog } from "../../cli/src/codex.ts";
 import { ingressModels } from "./ingress/models.ts";
@@ -35,6 +36,12 @@ import { assetsFingerprint, readLocalAssets, spawnSsh, syncRemoteAssets } from "
 import { RemoteTunnels, proxyConnectHost } from "./remote-tunnel.ts";
 import { syncContextWindows } from "./context-windows.ts";
 import { applyProcessPriority } from "./process-priority.ts";
+import { configurePersonalEgressPolicy, personalMode } from "./personal-policy.ts";
+import { captureRouterCodeIdentity } from "../../cli/src/install-runtime.ts";
+
+// Captured once, before listening. Reading the files again in /api/status could make an old
+// process incorrectly claim that it is executing newly installed code.
+const codeIdentity = captureRouterCodeIdentity();
 
 // Startup timing. Claude Desktop routes *all* its traffic through us in picker mode, so every
 // second before the socket is open is a second the app cannot reach anything (ERR_PROXY_-
@@ -91,14 +98,19 @@ const store = new ConfigStore(undefined, (c, errors) => {
   tunnels?.reconcile(c.remote?.hosts ?? []);
 });
 const cfg0 = store.get();
-log = new Logger(logFile, cfg0.log.maxBytes, cfg0.log.keep, !!process.env.CLAUDERIPPLE_ECHO || !logFile);
+configurePersonalEgressPolicy(() => store.get().security);
+log = new Logger(logFile, cfg0.log.maxBytes, cfg0.log.keep, !!process.env.CLAUDERIPPLE_ECHO || !logFile, personalMode(cfg0));
 applyProcessPriority(cfg0.processPriority, { log: line => log!.info(line) });
 const T_CONFIG = Date.now();
 
 const certs = new CertStore(home);
 // Prices come from the AA cache before the log replays unflushed hours (openRequestLog), so those are priced too.
-const requests = openRequestLog(home);
+const requests = openRequestLog(home, personalMode(cfg0));
 try {
+  if (personalMode(cfg0)) {
+    migrateSecretFile(path.join(home, "ca.key"));
+    migrateSecretFile(path.join(home, "leaf.key"));
+  }
   certs.register(cfg0.upstream, readPrivateFile(path.join(home, "leaf.pem"), 64 * 1024), readPrivateFile(path.join(home, "leaf.key"), 64 * 1024));
 } catch (e) {
   log.error(`cannot load leaf.pem/leaf.key from ${home}: ${(e as Error).message}. Run the installer first.`);
@@ -324,6 +336,7 @@ proxy
       providerHealth: () => proxy.providerHealth.snapshot(),
       modelHealth: () => proxy.modelHealth.snapshot(),
       version: VERSION,
+      codeIdentity,
       requests,
       compactPick: (session, model) => model === null ? proxy.compactPicks.clear(session) : proxy.compactPicks.set(session, model),
       chatgpt: () => ({
@@ -347,6 +360,10 @@ proxy
       claudeClearCooldown: (id) => proxy.claudeClearCooldown(id),
       picker: () => ({ enabled: !!store.get().picker?.enabled, hosts: terminateHosts(store.get()).slice(1), last: proxy.lastPickerInjection }),
       observedClaudeCodeAuth,
+      claudeLocalAuthorization: (allow) => {
+        proxy.setClaudeLocalAuthorization(allow);
+        ingress.setClaudeLocalAuthorization(allow);
+      },
       claudeUsage: () => proxy.claudeUsage.snapshot(),
       claudeModels: () => proxy.claudeModels.list(),
       claudeIdentity: () => proxy.claudeIdentity.identify(),

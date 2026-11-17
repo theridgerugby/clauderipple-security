@@ -113,11 +113,14 @@ test("the router's launcher probes /api/ping and ends only its own child after f
   assert.ok(lines.includes("try { $p.Kill() } catch {}"));
   assert.ok(lines.includes("if (Test-RouterAnswers $adminPort) { $answered = $true; $failures = 0 }"), "one answer clears the count");
   assert.doesNotMatch(launcher, /Stop-Process|taskkill|Get-Process|Get-CimInstance/, "no other process is looked up or touched");
-  assert.equal((launcher.match(/\.Kill\(\)/g) ?? []).length, 1);
-  // The port is the router's: config.admin.port, else listen.port + 1; unreadable config = no probing.
-  assert.ok(lines.includes("if ($cfg.admin -and $cfg.admin.port) { return [int]$cfg.admin.port }"));
-  assert.ok(lines.includes("if ($cfg.listen -and $cfg.listen.port) { return [int]$cfg.listen.port + 1 }"));
-  assert.ok(lines.includes("} catch { return 0 }"));
+  assert.equal((launcher.match(/\.Kill\(\)/g) ?? []).length, 2, "only the owned router and a stuck owned port-reader child can be ended");
+  // The fixed native helper reads encrypted/private config. PowerShell never parses credentials.
+  assert.doesNotMatch(launcher, /Get-Content|ConvertFrom-Json/);
+  assert.match(launcher, /watchdog-port\.ts/);
+  assert.ok(lines.includes("$info.FileName = 'C:\\node.exe'"));
+  assert.ok(lines.includes("if (-not $readerProcess.WaitForExit(30000)) { return 0 }"));
+  assert.ok(lines.includes("$reading = $readerProcess.StandardOutput.ReadBlockAsync($buffer, 0, 6)"));
+  assert.ok(lines.includes("} catch { return 0 } finally {"));
   assert.ok(lines.includes("if ($adminPort -le 0) { continue }"));
   assert.ok(lines.includes(`$watchdogLog = '${path.join("C:\\home", "logs", "launcher-watchdog.log")}'`));
   assert.equal(launcher.charCodeAt(0), 0xFEFF);

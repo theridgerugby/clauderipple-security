@@ -80,26 +80,25 @@ test("every remote workflow action is pinned and untrusted PRs have no privilege
   }
 });
 
-test("release permissions are isolated from builds and every supported OS is a mandatory gate", () => {
+test("personal Windows validation is mandatory and upstream publishing is disabled in the fork", () => {
   const ci = fs.readFileSync(path.join(root, ".github/workflows/ci.yml"), "utf8");
   assert.match(ci, /workflow_call:/);
   assert.match(ci, /workflow_dispatch:/);
-  assert.match(ci, /os: \[macos-latest, ubuntu-latest, windows-latest\]/);
+  assert.match(ci, /os: \[windows-latest\]/);
   assert.doesNotMatch(ci, /continue-on-error/);
   assert.match(ci, /npm ci --ignore-scripts/);
   assert.match(ci, /npm audit --audit-level=low/);
   assert.match(ci, /run: npm run test:ci/);
   const scripts = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).scripts;
   assert.equal(scripts["test:ci"], scripts.test.replace("node --test ", "node --test --test-reporter=tap "), "CI must run the identical full suite with immediate failure diagnostics");
-  assert.match(ci, /xvfb-run -a npm run test:native/);
+  assert.match(ci, /run: npm run test:native --workspace @clauderipple\/app/);
   assert.doesNotMatch(ci, /--no-sandbox/);
   const native = ci.slice(ci.indexOf("\n  native-security:"));
   assert.ok(ci.indexOf("\n  native-security:") > 0, "native checks have an independent job");
-  assert.match(native, /os: \[macos-latest, ubuntu-latest, windows-latest\]/);
+  assert.match(native, /os: \[windows-latest\]/);
   assert.match(native, /npm ci --ignore-scripts/);
   assert.match(native, /run: npm run build/);
-  assert.match(native, /runner\.os != 'Linux'/);
-  assert.match(native, /CHROME_DEVEL_SANDBOX: \/opt\/google\/chrome\/chrome-sandbox/);
+  assert.match(native, /Native Windows personal sensitive-data gates/);
   assert.doesNotMatch(native, /sudo|sysctl|chmod|chown|--disable-setuid-sandbox/);
   assert.doesNotMatch(native, /needs:|continue-on-error|if:.*(?:failure|cancelled)/);
   const source = fs.readFileSync(path.join(root, ".github/workflows/publish.yml"), "utf8");
@@ -109,6 +108,7 @@ test("release permissions are isolated from builds and every supported OS is a m
   const before = source.slice(0, start);
   const publisher = source.slice(start, end).replace(/^\s*#.*$/gm, "");
   assert.doesNotMatch(before, /id-token: write/);
+  assert.match(before, /if: github\.repository == 'PBJ-2\/clauderipple'/);
   assert.match(before, /uses: \.\/.github\/workflows\/ci.yml/);
   assert.match(publisher, /id-token: write/);
   assert.doesNotMatch(publisher, /actions\/checkout|npm (?:ci|install|run build)|npm@/);

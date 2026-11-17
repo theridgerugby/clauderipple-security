@@ -1,3 +1,8 @@
+# This personal security fork is installed only from a reviewed, fixed source checkout.
+# Stop before downloads, runtime changes, settings, PATH or service registration.
+[Console]::Error.WriteLine('This personal security fork disables bootstrap installation. Follow docs/personal-windows-install.md at the reviewed commit.')
+exit 1
+# LEGACY_INSTALLER_BODY: retained for isolated regression fixtures; unreachable in this fork.
 # ClaudeRipple installer for Windows.
 #
 # Run a reviewed local copy from the intended release: powershell -File .\install.ps1

@@ -209,7 +209,7 @@ test("router never answers: install exits 1 and leaves settings.json exactly as 
     fs.writeFileSync(settings, ORIGINAL_SETTINGS);
     const r = await runInstall(root, settings, await freePort());
     assert.equal(r.code, 1, r.out);
-    assert.match(r.out, /probe failed/);
+    assert.match(r.out, /installation verification failed|probe failed/);
     assert.match(r.out, /was left as it was/);
     assert.equal(fs.readFileSync(settings, "utf8"), ORIGINAL_SETTINGS);
     assert.equal(fs.readdirSync(root).filter((f) => f.includes(".bak-clauderipple")).length, 0, "not even a backup was needed");

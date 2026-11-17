@@ -1,5 +1,6 @@
 // AA benchmark scores are metadata only: this module never changes routing or calls providers.
 import fs from "node:fs/promises";
+import { guardEgressFetch } from "./egress.ts";
 import path from "node:path";
 import type { Dataset, Effort, Model } from "../../../scripts/aa-dataset-lib.mjs";
 import { homeDir, type Config } from "./config.ts";
@@ -131,7 +132,7 @@ export class ModelScoreCatalog {
     if (this.until > this.now()) return this.dataset;
     let raw: unknown;
     try {
-      const response = await (this.options.fetch ?? fetch)(AA_DATA_URL, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(5_000) });
+      const response = await guardEgressFetch(this.options.fetch)(AA_DATA_URL, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(5_000) });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       raw = await response.json();
       this.publish(parseScoreDataset(raw));

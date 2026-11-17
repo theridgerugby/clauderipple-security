@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { applyWindowsPrivateAcl, verifyWindowsPrivateAcl, verifyWindowsPrivateFiles } from "./windows-private-acl.ts";
 import { execBounded } from "../../cli/src/bounded-exec.ts";
+import { secretStoredBytesLimit, unsealSecretBytes, unsealSecretBytesAsync, type SecretProtector } from "./secret-storage.ts";
 export { applyWindowsPrivateAcl, WINDOWS_PRIVATE_ACL_SCRIPT } from "./windows-private-acl.ts";
 
 const DEFAULT_MAX_BYTES = 8 * 1024 * 1024;
@@ -118,11 +119,18 @@ function readBoundedDescriptor(fd: number, maxBytes: number): Buffer {
  * Read from a checked descriptor, without following symlinks or opening a FIFO indefinitely.
  * Existing owner-created legacy files are tightened before reading, never read after chmod fails.
  */
-export function readPrivateFile(file: string, maxBytes = DEFAULT_MAX_BYTES): Buffer {
+export function readPrivateFileStored(file: string, maxBytes = DEFAULT_MAX_BYTES): Buffer {
   assertReadLimit(maxBytes);
   const fd = openPrivateRead(file);
   try { return readBoundedDescriptor(fd, maxBytes); }
   finally { fs.closeSync(fd); }
+}
+
+/** Secret envelopes are decoded only after the same ownership/descriptor boundary as raw files. */
+export function readPrivateFile(file: string, maxBytes = DEFAULT_MAX_BYTES, options: { protector?: SecretProtector } = {}): Buffer {
+  assertReadLimit(maxBytes);
+  const bytes = readPrivateFileStored(file, Math.min(64 * 1024 * 1024, secretStoredBytesLimit(maxBytes)));
+  return unsealSecretBytes(file, bytes, maxBytes, options.protector);
 }
 
 function assertStrictPermissions(stat: fs.Stats): void {
@@ -148,19 +156,22 @@ function assertStrictSnapshot(file: string, expected: fs.Stats, fd: number): voi
  * its pathname identity checked before/after verification and reading. Trusted ancestors remain
  * required, as for the private writers; pathname checks alone do not secure a hostile parent.
  */
-export function readPrivateFileStrict(file: string, maxBytes = DEFAULT_MAX_BYTES): Buffer {
+export function readPrivateFileStrict(file: string, maxBytes = DEFAULT_MAX_BYTES, options: { protector?: SecretProtector } = {}): Buffer {
   assertReadLimit(maxBytes);
   const before = fs.lstatSync(file);
   assertStrictPermissions(before);
   const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
   try {
     assertStrictSnapshot(file, before, fd);
-    if (before.size > maxBytes) throw new Error("Private storage exceeds its size bound");
+    const storedLimit = secretStoredBytesLimit(maxBytes);
+    if (before.size > storedLimit) throw new Error("Private storage exceeds its size bound");
     if (process.platform === "win32") verifyWindowsPrivateAcl(file, false);
     assertStrictSnapshot(file, before, fd);
-    const bytes = readBoundedDescriptor(fd, maxBytes);
+    const bytes = readBoundedDescriptor(fd, storedLimit);
     assertStrictSnapshot(file, before, fd);
-    return bytes;
+    const clear = unsealSecretBytes(file, bytes, maxBytes, options.protector);
+    assertStrictSnapshot(file, before, fd);
+    return clear;
   } finally { fs.closeSync(fd); }
 }
 
@@ -176,7 +187,7 @@ function assertReadActive(signal?: AbortSignal): void {
  * and after the entire batch. A failed/aborted batch closes all descriptors and returns nothing.
  * As with the single-file reader, the caller must use trusted ancestor directories.
  */
-export async function readPrivateFilesStrict(files: readonly PrivateFileRead[], options: { signal?: AbortSignal } = {}): Promise<Buffer[]> {
+export async function readPrivateFilesStrict(files: readonly PrivateFileRead[], options: { signal?: AbortSignal; protector?: SecretProtector } = {}): Promise<Buffer[]> {
   assertReadActive(options.signal);
   if (files.length < 1 || files.length > 16) throw new Error("Invalid private storage batch");
   let maximum = 0;
@@ -196,7 +207,7 @@ export async function readPrivateFilesStrict(files: readonly PrivateFileRead[], 
       assertReadActive(options.signal);
       const before = fs.lstatSync(item.file);
       assertStrictPermissions(before);
-      if (before.size > item.maxBytes) throw new Error("Private storage exceeds its size bound");
+      if (before.size > secretStoredBytesLimit(item.maxBytes)) throw new Error("Private storage exceeds its size bound");
       const fd = fs.openSync(item.file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
       opened.push({ ...item, fd, before });
       assertStrictSnapshot(item.file, before, fd);
@@ -204,10 +215,17 @@ export async function readPrivateFilesStrict(files: readonly PrivateFileRead[], 
     if (process.platform === "win32") await verifyWindowsPrivateFiles(opened.map(item => item.file), execBounded, options);
     assertReadActive(options.signal);
     for (const item of opened) assertStrictSnapshot(item.file, item.before, item.fd);
-    const results = opened.map(item => {
+    const stored = opened.map(item => {
       assertReadActive(options.signal);
-      return readBoundedDescriptor(item.fd, item.maxBytes);
+      return readBoundedDescriptor(item.fd, secretStoredBytesLimit(item.maxBytes));
     });
+    for (const item of opened) assertStrictSnapshot(item.file, item.before, item.fd);
+    const results: Buffer[] = [];
+    for (let i = 0; i < opened.length; i++) {
+      const item = opened[i]!;
+      assertReadActive(options.signal);
+      results.push(await unsealSecretBytesAsync(item.file, stored[i]!, item.maxBytes, { ...options, run: execBounded }));
+    }
     for (const item of opened) assertStrictSnapshot(item.file, item.before, item.fd);
     assertReadActive(options.signal);
     return results;

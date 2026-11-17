@@ -6,7 +6,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { lockSync } from "proper-lockfile";
-import { applyWindowsPrivateAcl, assertPrivateTarget, ensurePrivateDirectory, ensureStorageDirectory, notePrivateDirectoryMutation, rememberPrivateFileCreated } from "./private-file.ts";
+import { applyWindowsPrivateAcl, assertPrivateTarget, ensurePrivateDirectory, ensureStorageDirectory, notePrivateDirectoryMutation, readPrivateFileStored, rememberPrivateFileCreated } from "./private-file.ts";
+import { hasNativeSecretProtection, isSealedSecret, sealSecretBytes, secretStoredBytesLimit, unsealSecretBytes, type SecretProtector } from "./secret-storage.ts";
 
 const LOCK_STALE_MS = 30_000;
 const LOCK_WAIT_MS = 100;
@@ -92,6 +93,37 @@ export function writeJsonAtomic(file: string, value: unknown): { directoryDurabl
   // Also used for user-selected Claude/Codex settings paths. Protect the file without taking
   // ownership of the surrounding workspace's directory permissions.
   return writePrivateFileAtomic(file, JSON.stringify(value, null, 2) + "\n", false);
+}
+
+/** Opt-in for project-owned secrets only, never third-party settings or externally read PEMs. */
+export function writeSecretJsonAtomic(file: string, value: unknown, options: { protector?: SecretProtector } = {}): { directoryDurable: boolean } {
+  return writeSecretFileAtomic(file, JSON.stringify(value, null, 2) + "\n", options);
+}
+
+/** Encrypt before creating the temporary file: even incomplete atomic writes contain ciphertext. */
+export function writeSecretFileAtomic(file: string, value: string | Buffer, options: { protector?: SecretProtector } = {}): { directoryDurable: boolean } {
+  const bytes = typeof value === "string" ? Buffer.from(value, "utf8") : value;
+  return writePrivateFileAtomic(file, sealSecretBytes(file, bytes, options.protector));
+}
+
+/**
+ * Idempotent upgrade of a specifically identified, project-owned legacy secret. Call at startup
+ * before using that store. A failure is fatal to migration, never a reason to write plaintext or
+ * reset the account. No backup copy is created; only the encrypted temporary file reaches disk.
+ */
+export function migrateSecretFile(file: string, options: { protector?: SecretProtector } = {}): boolean {
+  if (!options.protector && !hasNativeSecretProtection()) return false;
+  let existing: Buffer;
+  try { existing = readPrivateFileStored(file, secretStoredBytesLimit(8 * 1024 * 1024)); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+  // The normal already-migrated path remains read-only and does not contend with account refresh.
+  if (isSealedSecret(existing)) { unsealSecretBytes(file, existing, 8 * 1024 * 1024, options.protector); return false; }
+  return withFileLock(file, () => {
+    const bytes = readPrivateFileStored(file, secretStoredBytesLimit(8 * 1024 * 1024));
+    if (isSealedSecret(bytes)) { unsealSecretBytes(file, bytes, 8 * 1024 * 1024, options.protector); return false; }
+    writeSecretFileAtomic(file, bytes, options);
+    return true;
+  });
 }
 
 function assertPrivateTemporary(stat: fs.Stats): void {

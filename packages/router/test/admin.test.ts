@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { readPrivateFile } from "../src/private-file.ts";
 import http from "node:http";
 import https from "node:https";
 import tls from "node:tls";
@@ -1545,7 +1546,7 @@ test("PUT /api/config accepts a valid config and saves it atomically", async () 
     const next = makeCfg({ providers: { p: { type: "anthropic-compatible", url: "http://127.0.0.1:9" } }, routes: { "claude-opus-4-8": { provider: "p", model: "m" } } });
     const res = await fetch(`${base()}:${port}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(next) });
     assert.equal(res.status, 200);
-    const onDisk = JSON.parse(fs.readFileSync(configFile, "utf8"));
+    const onDisk = JSON.parse(readPrivateFile(configFile).toString("utf8"));
     assert.deepEqual(onDisk.routes, next.routes);
     // no leftover temp files
     const dir = fs.readdirSync(path.dirname(configFile));
@@ -1582,9 +1583,9 @@ test("config revisions prevent concurrent lost updates and detect external edits
     const secondWindow = await get();
     assert.match(firstWindow.configRevision, /^[a-f0-9]{64}$/);
     assert.deepEqual(secondWindow, firstWindow);
-    const responses = await Promise.all([put({ ...firstWindow, autoUpdate: true }), put({ ...secondWindow, autoUpdate: false })]);
+    const responses = await Promise.all([put({ ...firstWindow, processPriority: "normal" }), put({ ...secondWindow, processPriority: "below-normal" })]);
     assert.deepEqual(responses.map(response => response.status).sort(), [200, 409]);
-    const saved = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+    const saved = JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config;
     const success = await responses.find(response => response.status === 200)!.json() as { ok: boolean; configRevision: string };
     assert.equal(success.ok, true);
     assert.notEqual(success.configRevision, firstWindow.configRevision);
@@ -1599,7 +1600,7 @@ test("config revisions prevent concurrent lost updates and detect external edits
       assert.equal((await put({ ...saved, configRevision })).status, 400);
       assert.equal(fs.readFileSync(configFile, "utf8"), before);
     }
-    const fresh = await put({ ...await get(), autoUpdate: !saved.autoUpdate });
+    const fresh = await put({ ...await get(), processPriority: saved.processPriority === "normal" ? "below-normal" : "normal" });
     assert.equal(fresh.status, 200);
     const { configRevision } = await fresh.json() as { configRevision: string };
     const external = { ...saved, providers: { external: { type: "anthropic-compatible", url: "http://127.0.0.1:9" } } } satisfies Config;
@@ -1621,7 +1622,7 @@ test("PUT /api/config carries a webSearch backend through to the file and GET re
     });
     const res = await fetch(`${base()}:${port}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(next) });
     assert.equal(res.status, 200);
-    const onDisk = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+    const onDisk = JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config;
     assert.deepEqual(onDisk.webSearch, next.webSearch);
     setCfg(next);
     const read = (await (await fetch(`${base()}:${port}/api/config`)).json()) as Config;
@@ -1636,7 +1637,7 @@ test("PUT /api/config carries a chatgpt provider's Fast switches through to the 
     });
     const res = await fetch(`${base()}:${port}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(next) });
     assert.equal(res.status, 200);
-    const onDisk = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+    const onDisk = JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config;
     assert.deepEqual((onDisk.providers.gpt as { fast?: unknown }).fast, { main: true, subagent: false });
     setCfg(next);
     const read = (await (await fetch(`${base()}:${port}/api/config`)).json()) as Config;
@@ -3004,7 +3005,7 @@ test("POST /api/providers/measure runs in the background and polling settles the
     assert.equal(job.done, 1);
     assert.equal(job.total, 1);
     assert.deepEqual(job.results, [{ id: "mimo", wire: "chat", effortLevels: ["none", "low", "medium", "high"] }]);
-    const onDisk = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+    const onDisk = JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config;
     assert.equal(onDisk.providers.oc?.models?.[0]?.wire, "chat");
     // `medium` and `high` are in although the provider declared neither: a measurement corrects the
     // configuration in both directions, or a level the plan really offers stays out of reach.
@@ -3024,7 +3025,7 @@ test("measurement updates only its provider when another provider has the same m
     assert.equal(started.status, 202);
     const job = await pollMeasure(port, ((await started.json()) as { jobId: string }).jobId);
     assert.equal(job.state, "done");
-    const saved = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+    const saved = JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config;
     assert.equal(saved.providers.p?.models?.[0]?.wire, "chat");
     assert.deepEqual(saved.providers.p?.models?.[0]?.effortLevels, ["low"]);
     assert.deepEqual(saved.providers.q, cfg.providers.q, "a shared id does not share measured capabilities");
@@ -3059,7 +3060,7 @@ test("measurement fills blank fields but never overwrites a wire or ladder the u
     });
     assert.equal(started.status, 202);
     await pollMeasure(port, ((await started.json()) as { jobId: string }).jobId);
-    const models = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers.oc!.models!;
+    const models = (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers.oc!.models!;
     const muse = models.find((m) => m.id === "muse")!;
     const fresh = models.find((m) => m.id === "fresh")!;
     assert.equal(muse.wire, "responses", "an explicit wire is the user's, not the measurement's, to change");
@@ -3096,7 +3097,7 @@ test("a preset provider measures across the wires the preset declares, the provi
     });
     await pollMeasure(port, ((await started.json()) as { jobId: string }).jobId);
     assert.equal(seen[0], "https://opencode.ai/zen/go/v1/responses", "the provider's own wire is tried first");
-    const model = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers["opencode-go"]!.models![0]!;
+    const model = (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers["opencode-go"]!.models![0]!;
     assert.equal(model.wire, "chat");
   }, { measureFetch });
 });
@@ -3132,7 +3133,7 @@ test("a model the preset already places is measured on that wire first, even whe
     await pollMeasure(port, ((await started.json()) as { jobId: string }).jobId);
     assert.equal(seen[0], "https://opencode.ai/zen/go/v1/messages", "the preset's own placement is tried before the provider default");
     assert.equal(seen.length, 1, "a wire that answers ends the search");
-    const model = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers["opencode-go"]!.models![0]!;
+    const model = (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers["opencode-go"]!.models![0]!;
     assert.equal(model.wire, "anthropic");
   }, { measureFetch });
 });
@@ -3196,7 +3197,7 @@ test("a model the catalogue describes is measured with one request and takes the
     assert.deepEqual(bunny.map((s) => s.url), ["https://opencode.ai/zen/go/v1/chat/completions"], "the catalogue's wire first, and nothing after it answers");
     assert.equal(seen.filter((s) => s.model === "glm-5.3-flash").length, 1);
     assert.ok(seen.filter((s) => s.model === "unlisted").length > 2, "a model the catalogue lacks is measured as before");
-    const models = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers["opencode-go"]!.models!;
+    const models = (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers["opencode-go"]!.models!;
     assert.deepEqual(models.find((m) => m.id === "space-bunny-free")?.effortLevels, ["low", "medium", "high", "xhigh", "max"]);
     assert.deepEqual(models.find((m) => m.id === "glm-5.3-flash")?.effortLevels, ["low", "high", "max"]);
     assert.equal(models.find((m) => m.id === "glm-5.3-flash")?.wire, "chat");
@@ -3236,7 +3237,7 @@ test("measurement writes the catalogue's context window into a model that has no
     });
     const job = await pollMeasure(port, ((await started.json()) as { jobId: string }).jobId);
     assert.equal(job.state, "done");
-    const models = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers["opencode-go"]!.models!;
+    const models = (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers["opencode-go"]!.models!;
     assert.equal(models.find((m) => m.id === "muse-spark-1.3-contributor")?.contextWindow, 999, "a window already set is not overwritten");
     assert.equal(models.find((m) => m.id === "deepseek-v4.1-flash")?.contextWindow, 1000000);
   }, { measureFetch, modelCatalog });
@@ -3273,7 +3274,7 @@ test("backfillContextWindows fills only models without a window, leaving a set o
     });
     const deps = { config: () => cfg, configFile, log, modelCatalog } as unknown as AdminDeps;
     assert.deepEqual(await backfillContextWindows(deps), ["opencode-go/muse-spark-1.3-contributor"]);
-    const models = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers["opencode-go"]!.models!;
+    const models = (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers["opencode-go"]!.models!;
     assert.equal(models.find((m) => m.id === "muse-spark-1.3-contributor")?.contextWindow, 1048576);
     assert.equal(models.find((m) => m.id === "deepseek-v4.1-flash")?.contextWindow, 123, "the vendor's own window stands");
     assert.equal("contextWindow" in (models.find((m) => m.id === "not-listed") ?? {}), false);
@@ -3314,7 +3315,7 @@ test("backfillContextWindows fills a provider with no catalogue block from the s
     });
     const deps = { config: () => cfg, configFile, log, modelCatalog } as unknown as AdminDeps;
     assert.deepEqual(await backfillContextWindows(deps), ["hive/deepseek-ai/deepseek-v4.1-flash-1017"]);
-    const models = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers.hive!.models!;
+    const models = (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers.hive!.models!;
     assert.equal(models.find((m) => m.id === "deepseek-ai/deepseek-v4.1-flash-1017")?.contextWindow, 256000, "the smallest window the catalogue states");
     assert.equal(models.find((m) => m.id === "zai-org/glm-5.3-flash")?.contextWindow, 111, "the operator's own window stands");
     assert.equal("contextWindow" in (models.find((m) => m.id === "jev-1.13") ?? {}), false, "a model the catalogue does not list stays blank");
@@ -3351,7 +3352,7 @@ test("measurement gives a provider with no catalogue block the window its model 
     });
     const job = await pollMeasure(port, ((await started.json()) as { jobId: string }).jobId);
     assert.equal(job.state, "done");
-    const models = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers.hive!.models!;
+    const models = (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers.hive!.models!;
     assert.equal(models.find((m) => m.id === "deepseek-ai/deepseek-v4.1-flash-1017")?.contextWindow, 256000);
     assert.equal(models.find((m) => m.id === "zai-org/glm-5.3-flash")?.contextWindow, 777, "a window already set is not overwritten");
   }, { measureFetch, modelCatalog });
@@ -3381,7 +3382,7 @@ test("a model the plan refuses is still reported when the catalogue lists it", a
     const [result] = job.results as { error?: string; effortLevels?: string[] }[];
     assert.match(result?.error ?? "", /^not-entitled/);
     assert.equal(result?.effortLevels, undefined, "a model that did not answer is not given the catalogue's ladder");
-    assert.equal("effortLevels" in (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers["opencode-go"]!.models![0]!, false);
+    assert.equal("effortLevels" in (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers["opencode-go"]!.models![0]!, false);
   }, { measureFetch, modelCatalog });
 });
 
@@ -3403,7 +3404,7 @@ test("an auth failure in measurement writes nothing: the wire is not guessed", a
     });
     const job = await pollMeasure(port, ((await started.json()) as { jobId: string }).jobId);
     assert.deepEqual(job.results, [{ id: "bad", error: "auth" }]);
-    const model = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers.oc!.models![0]!;
+    const model = (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers.oc!.models![0]!;
     assert.equal("wire" in model, false);
     assert.equal("effortLevels" in model, false);
   }, { measureFetch });
@@ -3608,7 +3609,7 @@ test("measureUnsettledModels: discovers effort for a ladderless provider's unset
     let onDisk: Config | undefined;
     for (let i = 0; i < 200 && !(onDisk?.providers.kimi?.models?.[0]?.effortLevels && onDisk?.providers.groq?.models?.[0]?.effortLevels); i++) {
       await new Promise((resolveP) => setTimeout(resolveP, 5));
-      onDisk = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+      onDisk = JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config;
     }
     assert.deepEqual(onDisk?.providers.kimi?.models?.[0]?.effortLevels, ["low", "high"], "validated, and these two accepted");
     assert.deepEqual(onDisk?.providers.kimi?.models?.[1]?.effortLevels, [], "a settled model is left as it was");
@@ -3654,7 +3655,7 @@ test("an Ollama model's effort and context come from /api/show, and an empty lad
     assert.equal(job.state, "done");
     assert.deepEqual(calls.filter((c) => c.url === "https://ollama.com/api/show").map((c) => c.body.model), ["gpt-oss:120b", "qwen3:235b"]);
     assert.equal(calls.some((c) => "reasoning_effort" in c.body), false, "no ladder probing: the vendor states it");
-    const models = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers["ollama-cloud"]!.models!;
+    const models = (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers["ollama-cloud"]!.models!;
     assert.deepEqual(models.find((m) => m.id === "gpt-oss:120b")?.effortLevels, ["low", "medium", "high"], "an empty ladder is a blank on Ollama");
     assert.equal(models.find((m) => m.id === "gpt-oss:120b")?.contextWindow, 1048576);
     assert.deepEqual(models.find((m) => m.id === "qwen3:235b")?.effortLevels, ["low"], "a ladder someone set stands");
@@ -3693,7 +3694,7 @@ test("measureUnsettledModels re-measures Ollama's empty ladders, and leaves an e
     const models = () => onDisk?.providers.ollama?.models ?? [];
     for (let i = 0; i < 200 && !(models().find((m) => m.id === "llama3.3")?.effortLevels?.length && models().find((m) => m.id === "qwen3")?.contextWindow); i++) {
       await new Promise((resolveP) => setTimeout(resolveP, 5));
-      onDisk = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+      onDisk = JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config;
     }
     assert.deepEqual(models().find((m) => m.id === "llama3.3")?.effortLevels, ["low", "high"], "an unset ladder is stated now");
     assert.deepEqual(models().find((m) => m.id === "qwen3")?.effortLevels, ["low", "high"], "the empty ladder is replaced");

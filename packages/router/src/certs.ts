@@ -9,7 +9,7 @@ import path from "node:path";
 import tls from "node:tls";
 import { createLeaf } from "./x509.ts";
 import { ensurePrivateDirectory, readPrivateFile } from "./private-file.ts";
-import { withFileLock, writePrivateFileAtomic } from "./locked-file.ts";
+import { migrateSecretFile, withFileLock, writePrivateFileAtomic, writeSecretFileAtomic } from "./locked-file.ts";
 
 export class CertStore {
   private readonly home: string;
@@ -44,6 +44,8 @@ export class CertStore {
     ensurePrivateDirectory(dir);
     const certFile = path.join(dir, `${host}.pem`);
     const keyFile = path.join(dir, `${host}.key`);
+    // Do the idempotent migration outside the issuance lock: it takes the same lock itself.
+    if (fs.existsSync(keyFile)) migrateSecretFile(keyFile);
     return withFileLock(keyFile, () => {
       if (fs.existsSync(certFile) && fs.existsSync(keyFile)) {
         const cert = readPrivateFile(certFile, 64 * 1024);
@@ -65,7 +67,7 @@ export class CertStore {
         caKeyPem: readPrivateFile(caKey, 64 * 1024).toString("utf8"),
       });
       writePrivateFileAtomic(certFile, leaf.certPem);
-      writePrivateFileAtomic(keyFile, leaf.keyPem);
+      writeSecretFileAtomic(keyFile, leaf.keyPem);
       return { cert: Buffer.from(leaf.certPem), key: Buffer.from(leaf.keyPem) };
     });
   }

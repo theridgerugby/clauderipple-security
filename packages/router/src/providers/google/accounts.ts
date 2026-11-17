@@ -11,12 +11,13 @@
 // and marked (assumption) in docs/ARCHITECTURE.md §4d.
 
 import crypto from "node:crypto";
+import { guardEgressFetch, isEgressPolicyError } from "../../egress.ts";
 import fs from "node:fs";
 import path from "node:path";
 import type { Logger } from "../../log.ts";
 import type { Credential } from "../../pool.ts";
 import { redactErrorText } from "../../redact.ts";
-import { withFileLock, writeJsonAtomic } from "../../locked-file.ts";
+import { migrateSecretFile, withFileLock, writeSecretJsonAtomic } from "../../locked-file.ts";
 import { readPrivateFile } from "../../private-file.ts";
 import type { ProviderModel } from "../../config.ts";
 import { GOOGLE_OAUTH, type FetchLike } from "./antigravity.ts";
@@ -89,7 +90,8 @@ function parseAccountsFile(home: string): GoogleAccount[] | null {
 }
 
 export function readGoogleAccounts(home: string): GoogleAccount[] {
-  return parseAccountsFile(home) ?? [];
+  try { migrateSecretFile(googleAccountsPath(home)); return parseAccountsFile(home) ?? []; }
+  catch { return []; }
 }
 
 function readForMutation(home: string): GoogleAccount[] {
@@ -99,10 +101,11 @@ function readForMutation(home: string): GoogleAccount[] {
 }
 
 function write(home: string, accounts: GoogleAccount[]): void {
-  writeJsonAtomic(googleAccountsPath(home), { version: 1, accounts } satisfies AccountsFile);
+  writeSecretJsonAtomic(googleAccountsPath(home), { version: 1, accounts } satisfies AccountsFile);
 }
 
 function mutate<T>(home: string, change: (accounts: GoogleAccount[]) => { accounts?: GoogleAccount[]; result: T }): T {
+  migrateSecretFile(googleAccountsPath(home));
   return withFileLock(googleAccountsPath(home), () => {
     const { accounts, result } = change(readForMutation(home));
     if (accounts) write(home, accounts);
@@ -262,13 +265,14 @@ export function refreshRejectionIsTerminal(status: number, body: string): boolea
 export async function refreshGoogleGrant(refreshToken: string, previous: { projectId: string; email?: string }, fetchImpl: FetchLike = fetch, now = Date.now): Promise<GoogleGrant> {
   let res: Response;
   try {
-    res = await fetchImpl(GOOGLE_OAUTH.tokenUrl, {
+    res = await guardEgressFetch(fetchImpl)(GOOGLE_OAUTH.tokenUrl, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
       body: new URLSearchParams({ grant_type: "refresh_token", client_id: GOOGLE_OAUTH.clientId, client_secret: GOOGLE_OAUTH.clientSecret, refresh_token: refreshToken }).toString(),
       signal: AbortSignal.timeout(GOOGLE_OAUTH.requestTimeoutMs),
     });
   } catch (error) {
+    if (isEgressPolicyError(error)) throw error;
     throw new GoogleRefreshError(`token refresh unreachable: ${(error as Error).message}`, false);
   }
   const text = await res.text().catch(() => "");
@@ -393,6 +397,7 @@ export class GoogleAccountPool {
         }
       },
       (error: Error) => {
+        if (isEgressPolicyError(error)) throw error;
         if (error instanceof GoogleRefreshError && error.terminal) {
           markGoogleNeedsReauth(this.home, account.id, account.accessToken);
           this.log.warn(`google account ${account.id.slice(0, 8)}: refresh rejected; sign-in required`);

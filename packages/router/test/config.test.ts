@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ConfigStore, DEFAULTS, PROCESS_PRIORITIES, fastSwitches, providerFor, validate, webSearchBackend, webSearchNative } from "../src/config.ts";
+import { ConfigStore, DEFAULTS, PROCESS_PRIORITIES, fastSwitches, normalizeConfig, providerFor, validate, webSearchBackend, webSearchNative } from "../src/config.ts";
+import { readPrivateFile } from "../src/private-file.ts";
 import type { AnthropicCompatibleProvider, Config, GoogleProvider, OpenAiCompatibleProvider, ProcessPriority, Provider } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
 import { buildModelScores } from "../src/model-scores.ts";
@@ -54,7 +55,7 @@ for (const [label, settings, expected] of [
     assert.deepEqual(cfg.webSearch, { ...input.webSearch, provider: "opencode-go" });
     assert.equal(cfg.direct[0]?.provider, "opencode-go");
     assert.deepEqual(cfg.routes.slot, { ...input.routes.slot, provider: "opencode-go", fallbacks: [{ provider: "opencode-go", model: "chat-model" }, { provider: "other", model: "other-model" }] });
-    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), input, "migration never rewrites the source file");
+    assert.deepEqual(JSON.parse(readPrivateFile(file).toString("utf8")), input, "normalization preserves source data; Windows migration seals its storage");
   });
 }
 
@@ -72,13 +73,16 @@ for (const [label, fields, expected] of [
   test(`split-provider migration leaves ${label} for validation`, (t) => {
     const { cfg, errors } = readConfigFixture(t, { providers: splitProviders, ...fields });
     assert.ok(errors.includes(expected), errors.join("; "));
-    for (const [field, value] of Object.entries(fields)) assert.deepEqual(cfg[field as "webSearch" | "autoModeClassifier"], value);
+    const normalized = normalizeConfig({ providers: splitProviders, ...fields } as unknown as Partial<Config>);
+    for (const [field, value] of Object.entries(fields)) assert.deepEqual(normalized[field as "webSearch" | "autoModeClassifier"], value);
+    assert.deepEqual(cfg.security, { mode: "personal", approvedOrigins: [] }, "invalid config never remains active");
+    assert.deepEqual(cfg.providers, {});
   });
 }
 
 for (const wire of ["chat", "responses", "anthropic", "google"] as const) {
   test(`split-provider migration preserves explicit ${wire} model overrides`, (t) => {
-    const model = { id: "custom-model", wire, url: "https://custom.test/endpoint", authHeader: "x-api-key" as const, effortLevels: [], contextWindow: 123456 };
+    const model = { id: "custom-model", wire, url: "https://example.test/custom-endpoint", authHeader: "x-api-key" as const, effortLevels: [], contextWindow: 123456 };
     const { cfg, errors } = readConfigFixture(t, {
       providers: { ...splitProviders, chat: { ...splitProviders.chat, models: [model] } },
     });
@@ -161,12 +165,13 @@ test("valid CLI picker entries remain usable by the model catalogue", () => {
   assert.equal(buildModelScores(cfg, null).models[0]?.model, "custom");
 });
 
-test("a rejected CLI picker reload keeps the last usable model catalogue", (t) => {
+test("a rejected CLI picker reload clears routes but keeps the model catalogue renderer usable", (t) => {
   const { file, cfg } = readConfigFixture(t, { cli: { extraModels: [{ model: "custom", name: "Custom" }] } });
   const store = new ConfigStore(file);
   fs.writeFileSync(file, JSON.stringify({ cli: { extraModels: null } }));
   fs.utimesSync(file, new Date(2_000_000_000_000), new Date(2_000_000_000_000));
-  assert.deepEqual(store.get(), cfg);
+  assert.notDeepEqual(store.get(), cfg);
+  assert.deepEqual(store.get(), normalizeConfig({}));
   assert.doesNotThrow(() => buildModelScores(store.get(), null));
 });
 
@@ -353,7 +358,7 @@ test("validate accepts openai-compatible configuration and rejects invalid wire/
   assert.ok(invalidModel.some((error) => error.includes("models must be entries")));
 });
 
-test("ConfigStore hot-reloads on mtime change and keeps last good config on errors", () => {
+test("ConfigStore hot-reloads and drops active routes and destination approvals on errors", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-cfg-"));
   const file = path.join(dir, "config.json");
   fs.writeFileSync(file, JSON.stringify({ listen: { port: 1234 } }));
@@ -362,7 +367,8 @@ test("ConfigStore hot-reloads on mtime change and keeps last good config on erro
   assert.equal(store.get().listen.host, "127.0.0.1");
   fs.writeFileSync(file, "{ broken");
   fs.utimesSync(file, new Date(Date.now() + 5000), new Date(Date.now() + 5000));
-  assert.equal(store.get().listen.port, 1234);
+  assert.equal(store.get().listen.port, DEFAULTS.listen.port);
+  assert.deepEqual(store.get().security, { mode: "personal", approvedOrigins: [] });
   fs.writeFileSync(file, JSON.stringify({ listen: { port: 4321 } }));
   fs.utimesSync(file, new Date(Date.now() + 10000), new Date(Date.now() + 10000));
   assert.equal(store.get().listen.port, 4321);

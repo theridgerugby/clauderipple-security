@@ -22,6 +22,7 @@
 // field wrong and a search that really ran is reported as zero.
 
 import crypto from "node:crypto";
+import { guardEgressFetch } from "./egress.ts";
 import type { RequestUsage } from "./requestlog.ts";
 
 /** What the side request asked for. `allowedDomains`/`blockedDomains` ride on the tool definition. */
@@ -284,7 +285,7 @@ export function webPluginBackend(opts: {
         messages: [{ role: "user", content: `${QUERY_PREFIX}${q.query}` }],
         max_tokens: 700,
       };
-      const doFetch = opts.fetchImpl ?? fetch;
+      const doFetch = guardEgressFetch(opts.fetchImpl);
       const res = await doFetch(`${opts.url.replace(/\/+$/, "")}/v1/chat/completions`, {
         method: "POST",
         headers: { "content-type": "application/json", ...opts.headers },
@@ -349,7 +350,7 @@ export function anthropicServerToolBackend(opts: {
         tools: [tool],
         tool_choice: { type: "tool", name: "web_search" },
       };
-      const doFetch = opts.fetchImpl ?? fetch;
+      const doFetch = guardEgressFetch(opts.fetchImpl);
       const res = await doFetch(`${opts.url.replace(/\/+$/, "")}/v1/messages`, {
         method: "POST",
         headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", ...opts.headers },

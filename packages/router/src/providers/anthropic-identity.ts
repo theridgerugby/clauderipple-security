@@ -7,6 +7,7 @@
 // Only the email and a one-way hash of the UUID leave this module; the body is never logged.
 
 import crypto from "node:crypto";
+import { guardEgressFetch, isEgressPolicyError } from "../egress.ts";
 import type { Credential } from "../pool.ts";
 import type { RequestRecord } from "../requestlog.ts";
 import { subjectHash } from "./anthropic-accounts.ts";
@@ -139,6 +140,7 @@ export class ClaudeCurrentIdentity {
     try {
       headers = (await this.source.credentials()).find((credential) => credential.ownerId === "current")?.headers;
     } catch (e) {
+      if (isEgressPolicyError(e)) throw e;
       this.opts.warn?.(`claude identity: no credentials: ${(e as Error).message}`);
       return null;
     }
@@ -171,7 +173,7 @@ export class ClaudeCurrentIdentity {
 
   private async fetchProfile(headers: Record<string, string>): Promise<ClaudeLoginIdentity | null> {
     try {
-      const res = await (this.opts.fetch ?? fetch)(`https://${this.opts.upstream()}/api/oauth/profile`, {
+      const res = await guardEgressFetch(this.opts.fetch)(`https://${this.opts.upstream()}/api/oauth/profile`, {
         method: "GET",
         // The same headers the usage lookup sends for the current login.
         headers: { ...headers, accept: "application/json" },
@@ -184,6 +186,7 @@ export class ClaudeCurrentIdentity {
       }
       return claudeIdentityFromBody(await res.json());
     } catch (e) {
+      if (isEgressPolicyError(e)) throw e;
       this.opts.warn?.(`claude identity: ${(e as Error).message}`);
       return null;
     }

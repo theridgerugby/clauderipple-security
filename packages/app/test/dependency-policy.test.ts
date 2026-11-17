@@ -26,6 +26,11 @@ test("the app and router use a byte-identical canonical Windows ACL implementati
     fs.readFileSync(new URL("../../router/src/windows-private-acl.ts", import.meta.url), "utf8"));
 });
 
+test("the app and router use a byte-identical canonical secret-storage implementation", () => {
+  assert.equal(fs.readFileSync(new URL("../src/secret-storage.ts", import.meta.url), "utf8"),
+    fs.readFileSync(new URL("../../router/src/secret-storage.ts", import.meta.url), "utf8"));
+});
+
 test("the app and router use a byte-identical pinned TLS admin transport", () => {
   assert.equal(fs.readFileSync(new URL("../src/admin-transport-client.ts", import.meta.url), "utf8"),
     fs.readFileSync(new URL("../../router/src/admin-transport-client.ts", import.meta.url), "utf8"));

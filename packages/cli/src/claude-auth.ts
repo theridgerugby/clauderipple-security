@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { saveClaudeAuthFile } from "../../router/src/providers/anthropic-token-file.ts";
 import { removeAllClaudeAccounts } from "../../router/src/providers/anthropic-accounts.ts";
+import { authorizeClaudeLocalAuth, readClaudeLocalAuthState, revokeClaudeLocalAuth, withClaudeLocalAuthAuthorization } from "../../router/src/providers/anthropic-local-auth.ts";
 import { windowsDesktopRoots } from "../../remote/src/desktop-paths.ts";
 
 function isSetupToken(value: string): boolean {
@@ -229,6 +230,10 @@ export function claudeLogin(home: string, options: { binary?: string; pathValue?
   // and left to run it waits for input that never comes (the tray has no timeout at all). Refuse
   // before spawning and say where it works (reported as a bare "setup-token failed", 2026-09-15).
   if (!options.run && !(options.interactive ?? process.stdin.isTTY)) throw new Error(needsTerminal());
+  // An explicit reconnect restores local reuse. Normal proxied traffic can never do this.
+  // Keep the generation so another process's logout while setup-token waits wins over its result.
+  authorizeClaudeLocalAuth(home);
+  const consentGeneration = readClaudeLocalAuthState(home).generation;
   let stdout: string;
   try {
     // A .cmd/.bat launcher cannot be spawned directly on Windows; it needs a shell, and then the
@@ -248,9 +253,13 @@ export function claudeLogin(home: string, options: { binary?: string; pathValue?
   }
   const token = parseSetupToken(stdout);
   if (!token) throw new Error("Claude Code did not return a recognizable setup token; no credential was saved");
-  saveClaudeAuthFile(home, token);
+  const saved = withClaudeLocalAuthAuthorization(home, () => { saveClaudeAuthFile(home, token); return true; }, consentGeneration);
+  if (!saved) throw new Error("Local Claude authorization changed during sign-in; no credential was saved. Explicitly reconnect to try again");
 }
 
 export function claudeLogout(home: string): boolean {
+  // Publish refusal before removing owned files. Every running auth store observes this epoch
+  // and drops borrowed/observed RAM authority without modifying the upstream client's login.
+  revokeClaudeLocalAuth(home);
   return removeAllClaudeAccounts(home);
 }

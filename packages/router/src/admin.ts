@@ -38,8 +38,11 @@ import { MAX_PROBE_ERROR_BYTES, MAX_PROBE_JSON_BYTES, parseAdminJson, readProbeJ
 export { parseUpdateCheck, type UpdateCheck } from "./cli-control.ts";
 import { fileURLToPath } from "node:url";
 import type { Config, Provider, ProviderCredential, ProviderModel } from "./config.ts";
-import { withFileLock, writeJsonAtomic } from "./locked-file.ts";
+import { withFileLock, writeJsonAtomic, writeSecretJsonAtomic } from "./locked-file.ts";
 import { readPrivateFile } from "./private-file.ts";
+import { approvedOrigin, personalMode } from "./personal-policy.ts";
+import type { RouterCodeIdentity } from "../../cli/src/install-runtime.ts";
+import { EgressPolicyError, egressFetch, guardEgressFetch, isEgressPolicyError } from "./egress.ts";
 import { adminPort, headerValueProblem, homeDir, normalizeConfig, searchProviderFor, ssidProblem, validate } from "./config.ts";
 export { adminPort } from "./config.ts";
 import { accountDisplayName, agentRenames, generatedAgents } from "./agents.ts";
@@ -138,6 +141,7 @@ export type AdminDeps = {
   providerHealth?: () => Record<string, ProviderExhaustion>;
   modelHealth?: ModelHealth["snapshot"];
   version: string;
+  codeIdentity?: RouterCodeIdentity;
   /**
    * The installation identity this process captured at start: its home's opaque id (immutable for
    * this process, even if the file changes) and its own pid. Status reports both, and a shutdown
@@ -194,6 +198,8 @@ export type AdminDeps = {
   picker?: () => { enabled: boolean; hosts: string[]; last: unknown };
   /** Optional: observed CLI credentials held by the live proxy, never serialized directly. */
   observedClaudeCodeAuth?: ObservedClaudeCodeAuth;
+  /** Invalidate every live current-login cache and in-flight refresh generation together. */
+  claudeLocalAuthorization?: (allow: boolean) => void;
   /** Test seam for Claude Code's keychain and credential-file readers. */
   claudeCodeCredentialReaders?: ClaudeCodeCredentialReaders;
   /** Test seam for the local CLI side effects. Production uses the installed CLI runtime. */
@@ -1190,7 +1196,7 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
     envProxy: { set: ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NODE_USE_ENV_PROXY"].filter((name) => (process.env[name] ?? "") !== "") },
     // Which files this process is running, so the app can tell an old router from its own after
     // an update: a zip unpacked next to the previous install left the old one serving (2026-09-15).
-    runtime: { node: process.execPath, router: process.argv[1] ?? null, startedAt: STARTED_AT },
+    runtime: { node: process.execPath, router: process.argv[1] ?? null, startedAt: STARTED_AT, codeIdentity: deps.codeIdentity ?? null },
     home: homeDir(),
     // The identity captured when this process started: a caller accepts this status as its own only
     // when both the installation id and the pid match what it would act on. A file changed while
@@ -1326,7 +1332,7 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
 
 /** Call only while holding the lock for the entire config read/modify/write transaction. */
 function writeConfigFileLocked(configFile: string, config: Config): void {
-  writeJsonAtomic(configFile, config);
+  writeSecretJsonAtomic(configFile, config);
 }
 
 /** The disk fingerprint also detects CLI edits and background measurements, without persisting API metadata. */
@@ -1396,7 +1402,7 @@ async function probeAnthropicApiKey(apiKey: string, probeFetch: (url: string, in
     const response = await probeFetch(url, { ...init, redirect: "error" });
     if (!response.ok) { await response.body?.cancel().catch(() => {}); return response; }
     return Response.json(await readProbeJson(response));
-  }).catch(() => []);
+  }).catch((error: unknown) => { if (isEgressPolicyError(error)) throw error; return []; });
   const models: ModelEntry[] = listed.length ? listed.map(({ line: _line, createdAt: _createdAt, ...model }) => model) : CLAUDE_MODEL_FALLBACK;
   const label = "messages endpoint";
   try {
@@ -1413,6 +1419,7 @@ async function probeAnthropicApiKey(apiKey: string, probeFetch: (url: string, in
     if (response.status === 402 || /insufficient|balance|credit|quota|billing/i.test(detail)) return { ok: true, auth: "ok", models, error: `no-credits: ${response.status} ${detail}` };
     return { ok: false, auth: response.status >= 500 ? "unreachable" : "unknown", models, error: `${label} returned ${response.status}: ${detail}` };
   } catch (e) {
+    if (isEgressPolicyError(e)) throw e;
     return { ok: false, auth: "unreachable", models, error: `${label}: ${redactErrorText(errorText(e), [apiKey])}` };
   }
 }
@@ -1495,6 +1502,7 @@ async function probeGoogle(body: { apiKey?: unknown; url?: unknown }, probeFetch
     if (models.length === 0) return { ok: true, auth: "ok", models, error: "no generateContent models listed" };
     return { ok: true, auth: "ok", models };
   } catch (e) {
+    if (isEgressPolicyError(e)) throw e;
     return { ok: false, auth: "unreachable", models, error: `models endpoint: ${redactErrorText(errorText(e), [apiKey])}` };
   }
 }
@@ -1517,7 +1525,7 @@ async function probeGoogleAntigravity(deps: AdminDeps, probe: { name?: unknown; 
   const antigravity = Object.entries(deps.config().providers).filter(([, p]) => p.type === "google" && p.auth === "antigravity") as [string, { url?: string }][];
   const pin = (url: unknown): string => (typeof url === "string" ? url.trim().replace(/\/+$/, "") : "");
   const named = antigravity.find(([name]) => name === probe.name)?.[0] ?? antigravity.find(([, p]) => pin(p.url) === pin(probe.url))?.[0];
-  const models = named ? await deps.google?.().models?.(named).catch(() => null) ?? null : null;
+  const models = named ? await deps.google?.().models?.(named).catch((error: unknown) => { if (isEgressPolicyError(error)) throw error; return null; }) ?? null : null;
   return { ok: true, auth: "ok", models: models ?? staticAntigravityModels() };
 }
 
@@ -1562,6 +1570,7 @@ async function probeGrok(
   try {
     token = await auth.token();
   } catch (error) {
+    if (isEgressPolicyError(error)) throw error;
     return fallback({ ok: false, auth: "missing", error: errorText(error) });
   }
   const { "x-grok-model-override": _route, ...headers } = grokHeaders(token.key, "", await auth.clientVersion(clientVersion));
@@ -1569,6 +1578,7 @@ async function probeGrok(
   try {
     response = await probeFetch(`${base}/models`, { headers, redirect: "error" });
   } catch (error) {
+    if (isEgressPolicyError(error)) throw error;
     // fetch quotes a header value it refuses, which here is the session token.
     return fallback({ ok: false, auth: "unreachable", error: redactErrorText(errorText(error), [token.key]) });
   }
@@ -1657,7 +1667,31 @@ function withPresetOverrides(models: ModelEntry[], presetId: string | undefined)
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
-  return fetch(url, { ...init, redirect: "error", signal: AbortSignal.timeout(8_000) });
+  const timeout = AbortSignal.timeout(8_000);
+  return egressFetch(url, { ...init, signal: init.signal ? AbortSignal.any([init.signal, timeout]) : timeout });
+}
+
+/**
+ * Origin approval permits a destination to receive its own credentials; it does not permit a
+ * preset or catalogue URL to move another provider's key there. Capture the credential's original
+ * base before deriving probe candidates, then check every attempt against that origin. Draft
+ * providers use the URL the operator entered, so custom compatible APIs remain supported.
+ */
+function credentialOriginFetch(
+  credentialBase: string,
+  transport: (url: string, init: RequestInit) => Promise<Response>,
+  config: () => Config,
+): (url: string, init: RequestInit) => Promise<Response> {
+  let origin: string | undefined;
+  try {
+    const base = new URL(credentialBase);
+    if (base.protocol === "https:" && !base.username && !base.password) origin = base.origin;
+  } catch { /* A malformed credential base is refused before transport in personal mode. */ }
+  return guardEgressFetch(transport, (url) => {
+    if (personalMode(config()) && (origin === undefined || url.origin !== origin)) {
+      throw new EgressPolicyError("destination");
+    }
+  });
 }
 
 /**
@@ -1691,6 +1725,7 @@ async function probeProvider(body: ProbeRequest, probeFetch: (url: string, init:
       if (response.ok) models = withPresetOverrides(parsedModels(await readProbeJson(response)), body.preset);
       else { await response.body?.cancel().catch(() => {}); modelsError = `models endpoint returned ${response.status}`; }
     } catch (e) {
+      if (isEgressPolicyError(e)) throw e;
       modelsError = `models endpoint: ${redactErrorText(errorText(e), secrets)}`;
     }
   }
@@ -1753,6 +1788,7 @@ async function probeProvider(body: ProbeRequest, probeFetch: (url: string, init:
     }
     return { ok: false, auth: response.status >= 500 ? "unreachable" : "unknown", models, error: `${label} returned ${response.status}: ${detail}` };
   } catch (e) {
+    if (isEgressPolicyError(e)) throw e;
     const message = `${label}: ${redactErrorText(errorText(e), secrets)}`;
     return { ok: false, auth: "unreachable", models, error: modelsError ? `${modelsError}; ${message}` : message };
   }
@@ -1782,7 +1818,8 @@ const MEASURE_TIMEOUT_MS = 20_000;
 const MEASURE_CONCURRENCY = 4;
 
 async function measureFetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
-  return fetch(url, { ...init, redirect: "error", signal: AbortSignal.timeout(MEASURE_TIMEOUT_MS) });
+  const timeout = AbortSignal.timeout(MEASURE_TIMEOUT_MS);
+  return egressFetch(url, { ...init, signal: init.signal ? AbortSignal.any([init.signal, timeout]) : timeout });
 }
 
 /** Drop finished jobs past their TTL. Run on each measure request, so no timer keeps the process up. */
@@ -1940,10 +1977,11 @@ function startMeasureJob(providerName: string, models: string[], deps: AdminDeps
   const jobId = crypto.randomBytes(12).toString("hex");
   MEASURE_JOBS.set(jobId, { state: "running", done: 0, total: models.length, results: [], scope });
   deps.log.info(`admin: measuring ${providerName} (${models.length} model(s)) -> ${jobId.slice(0, 8)}`);
-  void runMeasureJob(jobId, providerName, models, deps).catch(() => {
+  void runMeasureJob(jobId, providerName, models, deps).catch((error: unknown) => {
     const job = MEASURE_JOBS.get(jobId);
-    if (job) MEASURE_JOBS.set(jobId, { ...job, state: "failed", error: "measurement failed", finishedAt: Date.now() });
-    deps.log.warn("admin: measurement failed unexpectedly");
+    const policy = isEgressPolicyError(error);
+    if (job) MEASURE_JOBS.set(jobId, { ...job, state: "failed", error: policy ? error.message : "measurement failed", finishedAt: Date.now() });
+    deps.log.warn(policy ? "admin: measurement refused by outbound security policy" : "admin: measurement failed unexpectedly");
   });
   return jobId;
 }
@@ -2087,12 +2125,16 @@ async function runMeasureJob(jobId: string, providerName: string, models: string
   const discover = effortUndeclared(provider);
   const headers = "headers" in provider ? provider.headers : undefined;
   const secrets = [...Object.values(headers ?? {}), ...credentialHeaderValues(Object.entries(headers ?? {}))];
-  const upstreamFetch = deps.measureFetch ?? measureFetchWithTimeout;
+  const upstreamFetch = credentialOriginFetch(provider.url, deps.measureFetch ?? measureFetchWithTimeout, () => deps.config());
+  const abort = new AbortController();
+  let policyFailure: Error | undefined;
   // capabilities.ts takes short excerpts. Redact the full, bounded response FIRST, otherwise an
   // excerpt cut halfway through a key no longer matches the known credential and exposes a prefix.
   const fetchImpl = async (url: string, init: RequestInit): Promise<Response> => {
+    if (policyFailure) throw policyFailure;
     try {
-      const response = await upstreamFetch(url, { ...init, redirect: "error" });
+      const signal = init.signal ? AbortSignal.any([init.signal, abort.signal]) : abort.signal;
+      const response = await upstreamFetch(url, { ...init, signal });
       const text = await readProbeText(response, response.ok ? MAX_PROBE_JSON_BYTES : MAX_PROBE_ERROR_BYTES);
       const body = response.ok ? text : redactErrorText(text, secrets, MAX_PROBE_ERROR_BYTES);
       return new Response([204, 205, 304].includes(response.status) ? null : body, {
@@ -2100,6 +2142,12 @@ async function runMeasureJob(jobId: string, providerName: string, models: string
         headers: { "content-type": response.headers.get("content-type") ?? "text/plain" },
       });
     } catch (error) {
+      if (isEgressPolicyError(error)) {
+        policyFailure ??= error;
+        abort.abort(error);
+        throw error;
+      }
+      if (policyFailure) throw policyFailure;
       throw new Error(redactErrorText(errorText(error), secrets));
     }
   };
@@ -2108,6 +2156,7 @@ async function runMeasureJob(jobId: string, providerName: string, models: string
   const ollama = ollamaBase(provider);
   const catalog = deps.modelCatalog ? await deps.modelCatalog().catch(() => undefined) : undefined;
   const measureOne = async (id: string): Promise<void> => {
+    if (policyFailure) throw policyFailure;
     const listed = catalogEntry(catalog, preset, id);
     // Per model, not once per job: the order depends on what the preset recorded for this id.
     const candidates = measureCandidates(provider, id, listed?.wire);
@@ -2120,6 +2169,7 @@ async function runMeasureJob(jobId: string, providerName: string, models: string
     // answers first, and the ladder probing it would only answer wrongly is skipped.
     const facts = ollama ? await ollamaModelFacts(ollama, id, { fetch: fetchImpl, ...(sessionHeader ? { sessionHeader } : {}), ...(headers ? { headers } : {}) }) : undefined;
     const measured = await measureModel(id, candidates, known || facts ? [] : ladder, { fetch: fetchImpl, ...(sessionHeader ? { sessionHeader } : {}), ...(headers ? { headers } : {}) }, { discover: discover && !known && !facts });
+    if (policyFailure) throw policyFailure;
     if (measured.error) measured.error = redactErrorText(measured.error, secrets);
     if (stated && measured.wire) measured.effortLevels = stated;
     if (facts) {
@@ -2281,6 +2331,12 @@ function serveStatic(urlPath: string, res: http.ServerResponse): void {
 }
 
 export function startAdmin(deps: AdminDeps): Promise<{ port: number; tlsPort: number; close(): void }> {
+  deps = {
+    ...deps,
+    ...(deps.probeFetch ? { probeFetch: guardEgressFetch(deps.probeFetch) } : {}),
+    ...(deps.probeModelFetch ? { probeModelFetch: guardEgressFetch(deps.probeModelFetch) } : {}),
+    ...(deps.measureFetch ? { measureFetch: guardEgressFetch(deps.measureFetch) } : {}),
+  };
   // The instance's configured home, not ambient user state (also keeps test fixtures isolated).
   const adminHome = path.dirname(path.resolve(deps.configFile));
   const adminToken = ensureAdminToken(adminHome);
@@ -2407,6 +2463,55 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; tlsPort: nu
           sendJson(res, 401, { error: "local admin authentication required" });
           return;
         }
+      }
+      if (pathname === "/api/security-policy" && method === "GET") {
+        const cfg = deps.config();
+        const candidates = new Set<string>();
+        const add = (value: string | undefined): void => {
+          if (!value) return;
+          try { const origin = approvedOrigin(new URL(value).origin); if (origin) candidates.add(origin); } catch { /* invalid provider is not an approval */ }
+        };
+        add(`https://${cfg.upstream}`);
+        for (const provider of Object.values(cfg.providers)) {
+          if ("url" in provider) add(provider.url);
+          if (provider.type === "google" && provider.auth === "api-key") add(provider.url ?? "https://generativelanguage.googleapis.com");
+          if (provider.type === "chatgpt") add(provider.url ?? "https://chatgpt.com");
+          if (provider.type === "anthropic") add("https://api.anthropic.com");
+          for (const model of provider.models ?? []) add(model.url);
+        }
+        sendJson(res, 200, {
+          mode: "personal", approvedOrigins: cfg.security?.approvedOrigins ?? [],
+          candidates: [...candidates].sort(), crossProviderFallback: false,
+          bodyDebugDumps: false, remoteAccess: false, persistentDiagnostics: false,
+        });
+        return;
+      }
+      if (pathname === "/api/security-policy" && method === "POST") {
+        let action: unknown;
+        try { action = parseAdminJson((await readBody(req, 4096, new Error("security policy request too large"))).toString("utf8")); }
+        catch { sendJson(res, 400, { error: "invalid security policy request" }); return; }
+        if (!action || typeof action !== "object" || Array.isArray(action)) { sendJson(res, 400, { error: "expected security policy action" }); return; }
+        const request = action as Record<string, unknown>;
+        const origin = approvedOrigin(request.origin);
+        if (!origin || (request.action !== "approve" && request.action !== "revoke") ||
+            (request.action === "approve" && request.acknowledgeDataSharing !== true)) {
+          sendJson(res, 400, { error: "approve an exact HTTPS origin only after acknowledging credential and conversation sharing" }); return;
+        }
+        withFileLock(deps.configFile, () => {
+          const next = configSnapshot(deps).config;
+          const previous = next.security?.approvedOrigins ?? [];
+          const origins = request.action === "approve" ? [...new Set([...previous, origin])] : previous.filter(value => value !== origin);
+          if (origins.length > 32) throw new Error("too many approved origins");
+          next.security = { mode: "personal", approvedOrigins: origins };
+          next.autoUpdate = false;
+          writeConfigFileLocked(deps.configFile, next);
+        });
+        sendJson(res, 200, { ok: true, origin, action: request.action });
+        return;
+      }
+      if (personalMode(deps.config()) && /^\/api\/(?:remote(?:\/|-|$)|phone-|settings-jobs)/.test(pathname)) {
+        sendJson(res, 403, { error: "remote access is disabled in the personal sensitive-data profile" });
+        return;
       }
       if (pathname === "/api/settings-jobs" || pathname === "/api/settings-jobs/claim" || pathname === "/api/settings-jobs/result") {
         res.setHeader("cache-control", "no-store");
@@ -2720,6 +2825,14 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; tlsPort: nu
           sendJson(res, 400, { error: "expected provider probe object" });
           return;
         }
+        const requested = parsed as Record<string, unknown>;
+        if (personalMode(deps.config()) && (requested.type === "grok" ||
+            (requested.type === "google" && requested.auth === "antigravity"))) {
+          // Probes run before a provider is saved, so config validation cannot fence their
+          // credential reads or an external CLI refresh. Refuse before restoring any secrets.
+          sendJson(res, 403, { error: "Subscription-token reuse for this provider is disabled in personal mode; use a direct HTTPS API provider" });
+          return;
+        }
         let probe: { type?: unknown; name?: unknown; auth?: unknown; apiKey?: unknown; url?: unknown; headers?: unknown; modelsUrl?: unknown; modelsAuthHeader?: unknown; probeModel?: unknown; sessionHeader?: unknown; preset?: unknown; wire?: unknown; home?: unknown; cli?: unknown; clientVersion?: unknown };
         try { probe = restoreProbeSecrets(parsed as Record<string, unknown>, deps.config().providers); }
         catch (error) { sendJson(res, 400, { error: (error as Error).message }); return; }
@@ -2791,7 +2904,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; tlsPort: nu
           ...(typeof probe.preset === "string" && probe.preset ? { preset: probe.preset } : {}),
           ...(typeof probe.probeModel === "string" ? { probeModel: probe.probeModel } : {}),
           ...(probe.wire === "chat" || probe.wire === "responses" ? { wire: probe.wire } : {}),
-        }, deps.probeModelFetch ?? fetchWithTimeout);
+        }, credentialOriginFetch(probe.url, deps.probeModelFetch ?? fetchWithTimeout, () => deps.config()));
         // A provider being added gets the same blank-only fill as one already saved: Hive's `/models`
         // names its models and nothing else, and the form saves what the probe returns. A window the
         // vendor did report is kept, and one the catalogue cannot match is left blank.
@@ -2893,6 +3006,9 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; tlsPort: nu
           let parsed: Config;
           try { parsed = restoreConfigSecrets(incoming, current.config); }
           catch (error) { return { status: 400 as const, body: { errors: [(error as Error).message] } }; }
+          if (parsed.security?.approvedOrigins?.some(origin => !current.config.security?.approvedOrigins.includes(origin))) {
+            return { status: 403 as const, body: { errors: ["Approve new destinations through the security policy panel with explicit data-sharing acknowledgement"] } };
+          }
           const errors = validate(parsed);
           if (errors.length > 0) return { status: 400 as const, body: { errors } };
           writeConfigFileLocked(deps.configFile, parsed);
@@ -3215,6 +3331,8 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; tlsPort: nu
           sendJson(res, 400, { error: "invalid JSON" });
           return;
         }
+        claudeAuthStore(deps).authorize();
+        deps.claudeLocalAuthorization?.(true);
         const session = new ClaudeOAuthSession({ home: homeDir(), manual, ...(replaceId ? { replaceId } : {}), ...(deps.claudeOAuthFetch ? { fetch: deps.claudeOAuthFetch } : {}) });
         claudeOAuth = session;
         const { url, manual: needsCode } = await session.start();
@@ -3256,12 +3374,17 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; tlsPort: nu
         return;
       }
       if (pathname === "/api/claude-login" && method === "POST") {
+        claudeAuthStore(deps).authorize();
+        deps.claudeLocalAuthorization?.(true);
         const r = await (deps.runCli ?? runCli)(["claude-login"], 200_000);
         deps.log.info(`admin: claude-login via GUI -> ${r.ok ? "ok" : "failed"}`);
         sendJson(res, r.ok ? 200 : 500, { ok: r.ok, output: r.output });
         return;
       }
       if (pathname === "/api/claude-logout" && method === "POST") {
+        claudeOAuth?.revokeLocalAuthorization();
+        claudeAuthStore(deps).revoke();
+        deps.claudeLocalAuthorization?.(false);
         const r = await (deps.runCli ?? runCli)(["claude-logout"]);
         deps.log.info(`admin: claude-logout via GUI -> ${r.ok ? "ok" : "failed"}`);
         if (r.ok) deps.agentsChanged?.();
@@ -3276,6 +3399,10 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; tlsPort: nu
         return;
       }
       if (pathname === "/api/google-login" && method === "POST") {
+        if (personalMode(deps.config())) {
+          sendJson(res, 403, { error: "Google subscription sign-in is disabled in personal mode; use the Google API-key provider" });
+          return;
+        }
         if (googleOAuth?.snapshot.running) {
           sendJson(res, 200, googleOAuth.snapshot);
           return;
@@ -3302,6 +3429,10 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; tlsPort: nu
         return;
       }
       if (pathname === "/api/google-login/code" && method === "POST") {
+        if (personalMode(deps.config())) {
+          sendJson(res, 403, { error: "Google subscription sign-in is disabled in personal mode; use the Google API-key provider" });
+          return;
+        }
         const session = googleOAuth;
         if (!session?.snapshot.running) {
           sendJson(res, 409, { error: "no Google sign-in is waiting for a code" });
@@ -3424,6 +3555,10 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; tlsPort: nu
         return;
       }
       if (pathname === "/api/update" && (method === "GET" || method === "POST")) {
+        if (method === "POST" && personalMode(deps.config())) {
+          sendJson(res, 403, { error: "Executable updates are disabled in personal mode; review and verify a new fork checkout explicitly" });
+          return;
+        }
         // The CLI answers both: it knows how this copy was installed, which decides what an update is
         // (the tray asks it the same way). A POST checks again rather than trusting the page.
         const r = await (deps.runCli ?? runCli)(["update", "--check", "--json"], 30_000);
@@ -3574,7 +3709,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; tlsPort: nu
         const requested = Number(new URL(url, "http://x").searchParams.get("n") ?? 200);
         const n = Number.isFinite(requested) ? Math.min(2000, Math.max(1, Math.floor(requested))) : 200;
         const file = path.join(homeDir(), "logs", "router.log");
-        const text = tailLines(file, n);
+        const text = deps.log.memoryTail(n) ?? tailLines(file, n);
         res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
         res.end(text);
         return;
@@ -3585,6 +3720,10 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; tlsPort: nu
       }
       sendJson(res, 404, { error: "not found" });
     } catch (e) {
+      if (isEgressPolicyError(e) && !res.headersSent) {
+        sendJson(res, 403, { error: (e as Error).message });
+        return;
+      }
       if (e instanceof ModSettingsInputError && !res.headersSent) {
         sendJson(res, e.status, { error: e.message });
         return;

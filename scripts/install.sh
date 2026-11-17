@@ -1,4 +1,9 @@
 #!/bin/sh
+# This personal security fork is installed only from a reviewed, fixed source checkout.
+# Stop before downloads, runtime changes, settings, PATH or service registration.
+printf '%s\n' 'This personal security fork disables bootstrap installation. Follow docs/personal-windows-install.md at the reviewed commit.' >&2
+exit 1
+# LEGACY_INSTALLER_BODY: retained for isolated regression fixtures; unreachable in this fork.
 # ClaudeRipple installer for macOS and Linux.
 #
 # Run a reviewed local copy from the intended release: sh ./install.sh

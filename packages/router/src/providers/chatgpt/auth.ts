@@ -10,8 +10,10 @@
 // OAuth constants are the public ones used by the Codex CLI (auth.openai.com, PKCE S256).
 
 import crypto from "node:crypto";
+import { egressFetch } from "../../egress.ts";
 import fs from "node:fs";
 import { readPrivateFile } from "../../private-file.ts";
+import { migrateSecretFile } from "../../locked-file.ts";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -96,6 +98,7 @@ export function identityFromTokens(tokens: { accessToken: string; idToken?: stri
 
 export function readOwn(home: string): Tokens | null {
   try {
+    migrateSecretFile(ownAuthPath(home));
     const j = JSON.parse(readPrivateFile(ownAuthPath(home)).toString("utf8")) as Partial<Tokens>;
     if (!j.accessToken || !j.accountId) return null;
     return { ...(j as Tokens), source: "own" };
@@ -176,7 +179,7 @@ export async function login(openBrowser: (url: string) => void): Promise<Omit<To
     }, 5 * 60 * 1000).unref();
   });
 
-  const res = await fetch(OAUTH.tokenUrl, {
+  const res = await egressFetch(OAUTH.tokenUrl, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: OAUTH.redirectUri, client_id: OAUTH.clientId, code_verifier: verifier }),

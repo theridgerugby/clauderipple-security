@@ -143,7 +143,7 @@ test("doctor and power use their explicit installation home through native TLS",
   });
   // Match doctor's production budget. This assertion covers explicit-home routing and
   // authentication; dedicated transport tests retain their cancellation/deadline coverage.
-  assert.deepEqual(await fetchRouterStatus(fixture.base.slice(0, -1), 4000, fixture.home), { version: "test-auth" });
+  assert.deepEqual(await fetchRouterStatus(fixture.base.slice(0, -1), 4000, fixture.home), { version: "test-auth", runtimeVerified: false });
   assert.equal((await adminPowerCall(fixture.endpoint.publicPort, fixture.home)("PUT", { awake: { mode: "off" } }))?.status, 200);
   assert.deepEqual(calls.map(c => c.pathname), ["/api/status", "/api/power"]);
   for (const call of calls) assert.equal(call.headers[ADMIN_TOKEN_HEADER], fixture.token);

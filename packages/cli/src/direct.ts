@@ -13,7 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { ConfigStore, adminPort, type Config } from "../../router/src/config.ts";
 import { certPaths } from "./certs.ts";
-import { classifyMode, cliProxyState, desktopProxyState, fetchRouterStatus, proxyUrlFor, repair, type Mode, type RecoveryDeps } from "./doctor.ts";
+import { classifyMode, cliProxyState, desktopProxyState, fetchRouterStatus, proxyUrlFor, repair, sameRecoveryDestination, type Mode, type RecoveryDeps } from "./doctor.ts";
 import { writeJsonAtomic } from "../../router/src/locked-file.ts";
 import { claimedElsewhere, claimsOf, readOwners } from "./owners.ts";
 import type { DesktopServiceDeps } from "./desktop-service.ts";
@@ -182,19 +182,29 @@ export async function directOff(deps: RecoveryDeps, opts: { force?: boolean } = 
   }
 
   const notes: string[] = [];
-  if ((await (deps.routerStatus ?? ((url, ms) => fetchRouterStatus(url, ms, deps.home)))(`http://127.0.0.1:${adminPort(cfg)}`, 4_000)) === null) {
+  const readStatus = deps.routerStatus ?? ((url: string, ms: number) => fetchRouterStatus(url, ms, deps.home));
+  const adminUrl = `http://127.0.0.1:${adminPort(cfg)}`;
+  let status = await readStatus(adminUrl, 4_000);
+  if (status === null) {
     const fixed = await repair(deps);
-    if (!fixed.doctor.router.responding) {
+    if (!fixed.ok || !fixed.doctor.router.responding || !fixed.doctor.router.runtimeVerified) {
       const failed = fixed.steps.filter((s) => !s.ok).map((s) => `${s.name}: ${s.detail}`).join("; ");
       return fail(`the router is not answering even after a repair (${failed || "no step failed, it just did not come up"}), so Claude stays on its default connection.`);
     }
     notes.push("The router was not answering; repaired it first.");
+    // repair's final diagnostic may await other checks. Do not reuse its earlier proof at this
+    // separate restoration boundary, even if the same version still answers the port.
+    status = await readStatus(adminUrl, 4_000);
+  }
+  if (!status?.runtimeVerified || status.version !== deps.version) {
+    return fail("The router's current source/runtime could not be verified. Claude stays on its default connection; run install from the reviewed checkout before direct off.");
   }
 
   const restoredKeys: string[] = [];
   let desktopApplied = false;
   const edit = editSettingsEnv((current) => {
     // Recheck after the asynchronous health/repair boundary, under the shared settings lock.
+    if (!sameRecoveryDestination(cfg, config(home))) throw new Error("router destination changed while waiting; left untouched");
     if (JSON.stringify(readState(home)) !== JSON.stringify(saved)) throw new Error("direct snapshot changed while waiting; left untouched");
     const record = readOwners(settingsPath());
     if (record.error) throw new Error(record.error);

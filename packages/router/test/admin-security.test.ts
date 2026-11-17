@@ -1,6 +1,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { readPrivateFile } from "../src/private-file.ts";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
@@ -38,7 +39,7 @@ async function fixture(t: TestContext, providers: Config["providers"] = {}, extr
   const configFile = path.join(home, "config.json");
   const cfg = { ...DEFAULTS, autoUpdate: false, admin: { port: 0 }, providers };
   fs.writeFileSync(configFile, JSON.stringify(cfg));
-  const readConfig = () => JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+  const readConfig = () => JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config;
   const log = new Logger(null, 1_000_000, 1, false);
   t.mock.method(log, "line", () => {});
   const servers: Awaited<ReturnType<typeof startAdmin>>[] = [];
@@ -452,7 +453,7 @@ test("normalized legacy provider snapshots preserve credentials and revision con
   });
   const config = await (await fetch(`${f.base}/api/config`, { headers: f.headers })).json() as Config;
   assert.deepEqual(Object.keys(config.providers), ["opencode-go"]);
-  config.autoUpdate = true;
+  config.processPriority = "normal";
   const save = await fetch(`${f.base}/api/config`, { method: "PUT", headers: f.headers, body: JSON.stringify(config) });
   assert.equal(save.status, 200, await save.text());
   const saved = f.readConfig();
@@ -518,10 +519,10 @@ test("Google probe will not forward environment credentials to custom destinatio
   assert.equal(calls.length, 0);
   assert.equal((await (await probe({})).json() as { ok: boolean }).ok, true);
   assert.equal(new Headers(calls[0]!.init.headers).get("x-goog-api-key"), "fixture-environment-secret");
-  assert.equal(calls[0]!.init.redirect, "error");
+  assert.equal(calls[0]!.init.redirect, "manual");
   await probe({ url: "https://custom.example", apiKey: "fixture-custom-key" });
   assert.equal(new Headers(calls[1]!.init.headers).get("x-goog-api-key"), "fixture-custom-key");
-  assert.equal(calls[1]!.init.redirect, "error");
+  assert.equal(calls[1]!.init.redirect, "manual");
 });
 
 test("Google probe restores a masked saved key only for its named original destination", async t => {
@@ -563,23 +564,35 @@ test("Grok ambient credentials require its official origin or an unchanged saved
   assert.equal(calls.length, 2);
   for (const call of calls) {
     assert.equal(new Headers(call.init.headers).get("authorization"), "Bearer fixture-grok-credential");
-    assert.equal(call.init.redirect, "error");
+    assert.equal(call.init.redirect, "manual");
   }
 });
 
 test("a live redirecting custom Google probe never sends its explicit key to the redirect target", async t => {
-  let collected = false;
-  const collector = http.createServer((_req, res) => { collected = true; res.end("{}"); });
+  let collected = 0;
+  let originalCalls = 0;
+  let originalKey: string | string[] | undefined;
+  const collector = http.createServer((req, res) => { collected++; req.resume(); res.end("{}"); });
   await new Promise<void>(resolve => collector.listen(0, "127.0.0.1", resolve));
   const address = collector.address() as import("node:net").AddressInfo;
-  const redirect = http.createServer((_req, res) => res.writeHead(302, { location: `http://127.0.0.1:${address.port}/stolen` }).end());
+  const redirect = http.createServer((req, res) => {
+    originalCalls++;
+    originalKey = req.headers["x-goog-api-key"];
+    req.resume();
+    res.writeHead(302, { location: `http://127.0.0.1:${address.port}/stolen` }).end();
+  });
   await new Promise<void>(resolve => redirect.listen(0, "127.0.0.1", resolve));
   t.after(() => { collector.closeAllConnections(); collector.close(); redirect.closeAllConnections(); redirect.close(); });
   const source = redirect.address() as import("node:net").AddressInfo;
   const f = await fixture(t);
   const response = await fetch(`${f.base}/api/providers/probe`, { method: "POST", headers: f.headers, body: JSON.stringify({ type: "google", auth: "api-key", url: `http://127.0.0.1:${source.port}`, apiKey: "fixture-explicit-secret" }) });
-  assert.equal((await response.json() as { ok: boolean }).ok, false);
-  assert.equal(collected, false);
+  assert.equal(response.status, 403);
+  const body = await response.text();
+  assert.match(body, /redirect refused/i);
+  assert.doesNotMatch(body, /fixture-explicit-secret|\/stolen/);
+  assert.equal(originalCalls, 1, "security refusals do not start a second probe or pagination request");
+  assert.equal(originalKey, "fixture-explicit-secret");
+  assert.equal(collected, 0);
 });
 
 for (const provider of ["google", "anthropic", "openai-compatible"] as const) {

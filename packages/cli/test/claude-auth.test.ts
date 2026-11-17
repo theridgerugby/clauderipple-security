@@ -6,6 +6,9 @@ import os from "node:os";
 import path from "node:path";
 import { claudeAuthPath, readClaudeAuthFile } from "../../router/src/providers/anthropic-token-file.ts";
 import { claudeAccountsPath, saveClaudeOAuthAccount } from "../../router/src/providers/anthropic-accounts.ts";
+import { ClaudeCodeAuthStore, ClaudeCodeCredentialStore } from "../../router/src/providers/anthropic.ts";
+import { ObservedClaudeCodeAuth } from "../../router/src/providers/anthropic-observed.ts";
+import { isClaudeLocalAuthRevoked, readClaudeLocalAuthState } from "../../router/src/providers/anthropic-local-auth.ts";
 import { claudeLogin, claudeLogout, desktopClaudeCodeDirs, latestDesktopClaude, parseSetupToken } from "../src/claude-auth.ts";
 import { posixModes } from "../../../test/capabilities.ts";
 
@@ -107,13 +110,69 @@ test("claude-login invokes PATH claude setup-token and saves only a 0600 credent
   assert.equal(fs.existsSync(claudeAccountsPath(home)), false);
 });
 
-test("setup-token parser rejects prose and extracts only explicit long tokens", () => {
+test("setup-token parser rejects prose and extracts only explicit long tokens", t => {
   assert.equal(parseSetupToken("Login complete"), null);
   assert.equal(parseSetupToken("CLAUDE_CODE_OAUTH_TOKEN=too-short"), null);
   assert.equal(parseSetupToken("Copy this token:\nexport CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-abcdefghijklmnopqrstuvwxyz0123456789\nDo not share it."), "sk-ant-oat01-abcdefghijklmnopqrstuvwxyz0123456789");
   assert.equal(parseSetupToken("sk-ant-oat01-abcdefghijklmnopqrstuvwxyz0123456789 sk-ant-oat01-zyxwvutsrqponmlkjihgfedcba9876543210"), null);
-  assert.equal(claudeLogout(fs.mkdtempSync(path.join(os.tmpdir(), "cr-claude-logout-"))), false);
-  assert.throws(() => claudeLogin("/missing", { binary: "/missing/claude", interactive: true }), /setup-token failed/);
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-claude-logout-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  assert.equal(claudeLogout(home), false);
+  assert.throws(() => claudeLogin(home, { binary: path.join(home, "missing-claude"), interactive: true }), /setup-token failed/);
   // The tray app and the GUI have no terminal; the browser flow cannot run there, so say so up front.
-  assert.throws(() => claudeLogin("/missing", { binary: "/missing/claude", interactive: false }), /needs a terminal/);
+  assert.throws(() => claudeLogin(home, { binary: path.join(home, "missing-claude"), interactive: false }), /needs a terminal/);
+});
+
+test("CLI logout suppresses live borrowed and observed authority until an explicit CLI reconnect", t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-cli-consent-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  let reads = 0;
+  const observed = new ObservedClaudeCodeAuth(path.join(home, "claude-auth-observed.json"));
+  const credentials = new ClaudeCodeCredentialStore(() => {
+    reads++;
+    return JSON.stringify({ claudeAiOauth: { accessToken: "synthetic-borrowed-token", expiresAt: 1_000_000 } });
+  }, () => 1);
+  const store = new ClaudeCodeAuthStore(credentials, { home, observed, env: {}, now: () => 1 });
+  assert.ok(!(store.get() instanceof Error));
+  assert.equal(reads, 1);
+  observed.observe(["authorization", "Bearer synthetic-observed-token"], 1);
+  assert.ok(observed.getFresh(1));
+  assert.equal(claudeLogout(home), false, "no upstream account or OS credential is removed");
+  assert.equal(isClaudeLocalAuthRevoked(home), true);
+  assert.ok(store.get() instanceof Error);
+  assert.equal(observed.getFresh(1), null);
+  observed.observe(["authorization", "Bearer synthetic-new-traffic"], 2);
+  assert.equal(observed.getFresh(2), null);
+  assert.equal(reads, 1, "logout does not immediately re-read the client-owned credential");
+  const epoch = readClaudeLocalAuthState(home).generation;
+  const token = "sk-ant-oat01-synthetic_reconnected_1234567890";
+  claudeLogin(home, { binary: "synthetic-unused-binary", run: () => token });
+  assert.equal(isClaudeLocalAuthRevoked(home), false);
+  assert.notEqual(readClaudeLocalAuthState(home).generation, epoch);
+  assert.equal(readClaudeAuthFile(home)?.token, token);
+  assert.ok(!(store.get() instanceof Error));
+  assert.equal(reads, 2, "the existing live store notices the explicit reconnect generation");
+  assert.equal(observed.getFresh(2), null, "reconnect never revives a pre-logout observed token");
+});
+
+test("CLI setup-token cannot checkpoint a result after another process logs out", t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-cli-consent-race-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  assert.throws(() => claudeLogin(home, {
+    binary: "synthetic-unused-binary",
+    run: () => {
+      claudeLogout(home);
+      return "sk-ant-oat01-synthetic_obsolete_1234567890";
+    },
+  }), /authorization changed during sign-in/);
+  assert.equal(isClaudeLocalAuthRevoked(home), true);
+  assert.equal(readClaudeAuthFile(home), null);
+});
+
+test("native CLI OAuth reconnect authorizes before constructing its generation-bound session", () => {
+  const source = fs.readFileSync(path.resolve(import.meta.dirname, "../src/index.ts"), "utf8");
+  const branch = source.slice(source.indexOf('case "claude-login":'), source.indexOf('case "claude-logout":'));
+  const authorize = branch.indexOf("authorizeClaudeLocalAuth(homeDir())");
+  const construct = branch.indexOf("new ClaudeOAuthSession(");
+  assert.ok(authorize >= 0 && construct > authorize);
 });

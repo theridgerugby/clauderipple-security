@@ -15,6 +15,7 @@
 // stub and nothing here reaches the network on its own.
 
 import crypto from "node:crypto";
+import { guardEgressFetch, isEgressPolicyError } from "./egress.ts";
 
 /** One wire to try for a model, and the base URL that wire is served on. */
 export type WireCandidate = { wire: "chat" | "responses" | "anthropic"; url: string; authHeader?: "x-api-key" | "authorization-bearer" };
@@ -141,9 +142,12 @@ export function refusedByPlan(detail: string): boolean {
 async function candidateLevels(id: string, candidate: WireCandidate, ladder: string[], deps: MeasureDeps): Promise<string[]> {
   let listed: string[] = [];
   try {
-    const response = await deps.fetch(endpointFor(candidate.wire, candidate.url), { method: "POST", headers: requestHeaders(candidate, deps), body: requestBody(candidate.wire, id, NOT_A_LEVEL) });
+    const response = await guardEgressFetch(deps.fetch)(endpointFor(candidate.wire, candidate.url), { method: "POST", headers: requestHeaders(candidate, deps), body: requestBody(candidate.wire, id, NOT_A_LEVEL) });
     if (!response.ok) listed = parseLevels(await response.text());
-  } catch { /* the endpoint said nothing; fall back to everything known */ }
+  } catch (error) {
+    if (isEgressPolicyError(error)) throw error;
+    /* the endpoint said nothing; fall back to everything known */
+  }
   return canonicalOrder(listed.length > 0 ? listed : [...ladder, ...KNOWN_EFFORTS]);
 }
 
@@ -175,8 +179,9 @@ async function discoverLadder(id: string, candidate: WireCandidate, deps: Measur
   const url = endpointFor(candidate.wire, candidate.url);
   let probe: Response;
   try {
-    probe = await deps.fetch(url, { method: "POST", headers: requestHeaders(candidate, deps), body: requestBody(candidate.wire, id, NOT_A_LEVEL) });
-  } catch {
+    probe = await guardEgressFetch(deps.fetch)(url, { method: "POST", headers: requestHeaders(candidate, deps), body: requestBody(candidate.wire, id, NOT_A_LEVEL) });
+  } catch (error) {
+    if (isEgressPolicyError(error)) throw error;
     return undefined;
   }
   if (probe.ok) return [];
@@ -187,8 +192,9 @@ async function discoverLadder(id: string, candidate: WireCandidate, deps: Measur
   for (const level of canonicalOrder(listed.length > 0 ? listed : KNOWN_EFFORTS)) {
     let response: Response;
     try {
-      response = await deps.fetch(url, { method: "POST", headers: requestHeaders(candidate, deps), body: requestBody(candidate.wire, id, level) });
-    } catch {
+      response = await guardEgressFetch(deps.fetch)(url, { method: "POST", headers: requestHeaders(candidate, deps), body: requestBody(candidate.wire, id, level) });
+    } catch (error) {
+      if (isEgressPolicyError(error)) throw error;
       unsettled = true;
       continue;
     }
@@ -266,12 +272,13 @@ export function parseOllamaShow(value: unknown): OllamaFacts {
 export async function ollamaModelFacts(base: string, id: string, deps: MeasureDeps): Promise<OllamaFacts | undefined> {
   let response: Response;
   try {
-    response = await deps.fetch(`${base.replace(/\/+$/, "")}/api/show`, {
+    response = await guardEgressFetch(deps.fetch)(`${base.replace(/\/+$/, "")}/api/show`, {
       method: "POST",
       headers: requestHeaders({ wire: "chat", url: base }, deps),
       body: JSON.stringify({ model: id }),
     });
-  } catch {
+  } catch (error) {
+    if (isEgressPolicyError(error)) throw error;
     return undefined;
   }
   if (!response.ok) return undefined;
@@ -295,8 +302,9 @@ async function measureLadder(id: string, candidate: WireCandidate, ladder: strin
   for (const level of await candidateLevels(id, candidate, ladder, deps)) {
     let response: Response;
     try {
-      response = await deps.fetch(url, { method: "POST", headers: requestHeaders(candidate, deps), body: requestBody(candidate.wire, id, level) });
-    } catch {
+      response = await guardEgressFetch(deps.fetch)(url, { method: "POST", headers: requestHeaders(candidate, deps), body: requestBody(candidate.wire, id, level) });
+    } catch (error) {
+      if (isEgressPolicyError(error)) throw error;
       supported.push(level); // transient — keep
       continue;
     }
@@ -323,8 +331,9 @@ export async function measureModel(id: string, candidates: WireCandidate[], ladd
   for (const candidate of candidates) {
     let response: Response;
     try {
-      response = await deps.fetch(endpointFor(candidate.wire, candidate.url), { method: "POST", headers: requestHeaders(candidate, deps), body: requestBody(candidate.wire, id) });
+      response = await guardEgressFetch(deps.fetch)(endpointFor(candidate.wire, candidate.url), { method: "POST", headers: requestHeaders(candidate, deps), body: requestBody(candidate.wire, id) });
     } catch (e) {
+      if (isEgressPolicyError(e)) throw e;
       failure = `network: ${errorText(e)}`;
       continue;
     }

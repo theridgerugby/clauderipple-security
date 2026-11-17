@@ -11,7 +11,10 @@ import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
-import { ConfigStore, DEFAULTS, homeDir, configPath } from "../../router/src/config.ts";
+import { ConfigStore, DEFAULTS, homeDir, configPath, normalizeConfig } from "../../router/src/config.ts";
+import { readInstallationId } from "../../router/src/installation-id.ts";
+import { writeSecretJsonAtomic } from "../../router/src/locked-file.ts";
+import { configurePersonalEgressPolicy, personalMode } from "../../router/src/personal-policy.ts";
 import { adminPort } from "../../router/src/admin.ts";
 import { CLI_WINDOW_MAX } from "../../router/src/bootstrap.ts";
 import { certsExist, certPaths, generateCerts } from "./certs.ts";
@@ -34,10 +37,13 @@ import { openBrowser } from "./browser.ts";
 import { electronPath, installTrayRuntime, startTray } from "./tray.ts";
 import { dropPowerShellShim, installKind, isNewer, latestVersion, PACKAGE, runUpdate } from "./update.ts";
 import { ClaudeOAuthSession } from "../../router/src/providers/claude-oauth.ts";
+import { authorizeClaudeLocalAuth } from "../../router/src/providers/anthropic-local-auth.ts";
 import { requestHostUpdate } from "../../remote/src/host-update.ts";
 import { purgeHome } from "./purge.ts";
 import { adminFetch, openAdminDashboard } from "./admin-client.ts";
 import { recordAdminRuntime } from "./admin-runtime.ts";
+import { captureRouterCodeIdentity, verifyAndApplyInstall } from "./install-runtime.ts";
+import { assertPersonalCliCommandAllowed, SECURITY_USAGE, updateApprovedOrigin } from "./security-config.ts";
 
 async function pickerOn(): Promise<void> {
   const home = homeDir();
@@ -144,16 +150,7 @@ function starterConfig(port: number): string {
   return JSON.stringify(
     {
       $docs: "https://github.com/PBJ-2/clauderipple/blob/main/docs/ARCHITECTURE.md",
-      listen: { host: "127.0.0.1", port },
-      upstream: DEFAULTS.upstream,
-      providers: {},
-      routes: {},
-      direct: [],
-      aliases: {},
-      effortClamp: DEFAULTS.effortClamp,
-      cli: { extraModels: [] },
-      health: DEFAULTS.health,
-      log: DEFAULTS.log,
+      ...normalizeConfig({ ...DEFAULTS, listen: { host: "127.0.0.1", port }, providers: {}, routes: {}, direct: [], aliases: {}, cli: { extraModels: [] } }),
     },
     null,
     2,
@@ -202,17 +199,6 @@ async function image(): Promise<void> {
   console.log(out);
 }
 
-/** The version the router on this admin port reports, or null when it does not answer. */
-async function runningVersion(port: number): Promise<string | null> {
-  try {
-    const res = await adminFetch(`http://127.0.0.1:${port}/api/status`, { signal: AbortSignal.timeout(10_000) }, path.dirname(configPath()));
-    const version = res.ok ? ((await res.json()) as { version?: unknown }).version : null;
-    return typeof version === "string" ? version : null;
-  } catch {
-    return null;
-  }
-}
-
 function proxyUrlFor(port: number): string {
   return `http://127.0.0.1:${port}`;
 }
@@ -229,7 +215,7 @@ async function install(): Promise<void> {
   } else console.log("✓ certificates already present");
 
   if (!fs.existsSync(configPath())) {
-    fs.writeFileSync(configPath(), starterConfig(port), { mode: 0o600 });
+    writeSecretJsonAtomic(configPath(), JSON.parse(starterConfig(port)));
     console.log(`✓ starter config written: ${configPath()}`);
   } else console.log(`✓ config kept: ${configPath()}`);
 
@@ -242,6 +228,9 @@ async function install(): Promise<void> {
   // A foreign proxy is still refused here, before anything is registered.
   const direct = fs.existsSync(path.join(home, "direct.json"));
   if (!direct) checkProxyEnv({ proxyUrl, force: flag("force") });
+  // Captured before registration/start, then checked against the live process and read again
+  // before settings change. The version is shared with upstream and cannot identify this code.
+  const expectedCodeIdentity = captureRouterCodeIdentity(installedRuntime);
 
   // Persist the single execution contract so the GUI, admin API, hooks, and supervisor all use
   // this installation's runtime rather than any Node installation on the user's PATH.
@@ -265,7 +254,7 @@ async function install(): Promise<void> {
   // and believe it only once the router's process exists (supervisor.startRouter).
   // Durable before the successor router starts: its own completion does not imply host application.
   try {
-    requestHostUpdate(home, VERSION);
+    if (!personalMode(cfg)) requestHostUpdate(home, VERSION);
   } catch (error) {
     // Bookkeeping for the phone host must never abort an install (issue #125: one refused rename
     // skipped the router restart, the probe and settings). The router retries it once the record
@@ -276,38 +265,56 @@ async function install(): Promise<void> {
   console.log(
     started === "failed" ? `✗ could not start the router (${supervisorName()})`
     : started === "started-directly" ? `! router started without the ${supervisorName()}. ${resupervise()}`
-    : `✓ router ${started === "already-running" ? "already running" : "started"}`,
+    : started === "already-running" || started === "started" ? `✓ router ${started === "already-running" ? "already running" : "started"}`
+    : describeOwnership(started),
   );
-  // Running the installer again is how an update arrives, and it replaces files, not the process:
-  // a router left alone keeps serving the old code until the next login. Restart one that
-  // answers with another version.
-  if (started === "already-running") {
-    const running = await runningVersion(adminPort(cfg));
-    if (running && running !== VERSION) {
-      console.log(`  the running router is ${running}; restarting it on ${VERSION}`);
-      const restarted = restartAgent({ onProgress: (m) => console.log(`  ${m}`) });
-      console.log(describeRestart(restarted));
-      if (restarted === "failed") {
-        // The old router may still be answering, so the probe below would pass and the installer
-        // would report a version it never switched to — what the tray showed as "updated" while
-        // the version stayed old until `repair` (#62, #80).
-        process.exitCode = 1;
-        console.log(`${settingsPath()} was left as it was: the router was not switched to ${VERSION}. Run \`clauderipple restart\`, then install again.`);
-        return;
-      }
-    }
-  }
-
-  const p = await probeWithRetry({ host: cfg.listen.host, port: cfg.listen.port, caPem: caPath, upstream: cfg.upstream });
-  console.log(p.ok ? `✓ end-to-end probe passed (${p.detail}, ${p.ms}ms)` : `✗ probe failed: ${p.detail}`);
-  if (!p.ok) {
+  let edit: ReturnType<typeof applyProxyEnv>;
+  let applyingSettings = false;
+  try {
+    edit = await verifyAndApplyInstall({
+      started,
+      target: { version: VERSION, node: installedRuntime.node, router: installedRuntime.router,
+        codeIdentity: expectedCodeIdentity, listen: cfg.listen, upstream: cfg.upstream },
+      deps: {
+        status: async signal => {
+          const response = await adminFetch(`http://127.0.0.1:${adminPort(cfg)}/api/status`, { signal }, home);
+          if (!response.ok) { await response.body?.cancel(); throw new Error("Secure router status was refused"); }
+          return response.json();
+        },
+        installationId: () => readInstallationId(home),
+        captureIdentity: () => captureRouterCodeIdentity(installedRuntime),
+        restart: () => {
+          console.log("  the authenticated router is running different code; requesting an ownership-checked restart");
+          return restartAgent({ onProgress: m => console.log(`  ${m}`), home });
+        },
+        onRestart: result => console.log(describeRestart(result)),
+      },
+      probe: () => probeWithRetry({ host: cfg.listen.host, port: cfg.listen.port, caPem: caPath, upstream: cfg.upstream }),
+      onProbe: result => console.log(result.ok ? `✓ end-to-end probe passed (${result.detail}, ${result.ms}ms)` : `✗ probe failed: ${result.detail}`),
+      // The cap sits at Claude Code's per-model ceiling (CLI_WINDOW_MAX). No client state is
+      // changed until the live identity remains the same across the data-plane probe.
+      apply: () => {
+        applyingSettings = true;
+        return applyProxyEnv({ proxyUrl, caPath, force: flag("force"), maxContextTokens: maxCtx ? Number(maxCtx) : CLI_WINDOW_MAX,
+          models: cfg.cli.models ?? {}, respectDirect: true, home });
+      },
+    });
+  } catch (error) {
     process.exitCode = 1;
-    console.log(`${settingsPath()} was left as it was, so Claude Code does not depend on a router that is not answering. Fix the router, then run install again.`);
+    console.error(`✗ installation verification failed: ${(error as Error).message}`);
+    console.log(applyingSettings
+      ? `The verified router is running, but the client settings update failed. Inspect ${settingsPath()} and its backup before retrying; a completed settings write has not been rolled back automatically.`
+      : `${settingsPath()} was left as it was. Private setup files or a service registration may have been created; no client proxy change was applied. Confirm the fixed source, stop only a known older installation using its own controls, then retry.`);
     return;
   }
-  // The cap sits at Claude Code's ceiling for a per-model window, so each routed model compacts at
-  // its own window from the bootstrap (CLI_WINDOW_MAX); a flag still sets another.
-  const edit = applyProxyEnv({ proxyUrl, caPath, force: flag("force"), maxContextTokens: maxCtx ? Number(maxCtx) : CLI_WINDOW_MAX, models: cfg.cli.models ?? {}, respectDirect: true, home });
+  console.log(`✓ authenticated router code verified (${expectedCodeIdentity.sha256.slice(0, 12)})`);
+  const installedProxy = currentProxyEnv();
+  if (!direct && (installedProxy.HTTPS_PROXY !== proxyUrl || installedProxy.NODE_EXTRA_CA_CERTS !== caPath)) {
+    process.exitCode = 1;
+    console.error(`✗ the verified router is running, but ${settingsPath()} does not point at it; installation is incomplete`);
+    for (const note of edit.notes) console.log(`  note: ${note}`);
+    return;
+  }
   console.log(edit.changed ? `✓ ${settingsPath()} updated (backup: ${edit.backup ?? "none"})` : `✓ ${settingsPath()} already correct`);
   for (const n of edit.notes) console.log(`  note: ${n}`);
   // Something to double-click for the menu-bar app, which is what offers repair when the router is
@@ -322,7 +329,7 @@ async function install(): Promise<void> {
   // The phone host has the same problem as the router above: new files, old process. The host
   // decides whether it is ours and idle (remote host-service refreshPlan). Never fatal.
   try {
-    execFileSync(installedRuntime.node, [installedRuntime.cli, "remote", "refresh"], { env: { ...process.env, ...installedRuntime.env }, stdio: "inherit" });
+    if (!personalMode(cfg)) execFileSync(installedRuntime.node, [installedRuntime.cli, "remote", "refresh"], { env: { ...process.env, ...installedRuntime.env }, stdio: "inherit" });
   } catch {
     console.log("  호스트 적용 대기: 진행 중인 작업을 유지하며 자동으로 다시 시도합니다.");
   }
@@ -720,7 +727,11 @@ function help(): void {
   config            print the config file path
   ui                open the installed native dashboard (no browser fallback)
   tray [--install]  start the menu-bar / tray app (--install fetches Electron, ~270MB, once)
-  update [--check]  install the latest version the way this one was installed (--check only reports)
+  update --check   report available versions (executable updates are disabled in personal mode)
+  security approve-origin <https-origin> --acknowledge-data-sharing
+                   explicitly allow sensitive data to one exact HTTPS origin before first install
+  security revoke-origin <https-origin>
+                   block future outbound attempts to that origin
   login             add a ChatGPT account (opens your browser; run again to add another — they take turns when one runs out)
   logout            forget every ChatGPT account added with "login" (the Codex CLI's own login is left alone)
   claude-login      connect a Claude subscription in the browser (--setup-token: via \`claude setup-token\`; --manual: paste the code)
@@ -747,7 +758,24 @@ Home directory: ${homeDir()}  (override with CLAUDERIPPLE_HOME)`);
 }
 
 async function dispatchCommand(): Promise<void> {
+  // withCommandHelp has already returned for --help/-h. Plain help also reads no private state.
+  if (cmd !== "help") {
+    const policyStore = new ConfigStore(configPath());
+    configurePersonalEgressPolicy(() => policyStore.get().security);
+    assertPersonalCliCommandAllowed(policyStore.get(), args);
+  }
   switch (cmd) {
+    case "security": {
+      const action = args[1], origin = args[2];
+      if ((action !== "approve-origin" && action !== "revoke-origin") || !origin ||
+          args.slice(3).some(argument => argument !== "--acknowledge-data-sharing")) throw new Error(SECURITY_USAGE);
+      const result = updateApprovedOrigin({ file: configPath(), action, origin,
+        acknowledgeDataSharing: flag("acknowledge-data-sharing") });
+      console.log(action === "approve-origin"
+        ? `${result.changed ? "Approved" : "Already approved"}: ${result.origin}. Requests to this origin may carry model inputs and credentials.`
+        : `${result.changed ? "Revoked" : "Not approved"}: ${result.origin}. Future outbound attempts to this origin are blocked.`);
+      break;
+    }
     case "remote": {
       const sub = args[1];
       // Remote (SSH) hosts for Claude Desktop sessions; every other `remote` verb is the phone host's.
@@ -912,6 +940,7 @@ async function dispatchCommand(): Promise<void> {
       }
       // Our own browser sign-in (PKCE). No terminal interaction unless the loopback port is taken,
       // in which case the code from Anthropic's page is pasted here.
+      authorizeClaudeLocalAuth(homeDir());
       const session = new ClaudeOAuthSession({ home: homeDir(), manual: flag("manual") });
       const { url, manual } = await session.start();
       console.log(manual ? "Opening your browser to sign in to Claude. Paste the code it shows below." : "Opening your browser to sign in to Claude. This window waits up to 5 minutes.");

@@ -6,7 +6,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { readPrivateFile } from "../private-file.ts";
-import { writeJsonAtomic } from "../locked-file.ts";
+import { migrateSecretFile, writeSecretJsonAtomic } from "../locked-file.ts";
 
 export type ClaudeAuthFile =
   | { token: string; createdAt: string; source: "setup-token" }
@@ -25,6 +25,7 @@ export function claudeAuthPath(home: string): string {
 
 export function readClaudeAuthFile(home: string): ClaudeAuthFile | null {
   try {
+    migrateSecretFile(claudeAuthPath(home));
     const raw = JSON.parse(readPrivateFile(claudeAuthPath(home)).toString("utf8")) as Partial<ClaudeAuthFile> & { refreshToken?: unknown; expiresAt?: unknown };
     if (typeof raw.token !== "string" || raw.token.length === 0 || typeof raw.createdAt !== "string") return null;
     if (raw.source === "setup-token") return { token: raw.token, createdAt: raw.createdAt, source: "setup-token" };
@@ -38,7 +39,7 @@ export function readClaudeAuthFile(home: string): ClaudeAuthFile | null {
 }
 
 function writeClaudeAuthFile(home: string, value: ClaudeAuthFile): void {
-  writeJsonAtomic(claudeAuthPath(home), value);
+  writeSecretJsonAtomic(claudeAuthPath(home), value);
 }
 
 export function saveClaudeAuthFile(home: string, token: string, createdAt = new Date().toISOString()): void {
