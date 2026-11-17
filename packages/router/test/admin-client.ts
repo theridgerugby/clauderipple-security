@@ -37,10 +37,9 @@ export async function startAdmin(deps: AdminDeps): ReturnType<typeof startServer
       headers: { ...adminAuthHeaders(home), [ADMIN_INSTANCE_HEADER]: endpoint.instanceId },
       tlsPort: server.tlsPort, ca: identity.caCertPem, checkServerIdentity,
       // Windows DPAPI/ACL assertions can block this test process for seconds between requests.
-      // Reusing an idle TLS socket across those synchronous OS calls races the server's idle
-      // timeout and produces an unrelated `fetch failed` (ECONNRESET) under hosted CI load.
-      // Every fixture request still performs certificate verification and the same API checks.
-      agent: new Agent({ connect: { ca: identity.caCertPem, rejectUnauthorized: true, checkServerIdentity }, pipelining: 0 }),
+      // Each synthetic request below asks the server to close its connection, preventing reuse
+      // of stale idle sockets while keeping Undici's supported HTTP parser/pipelining defaults.
+      agent: new Agent({ connect: { ca: identity.caCertPem, rejectUnauthorized: true, checkServerIdentity } }),
       endpoint, identity,
     };
     const origins = ["127.0.0.1", "localhost", "[::1]"].flatMap(host => [
@@ -81,6 +80,10 @@ async function fixtureFetch(input: Parameters<typeof globalThis.fetch>[0], init:
   const transport = transports.get(url.origin);
   if (!transport) return globalThis.fetch(input, init);
   const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+  // A response may arrive just before a long synchronous Windows DPAPI operation. Recycling the
+  // previous idle socket afterward races the server timeout; a new connection is deterministic.
+  // Explicit Connection headers in attack-shaped tests retain their original values.
+  if (!headers.has("connection")) headers.set("connection", "close");
   // Attack-shaped headers must reach the real listener unchanged instead of being stripped or
   // replaced by the production client's safe header policy. Ordinary requests use that client.
   const explicitBoundaryHeaders = ["origin", "host", "sec-fetch-site", ADMIN_TOKEN_HEADER, ADMIN_INSTANCE_HEADER].some(name => headers.has(name));
