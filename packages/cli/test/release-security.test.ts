@@ -88,9 +88,12 @@ test("personal Windows validation is mandatory and upstream publishing is disabl
   assert.doesNotMatch(ci, /continue-on-error/);
   assert.match(ci, /npm ci --ignore-scripts/);
   assert.match(ci, /npm audit --audit-level=low/);
-  assert.match(ci, /run: npm run test:ci/);
   const scripts = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).scripts;
   assert.equal(scripts["test:ci"], scripts.test.replace("node --test ", "node --test --test-reporter=tap "), "CI must run the identical full suite with immediate failure diagnostics");
+  assert.match(ci, /shard: \[1, 2, 3, 4\]/);
+  const expectedShardedRun = "run: node --test --test-reporter=tap --test-shard=" +
+    "${{ matrix.shard }}/4 " + scripts["test:ci"].replace(/^node --test --test-reporter=tap /, "");
+  assert.ok(ci.includes(expectedShardedRun), "every Windows shard must use the complete canonical CI file list with the shard flag before positional paths");
   assert.match(ci, /run: npm run test:native --workspace @clauderipple\/app/);
   assert.doesNotMatch(ci, /--no-sandbox/);
   const native = ci.slice(ci.indexOf("\n  native-security:"));

@@ -3,7 +3,7 @@
 This fork targets one person's Windows computer, installed from a fixed reviewed source commit.
 Use [the source installation guide](personal-windows-install.md), including its native acceptance
 checks. The full commit and observed hosted test results are recorded in
-[the fork PR](https://github.com/theridgerugby/clauderipple-security/pull/1). A matching package
+[the Windows personal fork PR](https://github.com/theridgerugby/clauderipple-security/pull/2). A matching package
 version alone does not identify this fork.
 
 ## Enforced boundaries

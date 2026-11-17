@@ -24,13 +24,16 @@ concurrency:
 
 jobs:
   test:
-    name: test (${{ matrix.os }})
+    name: test (${{ matrix.os }}, shard ${{ matrix.shard }}/4)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest]
+        # Native Windows DPAPI/ACL fixtures run much more slowly than on Unix.
+        # Node's file-level test sharding keeps every test while bounding each runner.
+        shard: [1, 2, 3, 4]
     env:
       # Dependency hooks remain disabled. Only the pinned Electron downloader below is invoked.
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
@@ -57,7 +60,9 @@ jobs:
       # maintainer step on a machine that has the engine.
       - run: npm run check:mod
       # TAP emits each failed assertion immediately, even if a later fixture hangs.
-      - run: npm run test:ci
+      # Node parses --test-shard only before positional test paths. Keep the test-file list
+      # identical to test:ci; appending the flag through `npm run ... --` silently ran all files.
+      - run: node --test --test-reporter=tap --test-shard=${{ matrix.shard }}/4 packages/router/test/*.test.ts packages/cli/test/*.test.ts test/mod/*.test.ts packages/remote/test/*.test.ts packages/app/test/*.test.ts
       - run: npm run build
 
   # Collect real desktop-boundary evidence even while a platform's full suite is
