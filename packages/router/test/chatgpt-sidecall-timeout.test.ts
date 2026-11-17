@@ -31,7 +31,7 @@ function isFixtureAclCall(home: string, command: unknown, args: unknown, options
   if (!options || typeof options !== "object" || Array.isArray(options)) return false;
   const opts = options as Record<string, unknown>;
   if (Object.keys(opts).sort().join(",") !== "encoding,input,maxBuffer,timeout,windowsHide" ||
-      opts.encoding !== "utf8" || opts.timeout !== 10_000 || opts.maxBuffer !== 16 * 1024 || opts.windowsHide !== true ||
+      opts.encoding !== "utf8" || opts.timeout !== 30_000 || opts.maxBuffer !== 16 * 1024 || opts.windowsHide !== true ||
       typeof opts.input !== "string" || opts.input.length > 128 * 1024) return false;
   let request: unknown;
   try { request = JSON.parse(opts.input); } catch { return false; }
@@ -122,7 +122,7 @@ test("the credential-isolation exception accepts only the fixed private ACL help
   const command = path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   const args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_PRIVATE_ACL_SCRIPT];
   const options = { input: JSON.stringify({ path: path.join(home, "account.json"), directory: false }),
-    encoding: "utf8", timeout: 10_000, maxBuffer: 16 * 1024, windowsHide: true };
+    encoding: "utf8", timeout: 30_000, maxBuffer: 16 * 1024, windowsHide: true };
   assert.equal(isFixtureAclCall(home, command, args, options, root), true);
   assert.equal(isFixtureAclCall(home, command, args, { ...options, input: JSON.stringify({ path: home, directory: true, verifyOnly: true }) }, root), true);
   for (const unsafe of ["powershell.exe", "security", "cmdkey.exe", `${command}.exe`]) {
@@ -132,7 +132,7 @@ test("the credential-isolation exception accepts only the fixed private ACL help
     assert.equal(isFixtureAclCall(home, command, altered, options, root), false);
   }
   for (const altered of [
-    { ...options, shell: true }, { ...options, env: {} }, { ...options, timeout: 0 },
+    { ...options, shell: true }, { ...options, env: {} }, { ...options, timeout: 0 }, { ...options, timeout: 10_000 },
     { ...options, maxBuffer: Infinity }, { ...options, encoding: "buffer" }, { ...options, windowsHide: false },
     { ...options, input: "malformed" },
     ...[path.join(home, "..", "outside.json"), path.join(`${home}-sibling`, "account.json"), "relative.json"].map(file =>
