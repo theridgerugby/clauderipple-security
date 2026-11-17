@@ -88,6 +88,22 @@ test("the complete actual builder-copied resource tree independently passes runt
   assert.equal(verifyRuntimeClosure(copiedRuntime).dependencies.length, verifyRuntimeClosure(runtime).dependencies.length);
 });
 
+test("trusted parent aliases use canonical containment without accepting links within the runtime", () => {
+  const alias = path.join(temporary, "aliased-resource-parent");
+  fs.symlinkSync(path.dirname(runtime), alias, process.platform === "win32" ? "junction" : "dir");
+  const aliasedRoot = path.join(alias, path.basename(runtime));
+  assert.equal(verifyRuntimeClosure(aliasedRoot).dependencies.length, verifyRuntimeClosure(runtime).dependencies.length);
+  const linkedRoot = path.join(temporary, "linked-runtime-root");
+  fs.symlinkSync(runtime, linkedRoot, process.platform === "win32" ? "junction" : "dir");
+  assert.throws(() => verifyRuntimeClosure(linkedRoot), /not an independent directory/);
+  const outside = path.join(temporary, "outside-runtime-tree");
+  fs.mkdirSync(outside);
+  const link = path.join(runtime, "packages/remote/src/untrusted-link");
+  fs.symlinkSync(outside, link, process.platform === "win32" ? "junction" : "dir");
+  try { assert.throws(() => verifyRuntimeClosure(aliasedRoot), /symbolic link/); }
+  finally { fs.unlinkSync(link); }
+});
+
 test("packaged CLI and Remote help run with no checkout ancestor, NODE_PATH or user state", () => {
   assert.equal(fs.existsSync(path.join(temporary, "node_modules")), false);
   const state = path.join(temporary, "empty-home");

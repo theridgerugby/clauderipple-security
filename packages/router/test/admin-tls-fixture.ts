@@ -9,9 +9,11 @@ import { once } from "node:events";
 import { ensureAdminToken } from "../src/admin-auth.ts";
 import { ensureAdminTlsIdentity, writeAdminEndpoint, type AdminEndpoint } from "../src/admin-transport-state.ts";
 
-export async function adminTlsFixture(t: TestContext, handler: RequestListener = (_req, res) => res.end('{"ok":true}')) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-admin-tls-"));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+export async function adminTlsFixture(t: TestContext, handler: RequestListener = (_req, res) => res.end('{"ok":true}'), options: { home?: string } = {}) {
+  const home = options.home ?? fs.mkdtempSync(path.join(os.tmpdir(), "ripple-admin-tls-"));
+  // A caller-owned home may also contain its supervisor/settings fixture. Its owner
+  // retains cleanup responsibility; this helper only closes its own TLS listener.
+  if (options.home === undefined) t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const token = ensureAdminToken(home);
   const identity = ensureAdminTlsIdentity(home);
   const server = https.createServer({ key: identity.keyPem, cert: identity.certPem, minVersion: "TLSv1.2" }, handler);

@@ -90,6 +90,13 @@ test("release permissions are isolated from builds and every supported OS is a m
   assert.match(ci, /npm audit --audit-level=low/);
   assert.match(ci, /xvfb-run -a npm run test:native/);
   assert.doesNotMatch(ci, /--no-sandbox/);
+  const native = ci.slice(ci.indexOf("\n  native-security:"));
+  assert.ok(ci.indexOf("\n  native-security:") > 0, "native checks have an independent job");
+  assert.match(native, /os: \[macos-latest, ubuntu-latest, windows-latest\]/);
+  assert.match(native, /npm ci --ignore-scripts/);
+  assert.match(native, /run: npm run build/);
+  assert.match(native, /runner\.os != 'Linux'/);
+  assert.doesNotMatch(native, /needs:|continue-on-error|if:.*(?:failure|cancelled)/);
   const source = fs.readFileSync(path.join(root, ".github/workflows/publish.yml"), "utf8");
   const start = source.indexOf("\n  publish:");
   const end = source.indexOf("\n  dry-run:");

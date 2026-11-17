@@ -13,9 +13,36 @@ import { LocalControl, localSecret } from "../src/local-control.ts";
 import { loadConfig, saveConfig } from "../src/config.ts";
 import { localControlHome, localControlRequest, readLocalControlState } from "../src/local-transport.ts";
 import { controlShutdown, hostStatus } from "../src/host-service.ts";
-import { ensureAdminTlsIdentity, readAdminEndpoint, writeAdminEndpoint } from "../../router/src/admin-transport-state.ts";
+import { ensureAdminTlsIdentity, readAdminEndpoint, writeAdminEndpoint, type AdminEndpoint } from "../../router/src/admin-transport-state.ts";
 import { ADMIN_TOKEN_HEADER } from "../../router/src/admin-auth.ts";
 import { posixModes } from "../../../test/capabilities.ts";
+
+/** Test metadata only: never select the existing TLS listener as the replacement public port. */
+function differentPublicPort(endpoint: Pick<AdminEndpoint, "publicPort" | "tlsPort">): number {
+  // Two consecutive candidates suffice because only one can equal the TLS port. Wrapping
+  // keeps boundary fixtures in the valid 1..65535 range without allocating another listener.
+  for (let offset = 1; offset <= 2; offset++) {
+    const candidate = ((endpoint.publicPort - 1 + offset) % 65_535) + 1;
+    if (candidate !== endpoint.tlsPort) return candidate;
+  }
+  throw new Error("could not select a distinct fixture port");
+}
+
+test("replacement public-port fixtures exclude adjacent TLS ports and wrap the 65535 boundary", () => {
+  for (const [publicPort, tlsPort, expected] of [
+    [50_000, 50_001, 50_002],
+    [65_534, 65_535, 1],
+    [65_535, 1, 2],
+    [65_535, 65_534, 1],
+    [1, 2, 3],
+  ] as const) {
+    const actual = differentPublicPort({ publicPort, tlsPort });
+    assert.equal(actual, expected);
+    assert.ok(Number.isInteger(actual) && actual >= 1 && actual <= 65_535);
+    assert.notEqual(actual, publicPort);
+    assert.notEqual(actual, tlsPort);
+  }
+});
 
 async function fixture(t: import("node:test").TestContext) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-host-tls-"));
@@ -144,7 +171,7 @@ test("a port-replacement server receives neither local capability nor request bo
 test("missing, mismatched or permissive private discovery cannot fall back to the public HTTP listener", async t => {
   const f = await fixture(t);
   const endpoint = readAdminEndpoint(f.home)!;
-  writeAdminEndpoint(f.home, { ...endpoint, publicPort: endpoint.publicPort === 65535 ? 65534 : endpoint.publicPort + 1 });
+  writeAdminEndpoint(f.home, { ...endpoint, publicPort: differentPublicPort(endpoint) });
   await assert.rejects(async () => localControlRequest(f.dir, "/local/status"), /mismatched/);
   writeAdminEndpoint(f.home, endpoint);
   if (posixModes) {
@@ -215,7 +242,7 @@ test("an authenticated stop receipt survives a configured port change but reject
   const endpoint = readAdminEndpoint(f.home)!;
   await f.local.close();
   const receipt = await controlShutdown(f.dir);
-  const nextPort = f.cfg.port === 65535 ? 65534 : f.cfg.port + 1;
+  const nextPort = differentPublicPort(endpoint);
   saveConfig({ ...f.cfg, port: nextPort }, f.dir);
   assert.doesNotThrow(() => receipt.assertStillStopped());
   assert.throws(() => readLocalControlState(f.dir), /mismatched/, "ordinary callers retain the config-port fence");

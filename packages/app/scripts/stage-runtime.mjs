@@ -121,6 +121,12 @@ function imports(file) {
 
 /** Checks every runtime source import plus each production package's required dependencies/peers. */
 export function verifyRuntimeClosure(root) {
+  const rootInfo = fs.lstatSync(root);
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw new Error("Runtime root is not an independent directory");
+  // macOS exposes temporary directories through /var -> /private/var. Compare the
+  // resolver's canonical files against the same canonical root, while links within
+  // that root (and a linked root itself) remain forbidden by the normal file checks.
+  root = fs.realpathSync(root);
   for (const file of allFiles(root)) {
     assertReleaseArtifactPath(slash(path.relative(root, file)));
     if (/\.node$/i.test(file)) throw new Error("Native runtime contains an unreviewed ABI addon; rebuilds are disabled and a target-specific verified addon policy is required");
