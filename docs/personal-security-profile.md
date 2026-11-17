@@ -1,6 +1,8 @@
 # Personal sensitive-data profile
 
 This fork targets one person's Windows computer, installed from a fixed reviewed source commit.
+The source-only install omits the Electron distribution packager and its unpatched
+`picomatch` ReDoS dependency chain. Signed and unsigned release commands refuse to run.
 Use [the source installation guide](personal-windows-install.md), including its native acceptance
 checks. The full commit and observed hosted test results are recorded in
 [the Windows personal fork PR](https://github.com/theridgerugby/clauderipple-security/pull/2). A matching package

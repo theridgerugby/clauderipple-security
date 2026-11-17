@@ -10,6 +10,10 @@ Use the **full 40-character commit SHA associated with the completed review and 
 A version such as `0.12.36` is insufficient: the fork and upstream may have the same version.
 Do not substitute a moving branch, `HEAD`, or an earlier SHA that predates personal mode.
 This is a source-based personal trial, not a signed-installer release or a security certification.
+The personal fork excludes the Electron distribution packager and disables all `dist` / `release`
+scripts. Its build-only dependency chain contained an unpatched high-severity `picomatch`
+advisory, and native distribution is outside this Windows source-install path. Keep the
+read-only `npm audit --audit-level=low` gate enabled before installing a reviewed commit.
 
 ## 1. Before starting
 

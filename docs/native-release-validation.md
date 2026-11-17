@@ -1,5 +1,12 @@
 # Native validation and signed release handoff
 
+**Windows personal fork status:** Native distribution is disabled in this source-only
+branch. `electron-builder` was removed because its dependency graph included an unpatched
+high-severity `picomatch` advisory. For the currently supported Windows source install and
+real-device trial, follow [personal-windows-install.md](personal-windows-install.md).
+The legacy multi-platform release plan below applies only after a separately reviewed,
+fully audited packaging toolchain is restored.
+
 These steps are release gates, not a record that they have already succeeded.
 See [security-hardening-validation.md](security-hardening-validation.md) for the
 commands actually executed and [security-acceptance.md](security-acceptance.md)

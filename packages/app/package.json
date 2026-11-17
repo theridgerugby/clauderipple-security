@@ -14,10 +14,10 @@
     "test:native": "npm run build && node test-native/run.mjs",
     "start": "npm run build && electron .",
     "icons": "node scripts/make-icons.mts",
-    "dist": "npm run icons && npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --dir -c.forceCodeSigning=false -c.mac.identity=null -c.mac.notarize=false -c.directories.output=release-dev",
-    "release": "node scripts/release.mjs mac",
-    "dist:win": "npm run icons && npm run build && electron-builder --win --dir -c.forceCodeSigning=false -c.win.signExecutable=false -c.directories.output=release-dev",
-    "release:win": "node scripts/release.mjs win"
+    "dist": "node scripts/block-personal-release.mjs",
+    "release": "node scripts/block-personal-release.mjs",
+    "dist:win": "node scripts/block-personal-release.mjs",
+    "release:win": "node scripts/block-personal-release.mjs"
   },
   "devDependencies": {
     "electron": "45.3.3"

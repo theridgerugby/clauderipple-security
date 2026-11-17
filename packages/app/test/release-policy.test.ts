@@ -104,13 +104,17 @@ test("production config forces signatures, notarization, integrity fuses and non
   assert.equal(productionConfig(manifest, macPlan(), "/fresh", hook).mac.identity, "Example Fixture (A1B2C3D4E5)");
 });
 
-test("developer distributions are explicit unsigned paths and production uses only the gate", () => {
+test("personal source-only checkout blocks native distribution and retains dormant signing checks", () => {
   assert.equal(manifest.build.forceCodeSigning, true);
   assert.equal(manifest.build.win.signExecutable, true);
-  assert.match(manifest.scripts.dist, /forceCodeSigning=false.*mac\.identity=null.*mac\.notarize=false/);
-  assert.match(manifest.scripts["dist:win"], /forceCodeSigning=false.*win\.signExecutable=false/);
-  assert.equal(manifest.scripts.release, "node scripts/release.mjs mac");
-  assert.equal(manifest.scripts["release:win"], "node scripts/release.mjs win");
+  for (const name of ["dist", "dist:win", "release", "release:win"]) {
+    assert.equal(manifest.scripts[name], "node scripts/block-personal-release.mjs");
+  }
+  const denied = spawnSync(process.execPath, [path.join(appDirectory, "scripts/block-personal-release.mjs")], {
+    encoding: "utf8", timeout: 10_000,
+  });
+  assert.equal(denied.status, 1);
+  assert.match(denied.stderr, /personal security fork is source-only/);
   const source = fs.readFileSync(path.join(appDirectory, "scripts/release.mjs"), "utf8");
   assert.match(source, /publish: "never"/);
   assert.match(source, /verifiedArchitectures\.has\("x64"\)/);
@@ -119,10 +123,13 @@ test("developer distributions are explicit unsigned paths and production uses on
   assert.doesNotMatch(source, /--no-sandbox|ExecutionPolicy|npm publish|gh release/);
 });
 
-test("the pinned real builder accepts both production configurations without building or signing", async () => {
-  const { validateConfiguration } = require("app-builder-lib/out/util/config/config.js");
-  for (const plan of [macPlan(), winPlan()]) {
-    await validateConfiguration(productionConfig(manifest, plan, path.join(os.tmpdir(), "fixture-only"), async () => {}), { isEnabled: false });
+test("personal source-only package lock excludes the vulnerable unsigned packager chain", () => {
+  const root = path.resolve(appDirectory, "../..");
+  const rootManifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+  const lock = JSON.parse(fs.readFileSync(path.join(root, "package-lock.json"), "utf8"));
+  assert.equal(rootManifest.devDependencies["electron-builder"], undefined);
+  for (const name of ["electron-builder", "app-builder-lib", "node-gyp", "tinyglobby", "picomatch"]) {
+    assert.equal(lock.packages[`node_modules/${name}`], undefined, `${name} must not be in the source-only dependency closure`);
   }
 });
 
