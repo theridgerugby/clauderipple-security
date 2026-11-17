@@ -6,7 +6,7 @@ import path from "node:path";
 import childProcess, { spawnSync } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { applyWindowsPrivateAcl, verifyWindowsPrivateAcl, WINDOWS_PRIVATE_ACL_SCRIPT } from "../src/windows-private-acl.ts";
-import { ensurePrivateDirectory, readPrivateFileStrict } from "../src/private-file.ts";
+import { ensurePrivateDirectory, readPrivateFileStrict, readPrivateFilesStrict } from "../src/private-file.ts";
 import { ensureAdminTlsIdentity, readAdminTlsIdentity, readAdminEndpoint, writeAdminEndpoint } from "../src/admin-transport-state.ts";
 import { ensureAdminToken, readAdminToken } from "../src/admin-auth.ts";
 
@@ -122,7 +122,7 @@ test("Windows strict reader rejects an exposed replacement after ACL verificatio
   if (process.platform !== "win32") assert.equal(fs.statSync(file).mode & 0o777, 0o644);
 });
 
-test("native Windows verify-only accepts private inheritance and refuses exposed ACLs without repairing them", { skip: process.platform !== "win32" }, t => {
+test("native Windows verify-only accepts private inheritance and refuses exposed ACLs without repairing them", { skip: process.platform !== "win32" }, async t => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-verify-acl-"));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   ensurePrivateDirectory(home);
@@ -160,9 +160,11 @@ if ($request.widen) {
   invoke(false, true);
   verifyWindowsPrivateAcl(file, false);
   assert.equal(readPrivateFileStrict(file).toString(), "dummy-secret");
+  assert.equal((await readPrivateFilesStrict([{ file, maxBytes: 128 }]))[0]!.toString(), "dummy-secret");
   const exposed = invoke(true);
   assert.throws(() => verifyWindowsPrivateAcl(file, false), /Cannot verify/);
   assert.throws(() => readPrivateFileStrict(file), /Cannot verify/);
+  await assert.rejects(readPrivateFilesStrict([{ file, maxBytes: 128 }]), /Cannot verify/);
   assert.equal(invoke(false), exposed, "verification must never repair a potentially exposed trust anchor");
   applyWindowsPrivateAcl(file, false);
   verifyWindowsPrivateAcl(file, false);

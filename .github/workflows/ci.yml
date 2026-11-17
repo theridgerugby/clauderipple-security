@@ -95,3 +95,8 @@ jobs:
       - name: Native Electron boundary tests (Windows and macOS)
         if: runner.os != 'Linux'
         run: npm run test:native --workspace @clauderipple/app
+      - name: Native Windows ACL and control deadlines
+        if: runner.os == 'Windows'
+        # These also run in the full matrix. Keep a quick, real-Windows gate for fresh ACL
+        # batches, caller cancellation, TLS generation races, phone proxying and shutdown receipts.
+        run: node --test --test-reporter=tap packages/cli/test/bounded-exec.test.ts packages/router/test/private-file-batch.test.ts packages/router/test/windows-private-acl.test.ts packages/router/test/phone.test.ts packages/remote/test/local-control-deadline.test.ts packages/remote/test/local-transport.test.ts

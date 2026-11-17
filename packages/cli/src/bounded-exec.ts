@@ -13,6 +13,7 @@ import { spawn as nodeSpawn, type ChildProcess, type SpawnOptions } from "node:c
 /** What the helper needs from a spawned child; a `ChildProcess` satisfies it. */
 export interface BoundedChild {
   pid?: number | undefined;
+  stdin?: NodeJS.WritableStream | null;
   stdout: NodeJS.ReadableStream | null;
   stderr: NodeJS.ReadableStream | null;
   kill(signal?: NodeJS.Signals | number): boolean;
@@ -28,6 +29,10 @@ export interface BoundedExecOptions {
   env?: NodeJS.ProcessEnv;
   windowsHide?: boolean;
   maxBuffer?: number;
+  /** Data-only stdin, never interpolated into argv or source. Bounded to 1 MiB. */
+  input?: string | Uint8Array;
+  /** Caller cancellation has the same process-tree and pipe cleanup as the hard deadline. */
+  signal?: AbortSignal;
   platform?: NodeJS.Platform;
   spawn?: BoundedSpawn;
   /** Ends the child and everything it started. Default: taskkill /T /F on Windows, the process group elsewhere. */
@@ -79,11 +84,15 @@ export function execBounded(file: string, args: string[], options: BoundedExecOp
     const out: Buffer[] = [];
     const errs: Buffer[] = [];
     let size = 0;
+    let errorSize = 0;
+
+    const abort = (): void => fail(Object.assign(new Error("Command aborted"), { name: "AbortError", code: "ABORT_ERR" }), true);
 
     const release = (): void => {
       if (timer) clearTimeout(timer);
       timer = null;
-      for (const stream of [child?.stdout, child?.stderr]) (stream as { destroy?: () => void } | null | undefined)?.destroy?.();
+      options.signal?.removeEventListener("abort", abort);
+      for (const stream of [child?.stdin, child?.stdout, child?.stderr]) (stream as { destroy?: () => void } | null | undefined)?.destroy?.();
     };
     const fail = (error: BoundedExecError, kill: boolean): void => {
       if (settled) return;
@@ -98,9 +107,15 @@ export function execBounded(file: string, args: string[], options: BoundedExecOp
       reject(error);
     };
 
+    if (options.signal?.aborted) { abort(); return; }
+    if (options.input !== undefined && Buffer.byteLength(options.input) > 1024 * 1024) {
+      fail(Object.assign(new Error("Command stdin exceeds its size bound"), { code: "ERR_CHILD_PROCESS_STDIN_MAXBUFFER" }), false);
+      return;
+    }
+
     try {
       child = spawnFn(file, args, {
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
         windowsHide: options.windowsHide ?? true,
         ...(options.env ? { env: options.env } : {}),
         // A group of its own on POSIX, so the deadline can end the whole tree; Windows uses taskkill /T.
@@ -131,8 +146,11 @@ export function execBounded(file: string, args: string[], options: BoundedExecOp
       out.push(buf);
     });
     child.stderr?.on("data", (chunk: Buffer | string) => {
-      if (settled || errs.reduce((n, b) => n + b.length, 0) > 64 * 1024) return;
-      errs.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+      if (settled || errorSize >= 64 * 1024) return;
+      const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+      const bounded = buf.subarray(0, 64 * 1024 - errorSize);
+      errorSize += bounded.length;
+      errs.push(bounded);
     });
     child.on("exit", () => { exited = true; });
     child.on("error", (error: Error) => fail(error as BoundedExecError, false));
@@ -149,5 +167,13 @@ export function execBounded(file: string, args: string[], options: BoundedExecOp
       error.code = code;
       fail(error, false);
     });
+    options.signal?.addEventListener("abort", abort, { once: true });
+    if (options.signal?.aborted) { abort(); return; }
+    if (options.input !== undefined) {
+      if (!child.stdin) { fail(new Error("Command stdin is unavailable"), true); return; }
+      child.stdin.on("error", (error: Error) => fail(error as BoundedExecError, true));
+      try { child.stdin.end(options.input); }
+      catch (error) { fail(error as BoundedExecError, true); }
+    }
   });
 }

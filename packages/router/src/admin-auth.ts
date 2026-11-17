@@ -16,16 +16,23 @@ export const ADMIN_INSTANCE_HEADER = "x-clauderipple-instance-id";
 const TOKEN_FILE = "admin-tls-token";
 const TOKEN_PATTERN = /^[a-f0-9]{64}$/;
 
+export function adminTokenPath(home: string): string { return path.join(home, TOKEN_FILE); }
+
+/** Pure validation shared by synchronous server reads and fresh async transport snapshots. */
+export function parseAdminToken(text: string): string {
+  const token = text.trim();
+  if (Buffer.byteLength(text) > 65 || !TOKEN_PATTERN.test(token)) throw new Error("invalid admin credential file");
+  return token;
+}
+
 /** Read a private, regular file without following a credential-file symlink. Never creates one. */
 export function readAdminToken(home = homeDir()): string | undefined {
-  const file = path.join(home, TOKEN_FILE);
+  const file = adminTokenPath(home);
   try {
     const stat = fs.lstatSync(file);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error("admin credential must be a regular private file");
     if (stat.size > 65) throw new Error("invalid admin credential file");
-    const token = readPrivateFileStrict(file, 65).toString("utf8").trim();
-    if (!TOKEN_PATTERN.test(token)) throw new Error("invalid admin credential file");
-    return token;
+    return parseAdminToken(readPrivateFileStrict(file, 65).toString("utf8"));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;

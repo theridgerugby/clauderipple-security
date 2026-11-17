@@ -15,6 +15,7 @@ import { localControlHome, localControlRequest, readLocalControlState } from "..
 import { controlShutdown, hostStatus } from "../src/host-service.ts";
 import { ensureAdminTlsIdentity, readAdminEndpoint, writeAdminEndpoint, type AdminEndpoint } from "../../router/src/admin-transport-state.ts";
 import { ADMIN_TOKEN_HEADER } from "../../router/src/admin-auth.ts";
+import { writePrivateFileAtomic } from "../../router/src/locked-file.ts";
 import { posixModes } from "../../../test/capabilities.ts";
 
 /** Test metadata only: never select the existing TLS listener as the replacement public port. */
@@ -46,19 +47,27 @@ test("replacement public-port fixtures exclude adjacent TLS ports and wrap the 6
 
 async function fixture(t: import("node:test").TestContext) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-host-tls-"));
+  let publicServer: http.Server | undefined;
+  let local: LocalControl | undefined;
+  t.after(async () => {
+    try { await local?.close(); }
+    finally {
+      try {
+        if (publicServer) {
+          publicServer.closeAllConnections();
+          await new Promise<void>(resolve => publicServer!.close(() => resolve()));
+        }
+      } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    }
+  });
   let publicRequests = 0;
-  const publicServer = http.createServer((_request, response) => { publicRequests++; response.end("untrusted public port"); });
+  publicServer = http.createServer((_request, response) => { publicRequests++; response.end("untrusted public port"); });
   await new Promise<void>(resolve => publicServer.listen(0, "127.0.0.1", resolve));
   const address = publicServer.address(); assert.ok(address && typeof address !== "string");
   const cfg = loadConfig(dir); cfg.port = address.port; saveConfig(cfg, dir);
   fs.writeFileSync(path.join(dir, "local.secret"), "legacy-fixture-capability", { mode: 0o600 });
-  const local = new LocalControl({ dir, config: cfg, version: "test", hostPublicKey: "public", phones: () => [], rotate() {} });
+  local = new LocalControl({ dir, config: cfg, version: "test", hostPublicKey: "public", phones: () => [], rotate() {} });
   await local.listen(cfg.port);
-  t.after(async () => {
-    await local.close(); publicServer.closeAllConnections();
-    await new Promise<void>(resolve => publicServer.close(() => resolve()));
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
   return { dir, cfg, local, home: localControlHome(dir), publicRequests: () => publicRequests };
 }
 
@@ -211,12 +220,16 @@ test("shutdown never retargets a new instance published after the authenticated 
   const f = await fixture(t);
   const state = readLocalControlState(f.dir)!;
   await f.local.close();
+  // Prepare the fully owner-protected replacement before starting the network deadline.
+  // A synchronous Windows ACL writer inside the handler would test PowerShell latency.
+  const staged = path.join(f.home, "staged-next-endpoint.json");
+  writePrivateFileAtomic(staged, JSON.stringify({ ...state.endpoint, instanceId: "c".repeat(32) }));
   const requests: string[] = [];
   const server = https.createServer({ cert: state.identity.certPem, key: state.identity.keyPem }, (request, response) => {
     requests.push(`${request.method} ${request.url}`);
     assert.equal(request.headers[ADMIN_TOKEN_HEADER], state.token);
     assert.equal(request.headers["x-clauderipple-instance-id"], state.endpoint.instanceId);
-    writeAdminEndpoint(f.home, { ...state.endpoint, instanceId: "c".repeat(32) });
+    fs.renameSync(staged, path.join(f.home, "admin-tls-endpoint.json"));
     response.setHeader("content-type", "application/json"); response.end('{"busy":false}');
   });
   await new Promise<void>(resolve => server.listen(state.endpoint.tlsPort, "127.0.0.1", resolve));
@@ -232,9 +245,22 @@ test("connection refusal from an old generation cannot confirm shutdown of a new
   const f = await fixture(t);
   const state = readLocalControlState(f.dir)!;
   await f.local.close();
-  const pending = controlShutdown(f.dir);
-  writeAdminEndpoint(f.home, { ...state.endpoint, instanceId: "d".repeat(32) });
-  await assert.rejects(pending, /instance changed/);
+  const staged = path.join(f.home, "staged-next-endpoint.json");
+  writePrivateFileAtomic(staged, JSON.stringify({ ...state.endpoint, instanceId: "d".repeat(32) }));
+  const request = https.request;
+  let dispatched = 0;
+  const mocked = t.mock.method(https, "request", (...args: Parameters<typeof https.request>) => {
+    const client = request(...args);
+    // The original snapshot has already passed its complete ACL batch. Replace it before
+    // the real loopback connection reports ECONNREFUSED, including on native Windows.
+    dispatched++;
+    fs.renameSync(staged, path.join(f.home, "admin-tls-endpoint.json"));
+    return client;
+  });
+  try {
+    await assert.rejects(controlShutdown(f.dir), /instance changed/);
+    assert.equal(dispatched, 1);
+  } finally { mocked.mock.restore(); }
 });
 
 test("an authenticated stop receipt survives a configured port change but rejects a newly published host", async t => {
@@ -244,8 +270,8 @@ test("an authenticated stop receipt survives a configured port change but reject
   const receipt = await controlShutdown(f.dir);
   const nextPort = differentPublicPort(endpoint);
   saveConfig({ ...f.cfg, port: nextPort }, f.dir);
-  assert.doesNotThrow(() => receipt.assertStillStopped());
+  await assert.doesNotReject(() => receipt.assertStillStopped());
   assert.throws(() => readLocalControlState(f.dir), /mismatched/, "ordinary callers retain the config-port fence");
   writeAdminEndpoint(f.home, { ...endpoint, publicPort: nextPort, instanceId: "e".repeat(32) });
-  assert.throws(() => receipt.assertStillStopped(), /instance changed/);
+  await assert.rejects(() => receipt.assertStillStopped(), /instance changed/);
 });

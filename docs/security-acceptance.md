@@ -32,18 +32,18 @@ operator decisions.
 | Credential redaction, probe/measurement response limits | Synthetic reflected-secret and response-limit tests | Locally verified within tests |
 | POSIX private files, links/owner/inode checks, atomic writes | Real temporary-file regressions | Locally verified within tests |
 | Generic writes preserve shared parent permissions | Regression covers existing directory mode | Locally verified on Linux |
-| Windows ACL migration, verify-only transport reads, file ownership | Shared implementation; all secret temp files get explicit owner/DACL before bytes; command-boundary mocks and native tests added; new state reads do not cache DACL decisions | Native execution pending |
+| Windows ACL migration, verify-only transport reads, file ownership | Shared implementation; explicit owner/DACL before secret writes; fresh asynchronous batch reads retain descriptor/path checks and never cache or repair DACL decisions | New batch, real exposed-DACL and lifecycle tests require the next Windows run |
 | Dependency graph and known-vulnerability scan | Clean install, valid npm tree, full/prod audit | Snapshot only; scan every release |
-| Electron main-frame/IPC/protocol/permission isolation | Real macOS/Windows execution exposed child-frame network attribution; administration moved to typed IPC with static-only protocol and fail-closed child-frame ownership | Revised native checks must pass; Linux runner sandbox prerequisite still blocks execution |
-| Whole-repository functional regression | Hosted Ubuntu and macOS suites passed at `cf742f3`; one cloud loopback failure remains locally | Later source changes and Windows still require successful full-suite evidence |
+| Electron main-frame/IPC/protocol/permission isolation | Real macOS/Windows harness passed at `9f79dee`: typed IPC, static-only protocol, parent-bridge borrowing refusal and sticky child-frame ownership | Linux blocked before app startup by a world-writable sandbox helper; exact final revision still needs its own matrix |
+| Whole-repository functional regression | Hosted Ubuntu and macOS suites passed all 4,038 tests or explicit platform skips at `9f79dee`; one cloud loopback failure remains locally | Later source changes and Windows still require successful full-suite evidence |
 | Claude proprietary mod engine and simultaneous provider sessions | Parser/helper tests only | Maintainer integration test required |
-| Local server identity under port takeover | Dedicated pinned TLS, exact leaf/CA/IP/expiry checks, instance generation, new token namespace; real adversarial TLS regressions | Locally verified; native integration still required |
+| Local server identity under port takeover | Dedicated pinned TLS, exact leaf/CA/IP/expiry checks, instance generation, new token namespace; actual Electron macOS/Windows harness refused exact-port impostors with zero authenticated rogue HTTP requests at `9f79dee` | Native boundary evidence recorded; final revision and full installed-app acceptance still required |
 | Browser capability transport | Native-only opener and stdin helper; no capability URL, browser storage or HTTP fallback | Implemented; actual Claude engine and native launcher integration pending |
 | Remote direct-phone credential exposure | Public direct WebSocket refused; HTTPS/E2EE relay required; startup atomically rotates legacy pairing tokens | Local transport and migration regressions; real upgraded phone acceptance pending |
 | OS vault, certificate trust/recovery, multi-file crash recovery | File protection implemented; remaining architecture unchanged | Native design/operational review required |
 | Release artifact isolation, exact-byte handoff, provenance request | Workflow and artifact regression tests | Hosted execution and provenance verification pending |
 | Native package source/dependency/resource closure | Real pinned-builder resource copying, isolated CLI/Remote startup, target payload/refusal and credential-path tests | Locally verified as Node/resource checks; matching native package execution still required |
-| Genuine desktop signing, notarization/timestamp, packaged fuses | Fail-closed release entry points and rejection tests; no real signer available here | Native signed build and exact-artifact install/rollback evidence required |
+| Genuine desktop signing, notarization/timestamp, packaged fuses | Fail-closed release entry points and rejection tests; clean source commit/tree/lockfile recorded and rechecked before promotion; no real signer available here | Native signed build and exact-artifact install/rollback evidence required; source identifiers alone do not attest CI, review or hermetic provenance |
 | Protected tags/branches and trusted publisher | Not configured or verified by this work | Maintainer configuration and evidence required |
 | Secret rotation, incident handling, rollback and response ownership | Suggested controls below; no operational drill | Owner assignment and exercised runbooks required |
 | Independent security review, fuzzing coverage and adversarial desktop test | Agent cross-review and deterministic regression tests only | Independent assessment required |
@@ -56,6 +56,10 @@ operator decisions.
 2. Run mandatory CI checks without suppressing failures. On Linux, provide a
    supported display server and normal Chromium sandbox prerequisites. Do not use
    `--no-sandbox` or skip the real-process harness to obtain a green result.
+   The inspected hosted helper `/opt/google/chrome/chrome-sandbox` was root-owned
+   but mode `0777`, not protected mode `04755`. An authorized administrator must
+   provision trustworthy verified bytes in a protected environment; simply making
+   the observed writable binary setuid is not an accepted remediation.
 3. On Windows, verify native ACL creation/migration, foreign-owner rejection,
    DACL cache invalidation, concurrent account writes, path quoting and installer
    rollback. Confirm preexisting user-directory ACLs are unchanged.

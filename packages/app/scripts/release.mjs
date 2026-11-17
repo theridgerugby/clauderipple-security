@@ -10,14 +10,16 @@ import {
   ReleaseGateError, releaseTarget, releasePlan, productionConfig, verifyConfiguredSigner,
   verifyPackagedApp, verifyMacSignature, verifyWindowsSignature, inspectArtifacts, RELEASE_FUSES,
 } from "./release-policy.mjs";
+import { captureReleaseSource, assertReleaseSourceUnchanged, releaseSourceReceipt, prepareReleaseIcons } from "./release-source.mjs";
 
 const require = createRequire(import.meta.url);
 const appDirectory = fileURLToPath(new URL("../", import.meta.url));
+const checkout = path.resolve(appDirectory, "../..");
 function prepare() {
+  prepareReleaseIcons(appDirectory);
   for (const args of [
     ["scripts/sync-private-acl.mjs", "--check"],
     ["scripts/sync-admin-transport.mjs", "--check"],
-    ["scripts/make-icons.mts"],
     [require.resolve("typescript/bin/tsc"), "-p", "tsconfig.json"],
   ]) {
     const result = spawnSync(process.execPath, args, { cwd: appDirectory, stdio: "inherit", timeout: 300_000, windowsHide: true });
@@ -31,6 +33,7 @@ try {
   // changes, icon generation or certificate access. CI's ordinary tests never need release keys.
   const target = releaseTarget(process.argv.slice(2));
   const plan = releasePlan(target);
+  const source = captureReleaseSource(checkout);
   verifyConfiguredSigner(plan);
   const manifest = JSON.parse(fs.readFileSync(path.join(appDirectory, "package.json"), "utf8"));
   const { build, Platform, Arch } = require("electron-builder");
@@ -62,10 +65,12 @@ try {
   // security certification, or substitute for the mandatory native application test matrix.
   const receipt = {
     schema: 1, version: manifest.version, platform: plan.host, architectures: [...verifiedArchitectures].sort(),
+    source: releaseSourceReceipt(source),
     signer: target === "mac" ? { appleTeam: plan.team } : { certificateThumbprint: plan.thumbprint },
     appSignaturesVerified: true, notarizationVerified: target === "mac", electronFuses: RELEASE_FUSES,
     artifacts: names.map(name => ({ name, sha256: createHash("sha256").update(fs.readFileSync(path.join(staging, name))).digest("hex") })),
   };
+  assertReleaseSourceUnchanged(checkout, source);
   fs.writeFileSync(path.join(staging, "release-verification.json"), `${JSON.stringify(receipt, null, 2)}\n`, { flag: "wx" });
   const verified = path.join(releaseDirectory, `verified-${target}-${manifest.version}-${path.basename(staging).split("-").at(-1)}`);
   fs.renameSync(staging, verified);

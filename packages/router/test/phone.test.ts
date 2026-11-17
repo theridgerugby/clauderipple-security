@@ -14,18 +14,33 @@ import { APPROVAL_WAIT_MS } from "../../remote/src/mod-approval.ts";
 import { ensureAdminToken, ADMIN_TOKEN_HEADER } from "../src/admin-auth.ts";
 import { ensureAdminTlsIdentity, writeAdminEndpoint, readAdminEndpoint } from "../src/admin-transport-state.ts";
 import { localControlHome } from "../../remote/src/local-transport.ts";
+import { writePrivateFileAtomic } from "../src/locked-file.ts";
 
 // Application responses are configurable; the production bridge always crosses real,
 // pinned TLS. This callback is never supplied to PhoneDeps or the transport client.
 async function admin(t: import("node:test").TestContext, phone: PhoneDeps & { fetch?: typeof globalThis.fetch }) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-phone-admin-"));
-  fs.writeFileSync(path.join(home, "host.json"), JSON.stringify({ port: 18797 }));
+  let control: https.Server | undefined;
+  let server: Awaited<ReturnType<typeof startAdmin>> | undefined;
+  t.after(async () => {
+    try { server?.close(); }
+    finally {
+      try {
+        if (control) {
+          control.closeAllConnections();
+          await new Promise<void>(resolve => control!.close(() => resolve()));
+        }
+      } finally { fs.rmSync(home, { recursive: true, force: true }); }
+    }
+  });
+  // A running production host persists its private configuration before TLS discovery.
+  writePrivateFileAtomic(path.join(home, "host.json"), JSON.stringify({ port: 18797 }));
   const controlHome = localControlHome(home);
   const identity = ensureAdminTlsIdentity(controlHome);
   const token = ensureAdminToken(controlHome);
   const { fetch: respond = async () => Response.json({ ok: true }), ...phoneDeps } = phone;
   let controlBase = "";
-  const control = https.createServer({ cert: identity.certPem, key: identity.keyPem }, (request, response) => {
+  control = https.createServer({ cert: identity.certPem, key: identity.keyPem }, (request, response) => {
     void (async () => {
       assert.equal(request.headers[ADMIN_TOKEN_HEADER], token);
       assert.equal(request.headers["x-clauderipple-instance-id"], "a".repeat(32));
@@ -46,16 +61,11 @@ async function admin(t: import("node:test").TestContext, phone: PhoneDeps & { fe
   const address = control.address(); assert.ok(address && typeof address !== "string");
   controlBase = `https://127.0.0.1:${address.port}`;
   writeAdminEndpoint(controlHome, { version: 1, instanceId: "a".repeat(32), publicPort: 18797, tlsPort: address.port });
-  const server = await startAdmin({
+  server = await startAdmin({
     config: () => ({ ...DEFAULTS, admin: { port: 0 } }), configFile: path.join(home, "config.json"),
     log: new Logger(null, 1_000_000, 1, false), version: "test", health: () => 0,
     stats: () => ({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 }),
     requests: new RequestLog(path.join(home, "requests.jsonl")), phone: { home, ...phoneDeps },
-  });
-  t.after(async () => {
-    server.close(); control.closeAllConnections();
-    await new Promise<void>(resolve => control.close(() => resolve()));
-    fs.rmSync(home, { recursive: true, force: true });
   });
   return { base: `http://127.0.0.1:${server.port}`, home, controlHome, controlBase };
 }
@@ -178,7 +188,8 @@ test("proxy preserves settings refusals, reports live incompatible hosts, and de
     assert.equal(new URL(String(url)).protocol, "https:");
     return Response.json({ error: "never reflect arbitrary upstream credential detail" }, { status });
   } });
-  fs.unlinkSync(path.join(f.home, "host.json"));
+  // A missing port uses DEFAULT_PORT. Missing protected configuration is incomplete state.
+  writePrivateFileAtomic(path.join(f.home, "host.json"), "{}");
   writeAdminEndpoint(f.controlHome, { ...readAdminEndpoint(f.controlHome)!, publicPort: 8797 });
   assert.equal((await fetch(`${f.base}/api/phone/settings`, { method: "POST", body: "{}" })).status, 400);
   status = 403;
@@ -188,6 +199,21 @@ test("proxy preserves settings refusals, reports live incompatible hosts, and de
   status = 200;
   // The byte limit is enforced before forwarding.
   assert.equal((await fetch(`${f.base}/api/phone/settings`, { method: "POST", body: "x".repeat(4097) })).status, 413);
+});
+
+test("published TLS discovery with missing host configuration fails closed without contacting or recreating the host", async t => {
+  let calls = 0;
+  const f = await admin(t, { fetch: async () => { calls++; return Response.json({ mode: "relay", phones: [] }); } });
+  assert.equal((await (await fetch(`${f.base}/api/phone/status`)).json() as { hostRunning: boolean }).hostRunning, true);
+  assert.equal(calls, 1);
+  const file = path.join(f.home, "host.json");
+  fs.unlinkSync(file);
+  assert.deepEqual(await (await fetch(`${f.base}/api/phone/status`)).json(), { hostRunning: false, hint: "clauderipple remote install" });
+  for (const route of ["settings", "rotate"]) {
+    assert.equal((await fetch(`${f.base}/api/phone/${route}`, { method: "POST", body: "{}" })).status, 503);
+  }
+  assert.equal(calls, 1, "partial state cannot send any request to the existing TLS listener");
+  assert.equal(fs.existsSync(file), false, "read-only control never fabricates configuration or credentials");
 });
 
 test("phone vocabulary is complete in all six dashboard languages", () => {

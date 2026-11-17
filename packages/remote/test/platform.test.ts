@@ -178,7 +178,7 @@ test("shutdown requires the pinned TLS capability, answers before callback, and 
   await controlShutdown(dir);
   assert.equal(stops, 1, "repeated shutdown does not re-enter the legacy upgrade trap");
   saveConfig({ ...cfg, port: cfg.port === 65535 ? 65534 : cfg.port + 1 }, dir);
-  assert.doesNotThrow(() => receipt.assertStillStopped());
+  await assert.doesNotReject(() => receipt.assertStillStopped());
   assert.equal(stops, 1, "a second install stage uses the receipt without targeting a different port");
 });
 

@@ -2,7 +2,8 @@
 // boundary, not protection against malware or administrators acting as the same user.
 import fs from "node:fs";
 import path from "node:path";
-import { applyWindowsPrivateAcl, verifyWindowsPrivateAcl } from "./windows-private-acl.ts";
+import { applyWindowsPrivateAcl, verifyWindowsPrivateAcl, verifyWindowsPrivateFiles } from "./windows-private-acl.ts";
+import { execBounded } from "../../cli/src/bounded-exec.ts";
 export { applyWindowsPrivateAcl, WINDOWS_PRIVATE_ACL_SCRIPT } from "./windows-private-acl.ts";
 
 const DEFAULT_MAX_BYTES = 8 * 1024 * 1024;
@@ -161,6 +162,67 @@ export function readPrivateFileStrict(file: string, maxBytes = DEFAULT_MAX_BYTES
     assertStrictSnapshot(file, before, fd);
     return bytes;
   } finally { fs.closeSync(fd); }
+}
+
+export interface PrivateFileRead { file: string; maxBytes: number }
+
+function assertReadActive(signal?: AbortSignal): void {
+  if (signal?.aborted) throw Object.assign(new Error("Private storage read aborted"), { name: "AbortError", code: "PRIVATE_STORAGE_ABORTED" });
+}
+
+/**
+ * One fresh snapshot, with at most one uncached Windows ACL process. All descriptors stay open
+ * across verification and every pathname/descriptor is checked again before any bytes are read
+ * and after the entire batch. A failed/aborted batch closes all descriptors and returns nothing.
+ * As with the single-file reader, the caller must use trusted ancestor directories.
+ */
+export async function readPrivateFilesStrict(files: readonly PrivateFileRead[], options: { signal?: AbortSignal } = {}): Promise<Buffer[]> {
+  assertReadActive(options.signal);
+  if (files.length < 1 || files.length > 16) throw new Error("Invalid private storage batch");
+  let maximum = 0;
+  const names = new Set<string>();
+  for (const item of files) {
+    assertReadLimit(item.maxBytes);
+    maximum += item.maxBytes;
+    if (typeof item.file !== "string" || item.file.length === 0 || item.file.includes("\0") || names.has(path.resolve(item.file))) {
+      throw new Error("Invalid private storage batch");
+    }
+    names.add(path.resolve(item.file));
+  }
+  if (maximum > DEFAULT_MAX_BYTES) throw new Error("Private storage batch exceeds its size bound");
+  const opened: { file: string; maxBytes: number; fd: number; before: fs.Stats }[] = [];
+  try {
+    for (const item of files) {
+      assertReadActive(options.signal);
+      const before = fs.lstatSync(item.file);
+      assertStrictPermissions(before);
+      if (before.size > item.maxBytes) throw new Error("Private storage exceeds its size bound");
+      const fd = fs.openSync(item.file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+      opened.push({ ...item, fd, before });
+      assertStrictSnapshot(item.file, before, fd);
+    }
+    if (process.platform === "win32") await verifyWindowsPrivateFiles(opened.map(item => item.file), execBounded, options);
+    assertReadActive(options.signal);
+    for (const item of opened) assertStrictSnapshot(item.file, item.before, item.fd);
+    const results = opened.map(item => {
+      assertReadActive(options.signal);
+      return readBoundedDescriptor(item.fd, item.maxBytes);
+    });
+    for (const item of opened) assertStrictSnapshot(item.file, item.before, item.fd);
+    assertReadActive(options.signal);
+    return results;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (typeof code === "string" && /^E[A-Z0-9_]{1,40}$/.test(code)) {
+      // Keep machine-readable absence/permission classification without reflecting a pathname.
+      throw Object.assign(new Error("Private storage could not be read"), { code });
+    }
+    throw error;
+  } finally {
+    // Close every descriptor even if a previous close itself failed. No batch can leak a
+    // descriptor because an early open, ACL check, JSON reader or cancellation rejected it.
+    for (const item of opened) { try { fs.closeSync(item.fd); } catch { /* already closed */ } }
+  }
 }
 
 /** Cache metadata only after the caller has explicitly protected this newly written file. */

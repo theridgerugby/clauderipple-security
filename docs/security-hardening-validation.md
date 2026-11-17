@@ -4,8 +4,8 @@ Original upstream review base: `PBJ-2/clauderipple` v0.12.36,
 `e7420ab5dc14c9569fed3439bc43e68a989c7055`.
 Integrated upstream revision: `7fe108c847428694e6fd05f5991c7a37c3c992fb`.
 Original local validation checkpoint: `f3057ccadf4afcccd53ea37610fc9da559420e1a`.
-Latest recorded hosted checkpoint: `cf742f3062ffdee8d19c209674eeb3652c83c13e`,
-tree `51c5a38925d573a48c4350f2e35a85cea28c9cef`.
+Latest recorded hosted checkpoint: `9f79dee98402952423783038fc166c962b0b902b`,
+tree `ea522a14a85d73410aee3819a008d807905fba67`.
 Validation date: 2026-11-16 (America/Toronto).
 Environment: Linux cloud workspace, Node 24.22.1, npm 11.9.0.
 
@@ -13,8 +13,9 @@ Environment: Linux cloud workspace, Node 24.22.1, npm 11.9.0.
 
 The local port-impersonation fixes and their executable regression tests are
 implemented. Hosted native execution found an additional child-frame authority
-defect; the subsequent IPC fix requires its own fresh run. Genuine signed release
-acceptance remains unverified. The writable fork is
+defect; the subsequent IPC fix passed the real macOS and Windows harnesses at the
+recorded checkpoint. Linux native execution and genuine signed release
+acceptance remain unverified. The writable fork is
 `theridgerugby/clauderipple-security`; hosted evidence below is tied to its exact
 checkpoint and does not certify later changes. No signed
 application release or installation on the user's machine was performed. This
@@ -27,14 +28,43 @@ Windows/macOS execution.
 
 ## Hosted validation and resulting fixes
 
+Run [44027136750](https://github.com/theridgerugby/clauderipple-security/actions/runs/44027136750)
+used `9f79dee`. Its recorded results:
+
+| Job | Observed result |
+| --- | --- |
+| Ubuntu full suite | 4,038 tests: 4,008 passed, 30 skipped, zero failures/cancellations; audit, typecheck, mod check and build passed |
+| macOS full suite | 4,038 tests: 4,014 passed, 24 skipped, zero failures/cancellations; audit, typecheck, mod check and build passed |
+| Windows full suite | Still running when this evidence was recorded; no success claimed |
+| macOS Electron harness | Passed on macOS 26 arm64, Electron 45.3.3 and Node 24.22.2 |
+| Windows Electron harness | Passed on Windows Server 2025, Electron 45.3.3 and Node 24.22.2 |
+| Ubuntu Electron harness | Failed before app initialization: root-owned sandbox helper was a regular, non-symlink, single-link file with mode `0777`; it did not meet the protected mode-`04755` prerequisite |
+
+Both successful native harnesses checked renderer sandbox/context isolation,
+Node isolation, typed owner IPC over pinned TLS, static-only custom protocol,
+CSP and permission denials, real child-frame requests, parent-bridge borrowing,
+sticky refusal after child removal/reload, fresh-window recovery, unowned windows,
+and external/browser requests. An exact-port wrong-certificate impostor received
+zero authenticated HTTP requests; the client returned a closed failure. These
+are real Electron processes using fixture windows/preloads and synthetic secrets,
+not signed installer or complete installed-application acceptance tests.
+
+The Linux failure is a protected runner prerequisite. No system permission,
+AppArmor, namespace or sandbox setting was changed. Do not promote the observed
+world-writable helper to setuid; a runner administrator must provide trustworthy
+verified helper bytes and the required protected execution environment.
+
+### Earlier run that exposed the authority defect
+
 Run [44024775833](https://github.com/theridgerugby/clauderipple-security/actions/runs/44024775833)
-used the recorded `cf742f3` checkpoint. Its completed results at this checkpoint:
+used `cf742f3062ffdee8d19c209674eeb3652c83c13e`, tree
+`51c5a38925d573a48c4350f2e35a85cea28c9cef`. Its results:
 
 | Job | Observed result |
 | --- | --- |
 | Ubuntu full suite | 4,022 tests: 3,992 passed, 30 skipped, zero failures/cancellations; audit, typecheck, mod check and build passed |
 | macOS full suite | 4,022 tests: 3,998 passed, 24 skipped, zero failures/cancellations; audit, typecheck, mod check and build passed |
-| Windows full suite | Still running when this checkpoint was recorded; no success claimed |
+| Windows full suite | Cancelled by the next candidate; logs contained a Remote shutdown generation fixture failure; no success claimed |
 | macOS/Windows Electron harness | Failed: real child-frame fetch reached the administrative protocol handler and returned 200 |
 | Ubuntu Electron harness | Failed before app initialization: the preinstalled sandbox helper did not meet the protected root-owned mode-4755 prerequisite |
 
@@ -43,8 +73,8 @@ was not executing in the top frame. Instrumented `webRequest` metadata neverthel
 identified the request as the main frame. This is a genuine authority-boundary
 failure. The revised design removes all administrative protocol handling, uses
 typed IPC with actual sender-frame validation, and refuses privileged IPC after
-any child frame is created, including parent-bridge borrowing. Those changes must
-be evaluated by the next exact-commit native run. The Linux preflight now reports
+any child frame is created, including parent-bridge borrowing. Those changes were
+evaluated by the `9f79dee` macOS/Windows native run above. The Linux preflight reports
 safe ownership/mode metadata for an authorized runner administrator; it does not
 alter system permissions, AppArmor or sandbox flags.
 
@@ -54,6 +84,41 @@ passed on both hosted Ubuntu and macOS above. Earlier Linux worker-lock and
 fixture-cleanup defects were fixed before this hosted checkpoint; an old failing
 run is not evidence against the later patch, and a later green run does not erase
 the earlier findings.
+
+### Follow-up changes awaiting their exact-commit hosted run
+
+Combined local regression after these changes: 4,077 tests, 4,045 passed,
+31 explicit platform skips, the one retained cloud loopback failure below, and
+zero cancellations. Typecheck, mod check, generated transport/ACL parity and build
+passed. The independent Remote/phone/lifecycle subset passed 58/58. These counts
+do not substitute for the next Windows/macOS native run.
+
+- Remote verifies endpoint, TLS identity, capability and host configuration in one
+  fresh four-file asynchronous Windows ACL process per attempt. All descriptors
+  stay open while verifying, and pathname/descriptor metadata is checked before
+  reading and after the complete batch. The fixed helper receives paths only.
+- The 500 ms network poll budget starts after permission validation. A separate
+  monotonic whole-operation deadline covers validation, network calls, retries
+  and the final shutdown receipt. Cancellation closes pipes and descriptors and
+  requests process-tree termination. Windows `taskkill` is asynchronous; rejection
+  alone does not prove that every descendant has already been reaped.
+- Real Windows tests now cover batch acceptance and rejection after an Everyone
+  Read ACE is added, with unchanged exposed SDDL. The lifecycle ACL-refusal and
+  deliberately slow/hung-helper tests use a mocked command boundary with real TLS.
+  Their scope is distinct from the real DACL test.
+- The generation-race fixture prepares the next private endpoint before serving
+  the status request, then atomically renames it in the handler. Permission setup
+  no longer consumes that fixture's network budget. Production limits are retained.
+- Full-suite integration initially caught nine phone-proxy fixture failures: the
+  fixture created `host.json` with public-read permissions. It now uses the same
+  private writer as production and retains its routing/status/default-port assertions.
+  A new missing-configuration test confirms no TLS dispatch, no file recreation,
+  and closed failure when discovery survives a deleted host configuration.
+- Signed-build preparation requires clean tracked, staged and untracked source,
+  including hidden index flags and build-consumed ignored files. It records source
+  commit/tree and lockfile digest, then rechecks before receipt promotion. Production
+  uses committed icon assets. These fields do not establish hermetic building,
+  review approval, CI success or SLSA provenance. No genuine signer was exercised.
 
 ## Original local checks
 
@@ -150,8 +215,9 @@ hosted Ubuntu and macOS full suites.
 
 ## External acceptance still required
 
-- Windows/macOS native desktop and installer tests, real OS ACL semantics,
-  certificate trust/install/removal and exact-artifact update/rollback tests.
+- A protected Linux native sandbox environment, plus complete installed-app and
+  installer tests on supported platforms. The macOS/Windows boundary harness above
+  does not establish certificate trust/install/removal or exact-artifact update/rollback.
 - Positive Developer ID signing/notarization or Windows Authenticode signing with
   the authorized publisher identity, plus independent verification of the actual
   distributed artifact. No real signing credential was available here.

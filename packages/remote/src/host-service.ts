@@ -10,8 +10,8 @@ import { renderUnit } from "../../cli/src/systemd.ts";
 import { recordedLaunchHome } from "../../cli/src/launcher.ts";
 import { type AgentStop, type Ownership, ownerOf, plistEnvironment, unitEnvironment } from "../../cli/src/ownership.ts";
 import { loadConfig, remoteHome } from "./config.ts";
-import { localControlHome, localControlRequest, readLocalControlState } from "./local-transport.ts";
-import { readAdminEndpoint, type AdminEndpoint } from "../../router/src/admin-transport-state.ts";
+import { localControlHome, localControlRequest, readLocalControlStateAsync, requestVerifiedLocalControl } from "./local-transport.ts";
+import { readAdminEndpointAsync, type AdminEndpoint } from "../../router/src/admin-transport-state.ts";
 import { assertGeneration, definitionGeneration, withServiceLockAsync, writeServiceFile } from "../../cli/src/service-definition.ts";
 
 export const TASK = "ClaudeRippleHost";
@@ -65,14 +65,26 @@ export function renderService(spec: Spec, platform = process.platform): string {
   throw new Error(`host service is unsupported on ${platform}`);
 }
 
-export interface HostStopReceipt { assertStillStopped(): void }
+export interface HostStopReceipt { assertStillStopped(options?: { signal?: AbortSignal }): Promise<void> }
+
+/** Real elapsed time bounds the entire operation, including fresh private-state verification. */
+function operationDeadline(timeoutMs = 60_000) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) throw new Error("invalid host control deadline");
+  const deadline = performance.now() + timeoutMs;
+  const signal = AbortSignal.timeout(timeoutMs);
+  return { signal, check() {
+    if (signal.aborted || performance.now() >= deadline) {
+      throw Object.assign(new Error("host control operation timed out"), { name: "TimeoutError", code: "HOST_CONTROL_TIMEOUT" });
+    }
+  } };
+}
 
 function stopReceipt(dir: string, endpoint?: AdminEndpoint): HostStopReceipt {
   const expected = endpoint ? { ...endpoint } : undefined;
-  return Object.freeze({ assertStillStopped() {
+  return Object.freeze({ async assertStillStopped(options: { signal?: AbortSignal } = {}) {
     // Configuration may now specify a new public port. Compare only the protected generation
     // actually stopped, never retarget a request or authorize stopping a newly started host.
-    const current = readAdminEndpoint(localControlHome(dir));
+    const current = await readAdminEndpointAsync(localControlHome(dir), options);
     if (expected ? !current || current.instanceId !== expected.instanceId || current.publicPort !== expected.publicPort || current.tlsPort !== expected.tlsPort
       : current !== undefined || fs.existsSync(path.join(dir, "local.secret"))) {
       throw new Error("host instance changed after shutdown was checked");
@@ -81,10 +93,17 @@ function stopReceipt(dir: string, endpoint?: AdminEndpoint): HostStopReceipt {
 }
 
 /** An authenticated local request, never a pairing credential or a public shutdown endpoint. */
-export async function controlShutdown(dir = remoteHome()): Promise<HostStopReceipt> {
-  const initial = readLocalControlState(dir);
+export async function controlShutdown(dir = remoteHome(), options: { timeoutMs?: number } = {}): Promise<HostStopReceipt> {
+  const budget = operationDeadline(options.timeoutMs);
+  const initial = await readLocalControlStateAsync(dir, { signal: budget.signal });
+  budget.check();
   const receipt = stopReceipt(dir, initial?.endpoint);
-  const stopped = () => { receipt.assertStillStopped(); return receipt; };
+  const stopped = async () => {
+    budget.check();
+    await receipt.assertStillStopped({ signal: budget.signal });
+    budget.check();
+    return receipt;
+  };
   if (!initial) {
     // A legacy capability is evidence of a previous host, never permission to hard-kill it
     // when the new authenticated boundary cannot determine liveness or finish its shutdown.
@@ -93,7 +112,10 @@ export async function controlShutdown(dir = remoteHome()): Promise<HostStopRecei
   }
   // Check first: a refused secret or incompatible live host must not lead to a hard kill.
   let status: Response;
-  try { status = await localControlRequest(dir, "/local/status", { signal: AbortSignal.timeout(2000) }, initial.endpoint.instanceId); }
+  try {
+    // No intervening await since the snapshot: this attempt checks each file once, not twice.
+    status = await requestVerifiedLocalControl(initial, "/local/status", { signal: budget.signal }, { networkTimeoutMs: 2000 });
+  }
   catch (error) {
     const cause = (error as { cause?: { code?: string } }).cause;
     if (cause?.code === "ECONNREFUSED") {
@@ -102,18 +124,23 @@ export async function controlShutdown(dir = remoteHome()): Promise<HostStopRecei
     throw new Error("could not check the host before shutdown");
   }
   await status.body?.cancel();
+  budget.check();
   if (!status.ok) throw new Error(`host local status refused (${status.status})`);
-  const response = await localControlRequest(dir, "/local/shutdown", { method: "POST", signal: AbortSignal.timeout(5000) }, initial.endpoint.instanceId);
+  const response = await localControlRequest(dir, "/local/shutdown", { method: "POST", signal: budget.signal }, initial.endpoint.instanceId, { networkTimeoutMs: 5000 });
   await response.body?.cancel();
+  budget.check();
   if (!response.ok) throw new Error(`host shutdown refused (${response.status}); update the host before stopping its task`);
   for (let i = 0; i < 100; i++) {
-    await delay(100);
+    await delay(100, undefined, { signal: budget.signal });
+    budget.check();
     try {
-      const current = readLocalControlState(dir);
+      const current = await readLocalControlStateAsync(dir, { signal: budget.signal });
+      budget.check();
       if (!current) return stopped();
       if (current.endpoint.instanceId !== initial.endpoint.instanceId) throw new Error("host restarted before shutdown could be confirmed");
-      const probe = await localControlRequest(dir, "/local/status", { signal: AbortSignal.timeout(500) }, initial.endpoint.instanceId);
+      const probe = await requestVerifiedLocalControl(current, "/local/status", { signal: budget.signal }, { networkTimeoutMs: 500 });
       await probe.body?.cancel();
+      budget.check();
     } catch (error) {
       if ((error as { cause?: { code?: string } }).cause?.code === "ECONNREFUSED") {
         return stopped();
@@ -124,19 +151,24 @@ export async function controlShutdown(dir = remoteHome()): Promise<HostStopRecei
   throw new Error("host did not finish shutdown; its task was left alone");
 }
 
-async function waitForHost(dir = remoteHome()): Promise<void> {
+export async function waitForHost(dir = remoteHome(), options: { timeoutMs?: number } = {}): Promise<void> {
+  const budget = operationDeadline(options.timeoutMs);
   for (let i = 0; i < 100; i++) {
+    budget.check();
     try {
-      const response = await localControlRequest(dir, "/local/status", { signal: AbortSignal.timeout(500) });
+      const response = await localControlRequest(dir, "/local/status", { signal: budget.signal }, undefined, { networkTimeoutMs: 500 });
       await response.body?.cancel();
+      budget.check();
       if (response.ok) return;
       if (response.status === 403) throw new Error("host local authentication refused");
     } catch (error) {
+      budget.check();
       const code = (error as NodeJS.ErrnoException).code ?? (error as { cause?: { code?: string } }).cause?.code;
+      if (code?.startsWith("PRIVATE_STORAGE_")) throw error;
       if (code !== "ENOENT" && code !== "LOCAL_CONTROL_UNAVAILABLE" && code !== "ECONNREFUSED" &&
           !(error instanceof Error && (["TimeoutError", "AbortError"].includes(error.name) || error.message === "admin request aborted"))) throw error;
     }
-    await delay(100);
+    await delay(100, undefined, { signal: budget.signal });
   }
   throw new Error("host service was registered but did not answer its authenticated status; check its logs");
 }
@@ -157,25 +189,33 @@ export function refreshPlan(o: { installed: boolean; definition: string | null; 
 }
 
 /** Unknown liveness is not permission to stop a host. Callers retain a pending update. */
-export async function hostStatus(dir = remoteHome()): Promise<{ busy?: boolean; version?: string } | null> {
+export async function hostStatus(dir = remoteHome(), options: { signal?: AbortSignal } = {}): Promise<{ busy?: boolean; version?: string } | null> {
+  // One bounded verification process (at most 10s), then the existing 2s network budget.
+  const budget = operationDeadline(12_000);
+  const signal = options.signal ? AbortSignal.any([options.signal, budget.signal]) : budget.signal;
   try {
-    const response = await localControlRequest(dir, "/local/status", { signal: AbortSignal.timeout(2000) });
+    const response = await localControlRequest(dir, "/local/status", { signal }, undefined, { networkTimeoutMs: 2000 });
     if (!response.ok) { await response.body?.cancel(); return null; }
     const body = await response.json() as { busy?: unknown; version?: unknown };
+    budget.check();
+    if (signal.aborted) return null;
     return { ...(typeof body.busy === "boolean" ? { busy: body.busy } : {}), ...(typeof body.version === "string" ? { version: body.version } : {}) };
   } catch { return null; }
 }
 /** The live host reserves idle and exits itself with a retryable status; never kill via a supervisor. */
 export async function refreshRunningHost(version: string, dir = remoteHome()): Promise<void> {
-  const response = await localControlRequest(dir, "/local/refresh", { method: "POST", signal: AbortSignal.timeout(2000) });
+  const budget = operationDeadline(25_000);
+  const response = await localControlRequest(dir, "/local/refresh", { method: "POST", signal: budget.signal }, undefined, { networkTimeoutMs: 2000 });
   await response.body?.cancel();
+  budget.check();
   if (!response.ok) throw new Error(response.status === 404 ? "안전한 자동 교체를 지원하지 않는 호스트입니다. 작업이 끝난 뒤 호스트를 다시 시작해 주세요." : `host refresh deferred (${response.status})`);
-  const deadline = Date.now() + 25_000;
-  while (Date.now() < deadline) {
-    await delay(200);
-    if ((await hostStatus(dir))?.version === version) return;
+  for (;;) {
+    budget.check();
+    await delay(200, undefined, { signal: budget.signal });
+    const status = await hostStatus(dir, { signal: budget.signal });
+    budget.check();
+    if (status?.version === version) return;
   }
-  throw new Error("host did not start the target version; application remains pending");
 }
 
 export async function installService(spec: Spec, deps: HostServiceDeps = {}): Promise<string[]> {

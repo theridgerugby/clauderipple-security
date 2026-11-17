@@ -5,7 +5,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { withFileLock, writeJsonAtomic } from "./locked-file.ts";
-import { ensurePrivateDirectory, readPrivateFileStrict } from "./private-file.ts";
+import { ensurePrivateDirectory, readPrivateFileStrict, readPrivateFilesStrict } from "./private-file.ts";
 import { createCa, createLeaf } from "./x509.ts";
 
 export interface AdminTlsIdentity {
@@ -25,6 +25,15 @@ export interface AdminEndpoint {
 const IDENTITY_FILE = "admin-tls-identity.json";
 const ENDPOINT_FILE = "admin-tls-endpoint.json";
 
+export function adminTransportPaths(home: string): { identity: string; endpoint: string } {
+  return { identity: path.join(home, IDENTITY_FILE), endpoint: path.join(home, ENDPOINT_FILE) };
+}
+
+export function parseAdminStateJson(text: string): unknown {
+  try { return JSON.parse(text) as unknown; }
+  catch { throw new Error("invalid local admin transport state"); }
+}
+
 function readState(file: string): unknown | undefined {
   let text: string;
   try {
@@ -38,8 +47,7 @@ function readState(file: string): unknown | undefined {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
   }
-  try { return JSON.parse(text) as unknown; }
-  catch { throw new Error("invalid local admin transport state"); }
+  return parseAdminStateJson(text);
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -67,6 +75,10 @@ function validIdentity(value: unknown, checkExpiration = true): value is AdminTl
 export function readAdminTlsIdentity(home: string): AdminTlsIdentity | undefined {
   const value = readState(path.join(home, IDENTITY_FILE));
   if (value === undefined) return undefined;
+  return parseAdminTlsIdentity(value);
+}
+
+export function parseAdminTlsIdentity(value: unknown): AdminTlsIdentity {
   if (!validIdentity(value)) throw new Error("invalid or expired local admin TLS identity");
   return value;
 }
@@ -105,8 +117,23 @@ function validEndpoint(value: unknown): value is AdminEndpoint {
 export function readAdminEndpoint(home: string): AdminEndpoint | undefined {
   const value = readState(path.join(home, ENDPOINT_FILE));
   if (value === undefined) return undefined;
+  return parseAdminEndpoint(value);
+}
+
+export function parseAdminEndpoint(value: unknown): AdminEndpoint {
   if (!validEndpoint(value)) throw new Error("invalid local admin endpoint state");
   return value;
+}
+
+/** A stop receipt needs only fresh protected discovery, not the current configured port. */
+export async function readAdminEndpointAsync(home: string, options: { signal?: AbortSignal } = {}): Promise<AdminEndpoint | undefined> {
+  let files: Buffer[];
+  try { files = await readPrivateFilesStrict([{ file: adminTransportPaths(home).endpoint, maxBytes: 64 * 1024 }], options); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  return parseAdminEndpoint(parseAdminStateJson(files[0]!.toString("utf8")));
 }
 
 export function writeAdminEndpoint(home: string, endpoint: AdminEndpoint): void {

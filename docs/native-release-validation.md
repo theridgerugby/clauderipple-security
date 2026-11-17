@@ -104,7 +104,16 @@ checked after building.
 
 Only successful candidates move to `packages/app/release/verified-*`. Each has
 `release-verification.json` with the checked signer, architectures, fuse policy
-and artifact SHA-256 digests. Failed `.candidate-*` files remain local diagnostic
+and artifact SHA-256 digests. Before accessing the signing key or starting the
+build, the command requires a clean Git checkout and records its commit, tree
+and `package-lock.json` SHA-256. It requires the same clean checkout again before
+promoting the receipt; staged, tracked or untracked source changes block release.
+Ignored build/staging output stays allowed. Production consumes the committed
+icon assets instead of redrawing tracked files. The source fields identify the
+local build inputs; they do not assert review approval, CI success, hermetic
+execution or a SLSA/provenance attestation. Associate the exact commit with the
+completed CI run and artifact-acceptance evidence separately.
+Failed `.candidate-*` files remain local diagnostic
 material and must not be distributed. These commands never publish a release.
 
 Development commands `dist` and `dist:win` deliberately produce unsigned unpacked

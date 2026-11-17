@@ -50,17 +50,25 @@ export function routerAdminUrl(configFile = routerConfigPath()): string {
   return `http://127.0.0.1:${adminPort(new ConfigStore(configFile).get())}`;
 }
 
-/** `persist: false` reads without writing the generated secrets (for commands that only print). */
-export function loadConfig(dir = remoteHome(), persist = true): HostConfig {
-  const file = path.join(dir, "host.json");
-  const stored = (readPhoneHostRecord(file) ?? {}) as Partial<HostConfig>;
-  if (typeof stored !== "object" || Array.isArray(stored) ||
-      (stored.pairingSecurityVersion !== undefined && stored.pairingSecurityVersion !== 2)) {
+/** Pure record validation shared with the async, owner-verified local-control snapshot. */
+export function parseStoredHostConfig(value: unknown): Partial<HostConfig> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("invalid phone host configuration or pairing security version");
+  }
+  const stored = value as Partial<HostConfig>;
+  if (stored.pairingSecurityVersion !== undefined && stored.pairingSecurityVersion !== 2) {
     throw new Error("invalid phone host configuration or pairing security version");
   }
   if (stored.pairingSecurityVersion === 2 && (typeof stored.token !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(stored.token))) {
     throw new Error("invalid migrated phone pairing token");
   }
+  return stored;
+}
+
+/** `persist: false` reads without writing the generated secrets (for commands that only print). */
+export function loadConfig(dir = remoteHome(), persist = true): HostConfig {
+  const file = path.join(dir, "host.json");
+  const stored = parseStoredHostConfig(readPhoneHostRecord(file) ?? {});
   const cfg: HostConfig = {
     token: typeof stored.token === "string" && stored.token.length >= 32 ? stored.token : newToken(),
     ...(stored.pairingSecurityVersion === 2 ? { pairingSecurityVersion: 2 as const } : {}),
@@ -79,18 +87,14 @@ export function loadConfig(dir = remoteHome(), persist = true): HostConfig {
 export function saveConfig(cfg: HostConfig, dir = remoteHome()): void {
   const file = path.join(dir, "host.json");
   withFileLock(file, () => {
-    const current = readPhoneHostRecord(file) as Partial<HostConfig> | undefined;
-    if (current !== undefined && (typeof current !== "object" || Array.isArray(current) ||
-        (current.pairingSecurityVersion !== undefined && current.pairingSecurityVersion !== 2))) {
-      throw new Error("invalid phone host configuration or pairing security version");
-    }
+    const record = readPhoneHostRecord(file);
+    const current = record === undefined ? undefined : parseStoredHostConfig(record);
     // Ordinary settings writes never replace an existing capability or its generation. Both
     // a legacy snapshot and a stale v2 snapshot must preserve a later explicit rotation.
     // ensurePhonePairingSecurity / rotatePhonePairingToken own the only credential writes.
     if (current !== undefined) {
       if (current.pairingSecurityVersion === 2) {
-        if (typeof current.token !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(current.token)) throw new Error("invalid migrated phone pairing token");
-        cfg = { ...cfg, token: current.token, pairingSecurityVersion: 2 };
+        cfg = { ...cfg, token: current.token!, pairingSecurityVersion: 2 };
       } else {
         cfg = { ...cfg, ...(typeof current.token === "string" && current.token.length >= 32 ? { token: current.token } : {}) };
         delete cfg.pairingSecurityVersion;
