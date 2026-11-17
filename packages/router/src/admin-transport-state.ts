@@ -5,8 +5,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { withFileLock, writeJsonAtomic } from "./locked-file.ts";
-import { ensurePrivateDirectory, readPrivateFile } from "./private-file.ts";
-import { verifyWindowsPrivateAcl } from "./windows-private-acl.ts";
+import { ensurePrivateDirectory, readPrivateFileStrict } from "./private-file.ts";
 import { createCa, createLeaf } from "./x509.ts";
 
 export interface AdminTlsIdentity {
@@ -33,9 +32,7 @@ function readState(file: string): unknown | undefined {
     if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error("admin transport state must be a regular private file");
     // These are new trust anchors, not legacy provider storage. An exposed signing key may
     // already have been copied; chmod/ACL repair must never make it trusted again silently.
-    if (process.platform === "win32") verifyWindowsPrivateAcl(file, false);
-    else if ((stat.mode & 0o077) !== 0) throw new Error("admin transport state permissions must be owner-only (0600)");
-    text = readPrivateFile(file, 64 * 1024).toString("utf8");
+    text = readPrivateFileStrict(file, 64 * 1024).toString("utf8");
   }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;

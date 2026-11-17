@@ -8,11 +8,18 @@ import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { ensureAdminTlsIdentity } from "../../router/src/admin-transport-state.ts";
 import { ensureAdminToken } from "../../router/src/admin-auth.ts";
+import { verifySystemSandboxHelper } from "./linux-sandbox.mjs";
 
 if (process.argv.length !== 2 || process.env.ELECTRON_DISABLE_SANDBOX || process.env.ELECTRON_RUN_AS_NODE ||
     process.getuid?.() === 0) throw new Error("Native security tests require an unmodified sandbox-enabled Electron process running as a normal user");
 const require = createRequire(import.meta.url);
 const executable = require("electron");
+// Ubuntu restricts unprivileged user namespaces for downloaded developer binaries. Use the
+// runner's already-installed, root-owned Chrome helper when explicitly configured, without
+// changing AppArmor/sysctls, installing setuid files, or disabling Chromium's sandbox.
+if (process.platform === "linux" && process.env.CHROME_DEVEL_SANDBOX) {
+  verifySystemSandboxHelper(process.env.CHROME_DEVEL_SANDBOX);
+}
 const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-native-security-"));
 try {
   // Node 24 prepares real disposable, owner-protected TLS state before Electron starts. These

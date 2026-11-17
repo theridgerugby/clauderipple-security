@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import {
-  applyWindowsPrivateAcl, ensurePrivateDirectory, readPrivateFile, WINDOWS_PRIVATE_ACL_SCRIPT,
+  applyWindowsPrivateAcl, ensurePrivateDirectory, readPrivateFile, readPrivateFileStrict, WINDOWS_PRIVATE_ACL_SCRIPT,
 } from "../src/private-file.ts";
 import { withFileLock, writeJsonAtomic, writePrivateFileAtomic } from "../src/locked-file.ts";
 import { readClaudeAuthFile, saveClaudeAuthFile } from "../src/providers/anthropic-token-file.ts";
@@ -40,6 +40,54 @@ test("private reads tighten owner-created legacy files before reading", { skip: 
   fs.chmodSync(file, 0o644);
   assert.equal(readPrivateFile(file).toString(), "dummy-credential");
   assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+});
+
+test("strict new-namespace reads refuse exposed POSIX permissions without consuming or repairing bytes", { skip: process.platform === "win32" }, t => {
+  const home = fixture(t), file = path.join(home, "capability");
+  fs.writeFileSync(file, "dummy-credential", { mode: 0o644 });
+  fs.chmodSync(file, 0o644);
+  let reads = 0;
+  t.mock.method(fs, "readSync", () => { reads++; throw new Error("must not read exposed bytes"); });
+  t.mock.method(fs, "chmodSync", () => { throw new Error("must not repair a new trust anchor"); });
+  t.mock.method(fs, "fchmodSync", () => { throw new Error("must not repair a new trust anchor"); });
+  assert.throws(() => readPrivateFileStrict(file), /owner-only/);
+  assert.equal(reads, 0);
+  assert.equal(fs.statSync(file).mode & 0o777, 0o644);
+});
+
+test("strict reads reject a pathname replaced while opening its descriptor before consuming bytes", t => {
+  const home = fixture(t), file = path.join(home, "capability"), replacement = path.join(home, "replacement");
+  writePrivateFileAtomic(file, "dummy-original");
+  writePrivateFileAtomic(replacement, "dummy-replacement");
+  const open = fs.openSync;
+  let exchanged = false, reads = 0;
+  t.mock.method(fs, "openSync", (...args: Parameters<typeof fs.openSync>) => {
+    if (args[0] === file && !exchanged) { exchanged = true; fs.renameSync(replacement, file); }
+    return open(...args);
+  });
+  t.mock.method(fs, "readSync", () => { reads++; throw new Error("must not read a replaced file"); });
+  assert.throws(() => readPrivateFileStrict(file), /changed while reading or verifying/);
+  assert.equal(exchanged, true);
+  assert.equal(reads, 0);
+});
+
+test("strict reads retain bounded reads and reject a file modified before returning its bytes", t => {
+  const home = fixture(t), file = path.join(home, "capability");
+  writePrivateFileAtomic(file, "dummy-credential");
+  assert.throws(() => readPrivateFileStrict(file, 2), /size bound/);
+  assert.throws(() => readPrivateFileStrict(file, -1), /size bound/);
+  const read = fs.readSync;
+  let changed = false;
+  t.mock.method(fs, "readSync", (...args: Parameters<typeof fs.readSync>) => {
+    const count = read(...args);
+    if (!changed) {
+      changed = true;
+      fs.utimesSync(file, new Date(), new Date(Date.now() + 5000));
+    }
+    return count;
+  });
+  assert.throws(() => readPrivateFileStrict(file), /changed while reading or verifying/);
+  assert.equal(changed, true);
 });
 
 test("generic locks and JSON writes preserve an existing workspace's directory permissions", { skip: process.platform === "win32" }, t => {

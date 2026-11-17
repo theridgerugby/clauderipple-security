@@ -2,7 +2,7 @@
 // boundary, not protection against malware or administrators acting as the same user.
 import fs from "node:fs";
 import path from "node:path";
-import { applyWindowsPrivateAcl } from "./windows-private-acl.ts";
+import { applyWindowsPrivateAcl, verifyWindowsPrivateAcl } from "./windows-private-acl.ts";
 export { applyWindowsPrivateAcl, WINDOWS_PRIVATE_ACL_SCRIPT } from "./windows-private-acl.ts";
 
 const DEFAULT_MAX_BYTES = 8 * 1024 * 1024;
@@ -94,26 +94,72 @@ export function openPrivateRead(file: string): number {
   } catch (error) { fs.closeSync(fd); throw error; }
 }
 
+function assertReadLimit(maxBytes: number): void {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > 64 * 1024 * 1024) throw new Error("Invalid private storage size bound");
+}
+
+function readBoundedDescriptor(fd: number, maxBytes: number): Buffer {
+  if (fs.fstatSync(fd).size > maxBytes) throw new Error("Private storage exceeds its size bound");
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for (;;) {
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1 - total));
+    const count = fs.readSync(fd, chunk, 0, chunk.length, null);
+    if (!count) break;
+    total += count;
+    if (total > maxBytes) throw new Error("Private storage exceeds its size bound");
+    chunks.push(chunk.subarray(0, count));
+  }
+  return Buffer.concat(chunks, total);
+}
+
 /**
  * Read from a checked descriptor, without following symlinks or opening a FIFO indefinitely.
  * Existing owner-created legacy files are tightened before reading, never read after chmod fails.
  */
 export function readPrivateFile(file: string, maxBytes = DEFAULT_MAX_BYTES): Buffer {
-  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > 64 * 1024 * 1024) throw new Error("Invalid private storage size bound");
+  assertReadLimit(maxBytes);
   const fd = openPrivateRead(file);
+  try { return readBoundedDescriptor(fd, maxBytes); }
+  finally { fs.closeSync(fd); }
+}
+
+function assertStrictPermissions(stat: fs.Stats): void {
+  assertRegular(stat);
+  if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
+    throw new Error("Private storage permissions must already be owner-only (0600)");
+  }
+}
+
+function assertStrictSnapshot(file: string, expected: fs.Stats, fd: number): void {
+  const current = fs.lstatSync(file);
+  const opened = fs.fstatSync(fd);
+  assertStrictPermissions(current);
+  assertStrictPermissions(opened);
+  if (identity(current) !== identity(expected) || identity(opened) !== identity(expected)) {
+    throw new Error("Private storage changed while reading or verifying it");
+  }
+}
+
+/**
+ * New capabilities/trust anchors must already be private. Never repair permissions or reuse an
+ * ACL cache. Verify Windows ownership/DACLs once per read, with the descriptor opened first and
+ * its pathname identity checked before/after verification and reading. Trusted ancestors remain
+ * required, as for the private writers; pathname checks alone do not secure a hostile parent.
+ */
+export function readPrivateFileStrict(file: string, maxBytes = DEFAULT_MAX_BYTES): Buffer {
+  assertReadLimit(maxBytes);
+  const before = fs.lstatSync(file);
+  assertStrictPermissions(before);
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
   try {
-    if (fs.fstatSync(fd).size > maxBytes) throw new Error("Private storage exceeds its size bound");
-    const chunks: Buffer[] = [];
-    let total = 0;
-    for (;;) {
-      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1 - total));
-      const count = fs.readSync(fd, chunk, 0, chunk.length, null);
-      if (!count) break;
-      total += count;
-      if (total > maxBytes) throw new Error("Private storage exceeds its size bound");
-      chunks.push(chunk.subarray(0, count));
-    }
-    return Buffer.concat(chunks, total);
+    assertStrictSnapshot(file, before, fd);
+    if (before.size > maxBytes) throw new Error("Private storage exceeds its size bound");
+    if (process.platform === "win32") verifyWindowsPrivateAcl(file, false);
+    assertStrictSnapshot(file, before, fd);
+    const bytes = readBoundedDescriptor(fd, maxBytes);
+    assertStrictSnapshot(file, before, fd);
+    return bytes;
   } finally { fs.closeSync(fd); }
 }
 

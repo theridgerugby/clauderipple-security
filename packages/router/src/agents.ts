@@ -16,6 +16,7 @@ import os from "node:os";
 import path from "node:path";
 import { adminPort, homeDir, type Config, type Provider } from "./config.ts";
 import { withFileLock } from "./locked-file.ts";
+import { ensurePrivateDirectory } from "./private-file.ts";
 import { accountPinFor, declaredBy, pinnedModel, qualifiedModel } from "./routing.ts";
 import { storedAccountsFor, storedAccountsSignature, type PinnedAccount } from "./pinned-accounts.ts";
 import { bareOwners, isTargetProvider, namedOnly } from "./targets.ts";
@@ -481,11 +482,16 @@ function readManifest(file: string, strict = false): Manifest {
  * The shared worker folder's lock. The manifest is per home, but the files are one folder for every
  * installation on the account, so two routers or an install and a router would otherwise write the
  * same name over each other (2026-10-25 lock audit). The lock lives outside the folder so Claude
- * Code's watcher never sees it.
+ * Code's watcher never sees it. The shared system temp directory is commonly root-owned on
+ * Linux; own only a private per-user child, never change or trust the shared parent's ownership.
  */
 function agentDirLock(dir: string): string {
   const key = crypto.createHash("sha256").update(path.resolve(dir)).digest("hex").slice(0, 16);
-  return path.join(os.tmpdir(), `clauderipple-agents-${key}`);
+  const user = typeof process.getuid === "function" ? `uid-${process.getuid()}`
+    : crypto.createHash("sha256").update(os.homedir()).digest("hex").slice(0, 16);
+  const locks = path.join(os.tmpdir(), `clauderipple-agent-locks-${user}`);
+  ensurePrivateDirectory(locks);
+  return path.join(locks, `agents-${key}`);
 }
 
 /**

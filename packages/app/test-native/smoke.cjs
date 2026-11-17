@@ -69,7 +69,34 @@ async function run() {
   const owner = new BrowserWindow(bounds);
   windows.push(owner);
   configurePermissions(session.defaultSession, () => owner.webContents);
-  handleScheme(ui, () => base, home, () => owner.webContents);
+  // Observe the real guard's decisions without replacing its policy. Installing a second
+  // onBeforeRequest listener would replace the production listener, so wrap registration
+  // temporarily and restore the method immediately after handleScheme registers its guard.
+  const guardRequests = [];
+  const webRequest = session.defaultSession.webRequest;
+  const originalBeforeRequest = webRequest.onBeforeRequest;
+  const beforeRequestDescriptor = Object.getOwnPropertyDescriptor(webRequest, "onBeforeRequest");
+  let guardRegistrations = 0;
+  Object.defineProperty(webRequest, "onBeforeRequest", { configurable: true, writable: true, value: function(filter, listener) {
+    guardRegistrations++;
+    return originalBeforeRequest.call(this, filter, (details, callback) => listener(details, response => {
+      const pathname = new URL(details.url).pathname;
+      if (pathname.startsWith("/api/")) {
+        const frame = details.frame;
+        guardRequests.push({ path: pathname, resourceType: details.resourceType,
+          webContentsId: details.webContentsId, processId: frame?.processId,
+          routingId: frame?.routingId, frameUrl: frame?.url, cancel: response.cancel === true });
+      }
+      callback(response);
+    }));
+  } });
+  try { handleScheme(ui, () => base, home, () => owner.webContents); }
+  finally {
+    if (beforeRequestDescriptor) Object.defineProperty(webRequest, "onBeforeRequest", beforeRequestDescriptor);
+    else delete webRequest.onBeforeRequest;
+  }
+  assert.equal(webRequest.onBeforeRequest, originalBeforeRequest);
+  assert.equal(guardRegistrations, 1, "the production protocol must install exactly one request guard");
   ipcMain.handle("ripple-native:probe", event => trustedIpcSender(event, owner.webContents));
   await owner.loadURL(`${ORIGIN}/`);
   const isolation = await owner.webContents.executeJavaScript(`({
@@ -79,24 +106,58 @@ async function run() {
   })`);
   assert.deepEqual(isolation, { sandboxed: true, isolated: true, require: "undefined", process: "undefined", loaded: true,
     bridgeNames: ["sandboxed", "contextIsolated", "probe"] });
+  console.log("PASS native sandbox, context isolation and renderer Node isolation");
   assert.equal(await owner.webContents.executeJavaScript("rippleNative.probe()"), true);
   const response = await owner.webContents.executeJavaScript(`fetch('/api/status').then(async r => ({ status: r.status, text: await r.text(), headers: [...r.headers] }))`);
   assert.equal(response.status, 200);
   assert.deepEqual(JSON.parse(response.text), { fixture: true });
   assert.ok(!JSON.stringify(response).includes(secret));
   assert.equal(received, 1);
+  assert.ok(guardRequests.some(request => request.webContentsId === owner.webContents.id &&
+    request.routingId === owner.webContents.mainFrame.routingId && request.cancel === false));
+  console.log("PASS native owned-frame IPC and pinned TLS credential isolation");
   const permission = await owner.webContents.executeJavaScript("navigator.permissions.query({name: 'geolocation'}).then(p => p.state)");
   assert.equal(permission, "denied");
   await owner.webContents.executeJavaScript("const script = document.createElement('script'); script.textContent = 'window.inlineRan = true'; document.body.append(script)");
   assert.equal(await owner.webContents.executeJavaScript("window.inlineRan === true"), false);
-  const child = await owner.webContents.executeJavaScript(`(async () => {
-    const frame = document.createElement('iframe'); document.body.append(frame);
-    try { return await frame.contentWindow.fetch('${ORIGIN}/api/status').then(r => r.status); }
-    catch { return 'blocked'; }
-    finally { frame.remove(); }
-  })()`);
-  assert.equal(child, "blocked");
+  console.log("PASS native permission denial and inline-script CSP");
+  // Execute inside Chromium's browser-owned child context after it loads, and verify the
+  // actual guard's frame attribution. Cross-window function calls alone do not establish it.
+  await owner.webContents.executeJavaScript(`new Promise(resolve => {
+    const frame = document.createElement('iframe'); frame.id = 'security-child';
+    frame.onload = () => resolve(true); document.body.append(frame);
+  })`);
+  const children = owner.webContents.mainFrame.frames;
+  assert.equal(children.length, 1);
+  const childFrame = children[0];
+  assert.notEqual(childFrame.routingId, owner.webContents.mainFrame.routingId);
+  assert.equal(await childFrame.executeJavaScript("window === window.top"), false);
+  const childTraceStart = guardRequests.length;
+  const child = await childFrame.executeJavaScript(`fetch('${ORIGIN}/api/status').then(r => r.status).catch(() => 'blocked')`);
+  const childRequests = guardRequests.slice(childTraceStart);
+  console.log("TRACE native child request", JSON.stringify({ result: child, requests: childRequests }));
+  assert.equal(child, "blocked", "a request executed inside the child frame must be denied");
+  assert.equal(childRequests.length, 1, "the production guard must see the actual child request");
+  assert.deepEqual(childRequests.map(request => ({ contents: request.webContentsId, process: request.processId,
+    frame: request.routingId, cancel: request.cancel })), [{ contents: owner.webContents.id,
+    process: childFrame.processId, frame: childFrame.routingId, cancel: true }]);
+  await owner.webContents.executeJavaScript("document.getElementById('security-child').remove()");
   assert.equal(received, 1, "an unowned child frame cannot borrow the capability");
+  console.log("PASS native child-originated API denial");
+
+  const sameOrigin = new BrowserWindow(bounds);
+  windows.push(sameOrigin);
+  await sameOrigin.loadURL(`${ORIGIN}/`);
+  assert.equal(await sameOrigin.webContents.executeJavaScript("rippleNative.probe()"), false);
+  const sameOriginTraceStart = guardRequests.length;
+  assert.equal(await sameOrigin.webContents.executeJavaScript(`fetch('/api/status').then(r => r.status).catch(() => 'blocked')`), "blocked");
+  const sameOriginRequests = guardRequests.slice(sameOriginTraceStart);
+  assert.equal(sameOriginRequests.length, 1);
+  assert.deepEqual(sameOriginRequests.map(request => ({ contents: request.webContentsId, frame: request.routingId,
+    cancel: request.cancel })), [{ contents: sameOrigin.webContents.id,
+    frame: sameOrigin.webContents.mainFrame.routingId, cancel: true }]);
+  assert.equal(received, 1, "a second same-origin window cannot use the owned dashboard's bridge");
+  console.log("PASS native same-origin unowned window IPC and API denial");
 
   const foreign = new BrowserWindow(bounds);
   windows.push(foreign);
@@ -108,6 +169,7 @@ async function run() {
   try { const browserRequest = await net.fetch(`${ORIGIN}/api/status`); assert.equal(browserRequest.status, 403); }
   catch (error) { assert.match(String(error), /ERR_BLOCKED|Failed to fetch|ERR_FAILED/); }
   assert.equal(received, 1, "browser-initiated requests have no owner frame");
+  console.log("PASS native foreign-window and browser-initiated API denial");
   // A process that takes over the exact TLS port with another identity must receive neither the
   // capability nor an HTTP request body. Keep the trusted endpoint/pin unchanged during this test.
   server.closeAllConnections();

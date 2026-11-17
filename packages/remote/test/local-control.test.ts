@@ -210,7 +210,9 @@ test("a legacy unrotated host refuses even a relay pairing URL", async t => {
 
 test("inbox routes authenticate, validate and enforce first-wins without logging text", async t => {
   const f = await fixture(t);
-  const offered = f.inbox.offer({ sessionId: "cli-1", itemId: "item-1", text: "private inbox text", offeredAt: 123 }, 1000);
+  // This exercises route authentication and first-wins, not the expiry deadline. Native Windows
+  // requests also verify private ACLs; leave time for those real checks before claiming the offer.
+  const offered = f.inbox.offer({ sessionId: "cli-1", itemId: "item-1", text: "private inbox text", offeredAt: 123 }, 60_000);
   assert.equal((await fetch(`${f.base}/local/inbox?session=cli-1`)).status, 410);
   assert.equal((await f.call("inbox")).status, 400);
   assert.deepEqual(await (await f.call("inbox?session=other")).json(), { offers: [] });

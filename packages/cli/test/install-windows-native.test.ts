@@ -8,11 +8,18 @@ import { spawnSync } from "node:child_process";
 const installer = path.resolve(import.meta.dirname, "../../../scripts/install.ps1");
 
 function powershell(source: string, env: NodeJS.ProcessEnv) {
-  // Keep the launcher constant and pass fixture code on stdin. No execution-policy override or
-  // machine configuration is needed to run this isolated in-memory test harness.
-  return spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; & ([scriptblock]::Create([Console]::In.ReadToEnd()))"], {
-    input: source, env, encoding: "utf8", timeout: 30_000,
-  });
+  // A real throwaway script gives extracted functions and their $script: recovery state the
+  // same scope as the production installer. An invoked in-memory block has no own script
+  // scope, so $script:NodeBackup could resolve outside its local fixture initialization.
+  // The fixture remains local and unsigned; no execution-policy override or machine change.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "cr-win-ps-fixture-"));
+  const script = path.join(directory, "fixture.ps1");
+  try {
+    fs.writeFileSync(script, "\uFEFF" + source, "utf8");
+    return spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-File", script], {
+      env, encoding: "utf8", timeout: 30_000,
+    });
+  } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 }
 
 // These tests execute only selected installer functions against temporary fixtures. Every
@@ -35,7 +42,9 @@ if ($errors.Count) { throw ($errors | Out-String) }
 foreach ($name in @('Install-Node', 'Restore-NodeRuntime')) {
   $definition = $tree.Find({ param($ast) $ast -is [Management.Automation.Language.FunctionDefinitionAst] -and $ast.Name -eq $name }, $true)
   if (-not $definition) { throw "missing installer function: $name" }
-  Set-Item -LiteralPath "Function:\$name" -Value $definition.Body.GetScriptBlock()
+  # Reparse only this trusted function declaration into the fixture's script scope rather
+  # than keeping the original install.ps1 AST's execution binding. The installer body never runs.
+  . ([scriptblock]::Create($definition.Extent.Text))
 }
 function Get-NodeMajor([string]$exe) { if ($env:FAIL_POINT -eq 'bad-node') { return 0 }; return 24 }
 function Invoke-RestMethod { return [pscustomobject]@{version='v24.0.0'} }

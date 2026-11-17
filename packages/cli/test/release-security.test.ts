@@ -88,6 +88,9 @@ test("release permissions are isolated from builds and every supported OS is a m
   assert.doesNotMatch(ci, /continue-on-error/);
   assert.match(ci, /npm ci --ignore-scripts/);
   assert.match(ci, /npm audit --audit-level=low/);
+  assert.match(ci, /run: npm run test:ci/);
+  const scripts = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).scripts;
+  assert.equal(scripts["test:ci"], scripts.test.replace("node --test ", "node --test --test-reporter=tap "), "CI must run the identical full suite with immediate failure diagnostics");
   assert.match(ci, /xvfb-run -a npm run test:native/);
   assert.doesNotMatch(ci, /--no-sandbox/);
   const native = ci.slice(ci.indexOf("\n  native-security:"));
@@ -96,6 +99,8 @@ test("release permissions are isolated from builds and every supported OS is a m
   assert.match(native, /npm ci --ignore-scripts/);
   assert.match(native, /run: npm run build/);
   assert.match(native, /runner\.os != 'Linux'/);
+  assert.match(native, /CHROME_DEVEL_SANDBOX: \/opt\/google\/chrome\/chrome-sandbox/);
+  assert.doesNotMatch(native, /sudo|sysctl|chmod|chown|--disable-setuid-sandbox/);
   assert.doesNotMatch(native, /needs:|continue-on-error|if:.*(?:failure|cancelled)/);
   const source = fs.readFileSync(path.join(root, ".github/workflows/publish.yml"), "utf8");
   const start = source.indexOf("\n  publish:");

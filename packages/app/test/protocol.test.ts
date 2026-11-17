@@ -44,7 +44,7 @@ function harness(admin: string, home = "/tmp/unused-ripple-home", transport: typ
   });
   assert.ok(exports.handleScheme && exports.registerScheme);
   exports.registerScheme();
-  exports.handleScheme("/tmp/unused-ripple-ui", () => admin, home, () => ({ id: 5, mainFrame: frame }));
+  exports.handleScheme(path.resolve("/tmp/unused-ripple-ui"), () => admin, home, () => ({ id: 5, mainFrame: frame }));
   assert.ok(handler);
   assert.ok(guard);
   const raw = handler;

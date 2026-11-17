@@ -55,7 +55,8 @@ jobs:
       # its relative imports and checks the manifests; `claude plugin test packages/mod` stays a
       # maintainer step on a machine that has the engine.
       - run: npm run check:mod
-      - run: npm test
+      # TAP emits each failed assertion immediately, even if a later fixture hangs.
+      - run: npm run test:ci
       - run: npm run build
 
   # Collect real desktop-boundary evidence even while a platform's full suite is
@@ -86,6 +87,10 @@ jobs:
       - run: npm run build
       - name: Native Electron boundary tests (Linux)
         if: runner.os == 'Linux'
+        env:
+          # Use the image's installed Chromium sandbox helper; keep AppArmor and all
+          # sandbox flags intact. run.mjs rejects unsafe ownership/modes or a missing file.
+          CHROME_DEVEL_SANDBOX: /opt/google/chrome/chrome-sandbox
         run: xvfb-run -a npm run test:native --workspace @clauderipple/app
       - name: Native Electron boundary tests (Windows and macOS)
         if: runner.os != 'Linux'
