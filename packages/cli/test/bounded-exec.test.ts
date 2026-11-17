@@ -7,6 +7,7 @@ import { execBounded, killProcessTree, type BoundedChild, type BoundedSpawn } fr
 
 class FakeChild extends EventEmitter {
   pid = 4242;
+  stdin = new PassThrough();
   stdout = new PassThrough();
   stderr = new PassThrough();
   killed: string[] = [];
@@ -134,4 +135,64 @@ test("a real command whose grandchild holds the pipes is cut at the deadline", {
 test("a real command that finishes is read whole", async () => {
   const out = await execBounded(process.execPath, ["-e", "process.stdout.write('hello')"], { timeoutMs: 10_000 });
   assert.equal(out, "hello");
+});
+
+test("bounded stdin is pipe data, never argv, and all pipes close on success", async () => {
+  const input = JSON.stringify({ paths: ["C:\\fixture\\quote'; $(not-code)\\secret"] });
+  const child = new FakeChild();
+  let received = "";
+  child.stdin.on("data", chunk => { received += String(chunk); });
+  const result = execBounded("trusted.exe", ["fixed-code"], {
+    timeoutMs: 5000, input, spawn: (file, args, options) => {
+      assert.equal(file, "trusted.exe"); assert.deepEqual(args, ["fixed-code"]);
+      assert.deepEqual(options.stdio, ["pipe", "pipe", "pipe"]);
+      return child;
+    },
+  });
+  assert.equal(received, input);
+  child.stdout.write("ack"); child.emit("close", 0, null);
+  assert.equal(await result, "ack");
+  for (const stream of [child.stdin, child.stdout, child.stderr]) assert.equal(stream.destroyed, true);
+});
+
+test("pre-cancelled or oversized stdin requests do not spawn a helper", async () => {
+  const controller = new AbortController(); controller.abort("dummy-private-reason");
+  let calls = 0;
+  const spawn: BoundedSpawn = () => { calls++; return new FakeChild(); };
+  await assert.rejects(execBounded("trusted.exe", [], { timeoutMs: 5000, signal: controller.signal, spawn }),
+    (error: Error) => error.name === "AbortError" && !error.message.includes("dummy-private-reason"));
+  await assert.rejects(execBounded("trusted.exe", [], { timeoutMs: 5000, input: Buffer.alloc(1024 * 1024 + 1), spawn }), /stdin exceeds/);
+  assert.equal(calls, 0);
+});
+
+test("cancellation kills the helper tree and closes stdin/stdout/stderr without waiting for close", async () => {
+  const controller = new AbortController(), child = new FakeChild();
+  let killed = 0;
+  const result = execBounded("trusted.exe", [], { timeoutMs: 5000, input: "dummy-data", signal: controller.signal,
+    spawn: () => child, killTree: actual => { assert.equal(actual, child); killed++; },
+  });
+  controller.abort();
+  await assert.rejects(result, { name: "AbortError", code: "ABORT_ERR" });
+  assert.equal(killed, 1);
+  for (const stream of [child.stdin, child.stdout, child.stderr]) assert.equal(stream.destroyed, true);
+  child.emit("close", 0, null); child.emit("error", new Error("late helper error"));
+  assert.equal(killed, 1);
+});
+
+test("an abort after Windows child exit releases pipes without killing a recycled PID", async () => {
+  const controller = new AbortController(), child = new FakeChild();
+  let killed = 0;
+  const result = execBounded("trusted.exe", [], { timeoutMs: 5000, platform: "win32", input: "dummy-data", signal: controller.signal,
+    spawn: () => child, killTree: () => { killed++; },
+  });
+  child.emit("exit", 0, null); controller.abort();
+  await assert.rejects(result, { name: "AbortError" });
+  assert.equal(killed, 0);
+  for (const stream of [child.stdin, child.stdout, child.stderr]) assert.equal(stream.destroyed, true);
+});
+
+test("a real helper receives bounded stdin intact", async () => {
+  const input = JSON.stringify({ files: ["dummy-one", "dummy-two"] });
+  const script = "process.stdin.setEncoding('utf8');let s='';process.stdin.on('data',x=>s+=x);process.stdin.on('end',()=>process.stdout.write(String(JSON.parse(s).files.length)))";
+  assert.equal(await execBounded(process.execPath, ["-e", script], { timeoutMs: 10_000, input }), "2");
 });

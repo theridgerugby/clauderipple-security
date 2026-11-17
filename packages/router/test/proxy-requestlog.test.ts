@@ -10,6 +10,7 @@ import tls from "node:tls";
 import { CertStore } from "../src/certs.ts";
 import { DEFAULTS, type Config } from "../src/config.ts";
 import { UpstreamHealth } from "../src/health.ts";
+import { writePrivateFileAtomic } from "../src/locked-file.ts";
 import { Logger } from "../src/log.ts";
 import { Proxy } from "../src/proxy.ts";
 import { ObservedClaudeCodeAuth } from "../src/providers/anthropic-observed.ts";
@@ -22,15 +23,16 @@ import { createCa, createLeaf } from "../src/x509.ts";
 const noClaudeCodeCredentialReaders = { keychain: () => null, credentialsFile: () => null };
 
 async function rig(options: { respond?: (res: http.ServerResponse, req: http.IncomingMessage) => void; healthLimit?: number; profiles?: Record<string, string>; profileWait?: Promise<void>; refuse?: (req: http.IncomingMessage) => number | undefined; noPool?: boolean } = {}) {
+  const setupStarted = performance.now();
   // The current login's email per bearer token, as `/api/oauth/profile` would name it. `profileWait`
   // holds each answer until it resolves, to show what a slow lookup does to the turn and its row.
   const profiles = options.profiles ?? {};
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-log-metadata-"));
   const ca = createCa({ cn: "request log test" });
   const leaf = createLeaf({ host: "localhost", caCertPem: ca.certPem, caKeyPem: ca.keyPem });
-  fs.writeFileSync(path.join(home, "ca.pem"), ca.certPem);
-  fs.writeFileSync(path.join(home, "ca.key"), ca.keyPem);
-  fs.writeFileSync(path.join(home, "chatgpt-auth.json"), JSON.stringify({ accessToken: "test-token", accountId: "test-account", expiresAt: Date.now() + 3600_000, source: "own" }));
+  writePrivateFileAtomic(path.join(home, "ca.pem"), ca.certPem);
+  writePrivateFileAtomic(path.join(home, "ca.key"), ca.keyPem);
+  writePrivateFileAtomic(path.join(home, "chatgpt-auth.json"), JSON.stringify({ accessToken: "test-token", accountId: "test-account", expiresAt: Date.now() + 3600_000, source: "own" }));
   const seen: Record<string, unknown>[] = [];
   const seenAuth: (string | undefined)[] = [];
   let responseStatus = 200;
@@ -109,17 +111,49 @@ async function rig(options: { respond?: (res: http.ServerResponse, req: http.Inc
     const email = profiles[token];
     return email ? new Response(JSON.stringify({ account: { uuid: `uuid-${token}`, email } }), { status: 200 }) : new Response("{}", { status: 404 });
   };
-  const proxy = new Proxy({ config: () => cfg, home, requests, claudeCodeCredentialReaders: noClaudeCodeCredentialReaders, observedClaudeCodeAuth: observed, agentDir: path.join(home, "agents"), certs: new CertStore(home), log: new Logger(path.join(home, "router.log"), 1e6, 1, false), health, upstreamPort: (native.address() as net.AddressInfo).port, upstreamAgent: agent, claudeProfileFetch,
+  const log = new Logger(path.join(home, "router.log"), 1e6, 1, false);
+  const proxy = new Proxy({ config: () => cfg, home, requests, claudeCodeCredentialReaders: noClaudeCodeCredentialReaders, observedClaudeCodeAuth: observed, agentDir: path.join(home, "agents"), certs: new CertStore(home), log, health, upstreamPort: (native.address() as net.AddressInfo).port, upstreamAgent: agent, claudeProfileFetch,
     // Each login is its own durable key, as a switch of the app's login is: the rest of a refused login must not follow to the next.
     claudeLoginKey: () => { const authorization = observed.getFresh()?.authorization; return authorization ? `login:${authorization}` : undefined; } });
   await proxy.listen();
-  const send = async (model: string, extra: Record<string, unknown> = {}, pathname = "/v1/messages", beforeSend?: (socket: tls.TLSSocket) => void, headers: Record<string, string> = {}) => {
+  const connectTls = async (): Promise<tls.TLSSocket> => {
     const socket = net.connect(port, "127.0.0.1");
-    await new Promise<void>((resolve) => socket.once("connect", resolve));
-    socket.write("CONNECT localhost:443 HTTP/1.1\r\nHost: localhost:443\r\n\r\n");
-    await new Promise<void>((resolve) => socket.once("data", () => resolve()));
-    const secure = tls.connect({ socket, servername: "localhost", ca: ca.certPem });
-    await new Promise<void>((resolve) => secure.once("secureConnect", resolve));
+    let secure: tls.TLSSocket | undefined;
+    try {
+      await new Promise<void>((resolve, reject) => { socket.once("connect", resolve); socket.once("error", reject); });
+      socket.write("CONNECT localhost:443 HTTP/1.1\r\nHost: localhost:443\r\n\r\n");
+      await new Promise<void>((resolve, reject) => { socket.once("data", () => resolve()); socket.once("error", reject); });
+      secure = tls.connect({ socket, servername: "localhost", ca: ca.certPem });
+      await new Promise<void>((resolve, reject) => { secure!.once("secureConnect", resolve); secure!.once("error", reject); });
+      return secure;
+    } catch (error) { secure?.destroy(); socket.destroy(); throw error; }
+  };
+  const stop = async (): Promise<void> => {
+    proxy.close(); agent.destroy();
+    await Promise.all([backend, native].map((server) => new Promise<void>((resolve) => {
+      server.close(() => resolve());
+      server.closeAllConnections();
+    })));
+    log.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  };
+  // The real router preloads its installed leaf and premints the other terminated hosts.
+  // Exercise a real, verified CONNECT/TLS handshake before timing request semantics: cold
+  // certificate generation and Windows ACL provisioning belong to fixture setup. No HTTP
+  // request, credentials, profile lookup or request-log record is sent during this warm-up.
+  const warmupStarted = performance.now();
+  try {
+    const warmup = await connectTls();
+    const closed = new Promise<void>((resolve) => warmup.once("close", resolve));
+    warmup.end();
+    await closed;
+    assert.equal(seen.length, 0, "TLS setup must not send a model request");
+    assert.equal(requests.list(1).length, 0, "TLS setup must not add a request-log row");
+  } catch (error) { await stop(); throw error; }
+  const tlsWarmupMs = performance.now() - warmupStarted;
+  const setupMs = performance.now() - setupStarted;
+  const send = async (model: string, extra: Record<string, unknown> = {}, pathname = "/v1/messages", beforeSend?: (socket: tls.TLSSocket) => void, headers: Record<string, string> = {}) => {
+    const secure = await connectTls();
     const body = JSON.stringify({ model, max_tokens: 16, stream: true, messages: [{ role: "user", content: "private-prompt" }], ...extra });
     const result = new Promise<string>((resolve, reject) => {
       let text = "";
@@ -141,41 +175,42 @@ async function rig(options: { respond?: (res: http.ServerResponse, req: http.Inc
     secure.destroy();
     return { text, record: requests.list(1)[0]! };
   };
-  return { cfg, seen, seenAuth, home, requests, proxy, observed, profiles, send, health, trips, failBackend: () => { responseStatus = 400; }, failImage: () => { imageStatus = 500; }, stop: async () => {
-    proxy.close(); agent.destroy();
-    await Promise.all([backend, native].map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
-    fs.rmSync(home, { recursive: true, force: true });
-  } };
+  return { cfg, seen, seenAuth, home, requests, proxy, observed, profiles, send, health, trips, setupMs, tlsWarmupMs, failBackend: () => { responseStatus = 400; }, failImage: () => { imageStatus = 500; }, stop };
 }
 
-test("repeated client cancellations before native headers never trip upstream health", { timeout: 5000 }, async () => {
+test("repeated client cancellations before native headers never trip upstream health", async (t) => {
   let received = Promise.withResolvers<http.ServerResponse>();
   const r = await rig({ respond: (res) => received.resolve(res), healthLimit: 2, noPool: true });
+  t.diagnostic(`fixture setup=${Math.round(r.setupMs)} ms, TLS warm-up=${Math.round(r.tlsWarmupMs)} ms`);
   try {
-    for (let i = 0; i < 3; i++) {
-      let client: tls.TLSSocket | undefined;
-      const sent = r.send("claude-native", {}, "/v1/messages", (socket) => { client = socket; });
-      const upstream = await received.promise;
-      const closed = new Promise<void>((resolve) => upstream.once("close", resolve));
-      client!.destroy();
-      await sent;
-      await closed;
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      assert.equal(r.health.consecutiveFailures, 0);
-      assert.deepEqual(r.trips, []);
-      assert.equal(r.requests.list(10).length, i + 1);
-      assert.equal(r.requests.list(1)[0]!.status, "aborted");
-      assert.equal(r.requests.list(1)[0]!.ok, false);
-      received = Promise.withResolvers<http.ServerResponse>();
-    }
-    assert.equal(r.proxy.stats.inFlight, 0);
-    assert.equal(r.proxy.stats.completed, 0);
-    assert.equal(r.proxy.stats.failed, 3);
+    await t.test("all three cancellations and health/log assertions complete within 5000 ms", { timeout: 5000 }, async () => {
+      const started = performance.now();
+      for (let i = 0; i < 3; i++) {
+        let client: tls.TLSSocket | undefined;
+        const sent = r.send("claude-native", {}, "/v1/messages", (socket) => { client = socket; });
+        const upstream = await received.promise;
+        const closed = new Promise<void>((resolve) => upstream.once("close", resolve));
+        client!.destroy();
+        await sent;
+        await closed;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(r.health.consecutiveFailures, 0);
+        assert.deepEqual(r.trips, []);
+        assert.equal(r.requests.list(10).length, i + 1);
+        assert.equal(r.requests.list(1)[0]!.status, "aborted");
+        assert.equal(r.requests.list(1)[0]!.ok, false);
+        received = Promise.withResolvers<http.ServerResponse>();
+      }
+      assert.equal(r.proxy.stats.inFlight, 0);
+      assert.equal(r.proxy.stats.completed, 0);
+      assert.equal(r.proxy.stats.failed, 3);
+      assert.ok(performance.now() - started < 5000, "the three ready-request cancellations keep their 5000 ms bound");
+    });
   } finally { await r.stop(); }
 });
 
 for (const [model, provider] of [["claude-native", "anthropic"], ["chat-test", "chat"], ["responses-test", "responses"], ["gpt-test", "gpt"], ["gemini-test", "google"]] as const) {
-  test(`cancelling ${model} after stream start is recorded once as aborted, not successful`, { timeout: 5000 }, async () => {
+  test(`cancelling ${model} after stream start is recorded once as aborted, not successful`, async (t) => {
     const received = Promise.withResolvers<http.ServerResponse>();
     const r = await rig({ respond: (res) => {
       res.writeHead(200, { "content-type": "text/event-stream" });
@@ -188,47 +223,56 @@ for (const [model, provider] of [["claude-native", "anthropic"], ["chat-test", "
             : 'data: {"type":"message_start","message":{"id":"msg_partial"}}\n\n');
       received.resolve(res);
     }, noPool: true });
+    t.diagnostic(`fixture setup=${Math.round(r.setupMs)} ms, TLS warm-up=${Math.round(r.tlsWarmupMs)} ms`);
     try {
-      const exhaustion = { reason: "quota_exhausted" as const, at: Date.now(), until: Date.now() + 60_000 };
-      r.proxy.providerHealth.observe(provider, 429, exhaustion);
-      const started = Promise.withResolvers<void>();
-      let client: tls.TLSSocket | undefined;
-      const sent = r.send(model, {}, "/v1/messages", (socket) => {
-        client = socket;
-        socket.once("data", () => started.resolve());
+      await t.test("cancellation and all accounting assertions complete within 5000 ms", { timeout: 5000 }, async () => {
+        const requestStarted = performance.now();
+        const exhaustion = { reason: "quota_exhausted" as const, at: Date.now(), until: Date.now() + 60_000 };
+        r.proxy.providerHealth.observe(provider, 429, exhaustion);
+        const started = Promise.withResolvers<void>();
+        let client: tls.TLSSocket | undefined;
+        const sent = r.send(model, {}, "/v1/messages", (socket) => {
+          client = socket;
+          socket.once("data", () => started.resolve());
+        });
+        const upstream = await received.promise;
+        const closed = new Promise<void>((resolve) => upstream.once("close", resolve));
+        await started.promise;
+        client!.destroy();
+        await sent;
+        await closed;
+        while (r.proxy.stats.inFlight > 0) await new Promise<void>((resolve) => setTimeout(resolve, 1));
+        assert.equal(r.requests.list(10).length, 1);
+        const record = r.requests.list(1)[0]!;
+        assert.equal(record.ok, false);
+        assert.equal(record.status, "aborted");
+        assert.equal(record.stopReason, undefined);
+        assert.equal(r.proxy.stats.completed, 0);
+        assert.equal(r.proxy.stats.failed, 1);
+        assert.equal(r.health.consecutiveFailures, 0);
+        if (provider === "chat" || provider === "responses") {
+          assert.deepEqual(r.proxy.providerHealth.snapshot()[provider], exhaustion, "a cancelled OpenAI turn must not clear an earlier provider exhaustion as a success");
+        }
+        assert.ok(performance.now() - requestStarted < 5000, "the ready-request cancellation keeps its 5000 ms bound");
       });
-      const upstream = await received.promise;
-      const closed = new Promise<void>((resolve) => upstream.once("close", resolve));
-      await started.promise;
-      client!.destroy();
-      await sent;
-      await closed;
-      while (r.proxy.stats.inFlight > 0) await new Promise<void>((resolve) => setTimeout(resolve, 1));
-      assert.equal(r.requests.list(10).length, 1);
-      const record = r.requests.list(1)[0]!;
-      assert.equal(record.ok, false);
-      assert.equal(record.status, "aborted");
-      assert.equal(record.stopReason, undefined);
-      assert.equal(r.proxy.stats.completed, 0);
-      assert.equal(r.proxy.stats.failed, 1);
-      assert.equal(r.health.consecutiveFailures, 0);
-      if (provider === "chat" || provider === "responses") {
-        assert.deepEqual(r.proxy.providerHealth.snapshot()[provider], exhaustion, "a cancelled OpenAI turn must not clear an earlier provider exhaustion as a success");
-      }
     } finally { await r.stop(); }
   });
 }
 
-test("real native connection resets still count toward upstream health", { timeout: 5000 }, async () => {
+test("real native connection resets still count toward upstream health", async (t) => {
   const r = await rig({ respond: (res) => res.destroy(), healthLimit: 2, noPool: true });
   try {
-    for (let i = 0; i < 2; i++) {
-      const { text, record } = await r.send("claude-native");
-      assert.match(text, /^HTTP\/1\.1 502/);
-      assert.equal(record.ok, false);
-    }
-    assert.equal(r.health.consecutiveFailures, 2);
-    assert.deepEqual(r.trips, [2]);
+    await t.test("resets and health assertions complete within 5000 ms", { timeout: 5000 }, async () => {
+      const started = performance.now();
+      for (let i = 0; i < 2; i++) {
+        const { text, record } = await r.send("claude-native");
+        assert.match(text, /^HTTP\/1\.1 502/);
+        assert.equal(record.ok, false);
+      }
+      assert.equal(r.health.consecutiveFailures, 2);
+      assert.deepEqual(r.trips, [2]);
+      assert.ok(performance.now() - started < 5000, "the ready-request resets keep their 5000 ms bound");
+    });
   } finally { await r.stop(); }
 });
 
@@ -480,15 +524,17 @@ async function currentRow(r: { requests: RequestLog }): Promise<RequestRecord> {
   throw new Error("no current row was written");
 }
 
-test("a Claude turn goes upstream while its profile lookup is still unanswered, and its row is written without an email", async () => {
+test("a Claude turn goes upstream while its profile lookup is still unanswered, and its row is written without an email", async (t) => {
   const r = await rig({ profiles: { "test-native": "never@example.test" }, profileWait: new Promise<void>(() => {}) });
   try {
     r.observed.observe(["authorization", "Bearer test-native", "anthropic-version", "2023-06-01"]);
-    const started = Date.now();
+    const started = performance.now();
     const { text } = await r.send("claude-pool");
     assert.match(text, /HTTP\/1\.1 200/, "the turn is answered");
     assert.equal(r.seenAuth.includes("Bearer test-native"), true, "the upstream request was sent");
-    assert.ok(Date.now() - started < 1_000, "the turn did not wait for the 1.5 s bound the lookup would have hit");
+    const elapsedMs = performance.now() - started;
+    t.diagnostic(`fixture setup=${Math.round(r.setupMs)} ms, TLS warm-up=${Math.round(r.tlsWarmupMs)} ms, ready request=${Math.round(elapsedMs)} ms`);
+    assert.ok(elapsedMs < 1_000, "the turn did not wait for the unanswered profile lookup");
     const row = await currentRow(r);
     assert.equal(row.ok, true);
     assert.equal(row.accountEmail, undefined, "an unanswered lookup names nobody");

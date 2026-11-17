@@ -20,6 +20,7 @@ import { credentialHeaderValues, redactErrorText } from "../../redact.ts";
 import { codexClientVersion, latestCodexVersion, parseCodexCatalog } from "./catalog.ts";
 import { noteChatgptModelWindows } from "./windows.ts";
 import fs from "node:fs";
+import { writeJsonAtomic } from "../../locked-file.ts";
 import path from "node:path";
 import { homeDir, fastSwitches } from "../../config.ts";
 import { promptAdditions } from "../../identity.ts";
@@ -790,13 +791,12 @@ export class ChatGptAdapter {
    */
   private readonly turnStateByKey = new Map<string, string>();
 
-  /** Troubleshooting aid (provider.debugDump): the failing exchange, secrets excluded (the request carries none). */
+  /** Opt-in troubleshooting data includes prompts; store privately. Never treat it as sanitized telemetry. */
   private dump(status: number, anthropic: AnthropicRequest, upstreamReq: unknown, upstreamText: string): void {
     try {
       const dir = path.join(homeDir(), "debug");
-      fs.mkdirSync(dir, { recursive: true });
       const file = path.join(dir, `upstream-${new Date().toISOString().replace(/[:.]/g, "-")}-${status}.json`);
-      fs.writeFileSync(file, JSON.stringify({ status, upstream: upstreamText, request: upstreamReq, anthropic }, null, 1), { mode: 0o600 });
+      writeJsonAtomic(file, { status, upstream: redactErrorText(upstreamText, [], 16 * 1024), request: upstreamReq, anthropic });
       const files = fs.readdirSync(dir).filter((f) => f.startsWith("upstream-")).sort();
       for (const f of files.slice(0, Math.max(0, files.length - 60))) fs.rmSync(path.join(dir, f), { force: true });
     } catch (e) {

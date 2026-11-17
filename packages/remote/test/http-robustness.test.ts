@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import { HostServer } from "../src/server.ts";
 import type { HostMsg } from "../src/protocol.ts";
+import { peerFixtureUrl } from "./peer-fixture.ts";
 
 const webDir = fileURLToPath(new URL("../web", import.meta.url));
 const token = "remote-test-token-not-a-real-pairing-token";
@@ -38,9 +39,9 @@ function get(port: number, target: string): Promise<{ status: number }> {
   });
 }
 
-function hello(port: number, tokenValue: string, clientId: unknown): Promise<{ frames: HostMsg[]; closed: { code: number } }> {
+function hello(url: string, tokenValue: string, clientId: unknown): Promise<{ frames: HostMsg[]; closed: { code: number } }> {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    const ws = new WebSocket(url);
     const frames: HostMsg[] = [];
     ws.on("open", () => ws.send(JSON.stringify({ t: "hello", token: tokenValue, clientId })));
     ws.on("message", data => { frames.push(JSON.parse(String(data)) as HostMsg); });
@@ -62,24 +63,24 @@ test("malformed percent-encoding is a 400 and the host survives it", async t => 
 
 test("hello rejects clientIds outside [A-Za-z0-9_-] and keeps good ones", async t => {
   const server = await serve(t, stubSessions());
-  const port = server.address().port;
+  const url = await peerFixtureUrl(t, server);
   for (const bad of ["evil;id!", "../../x", "a b", "x".repeat(101), "id+tag", "pixel-9_pro.2026"]) {
-    const r = await hello(port, token, bad);
+    const r = await hello(url, token, bad);
     assert.equal(r.frames[0]?.t, "denied", `clientId ${JSON.stringify(bad)} must be denied`);
     assert.equal(r.closed.code, 4003);
   }
-  const good = await hello(port, token, "pixel-9_pro-2026");
+  const good = await hello(url, token, "pixel-9_pro-2026");
   assert.equal(good.frames[0]?.t, "ready");
-  const empty = await hello(port, token, "");
+  const empty = await hello(url, token, "");
   assert.equal(empty.frames[0]?.t, "ready");
 });
 
 test("a forged decide decision is an error to the phone, never to the queue", async t => {
   let calls = 0;
   const server = await serve(t, stubSessions(() => { calls++; return true; }));
-  const port = server.address().port;
+  const url = await peerFixtureUrl(t, server);
   const answer = await new Promise<HostMsg>(resolve => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    const ws = new WebSocket(url);
     ws.on("open", () => {
       ws.send(JSON.stringify({ t: "hello", token, clientId: "phone-1" }));
       setTimeout(() => ws.send(JSON.stringify({ t: "decide", session: "s", id: "p", decision: "expired", reqId: "r1" })), 100);

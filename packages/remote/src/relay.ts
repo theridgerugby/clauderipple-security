@@ -3,8 +3,7 @@
 // 30 s of silence, abandoned if not ready 8 s after it was created, backoff min(30 s, n × 1 s)
 // forever. When the relay says a phone arrived, the host opens one data socket for it, answers the
 // phone's handshake (e2ee.ts) and hands the decrypted channel to HostServer like any other phone.
-// The relay sees ciphertext only; the pairing token is checked inside the channel, as on the
-// direct path.
+// The relay sees ciphertext only; the pairing token is checked inside the authenticated channel.
 //
 // A pong proves only that the relay's edge answers this socket, not that phones reach it: on
 // 2026-10-15 the relay kept sending every phone to a replaced socket that never answered its close,
@@ -17,6 +16,7 @@ import path from "node:path";
 import { fromB64u, hostAccept, toB64u } from "./e2ee.ts";
 import type { Channel, KeyPair, Nacl } from "./e2ee.ts";
 import { readJson, writeFileAtomic } from "./fsutil.ts";
+import { normalizeRelay } from "./config.ts";
 import type { Peer } from "./server.ts";
 
 /** The host's long-term X25519 key pair (its public half goes in the pairing link), made once, kept 0600. */
@@ -49,7 +49,7 @@ export interface WsLike {
 const OPEN = 1;
 
 export interface RelayDeps {
-  /** the relay's origin, https:// (or http://localhost for `wrangler dev`) */
+  /** The HTTPS relay origin. Plaintext developer-relay origins cannot carry real credentials. */
   relay: string;
   serverId: string;
   secret: string;
@@ -84,8 +84,8 @@ export const STALL_MS = 5_000;
 export const STALL_GRACE_MS = 5_000;
 
 function wsOrigin(relay: string): string {
-  const u = new URL(relay);
-  return `${u.protocol === "https:" ? "wss:" : "ws:"}//${u.host}`;
+  const u = new URL(normalizeRelay(relay));
+  return `wss://${u.host}`;
 }
 
 const toBytes = (data: Buffer | ArrayBuffer | Buffer[]): Uint8Array =>
@@ -164,7 +164,7 @@ export class RelayHost {
   private routeConfirmed = false;
 
   constructor(deps: RelayDeps) {
-    this.deps = deps;
+    this.deps = { ...deps, relay: normalizeRelay(deps.relay) };
     this.now = deps.now ?? Date.now;
     this.setTimer = deps.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
     this.clearTimer = deps.clearTimer ?? ((id) => clearTimeout(id as ReturnType<typeof setTimeout>));

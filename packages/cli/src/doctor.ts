@@ -9,7 +9,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ConfigStore, adminPort, type Config } from "../../router/src/config.ts";
+import { ConfigStore, adminPort, homeDir, type Config } from "../../router/src/config.ts";
+import { adminFetch } from "./admin-client.ts";
 import { certPaths } from "./certs.ts";
 import { claudeBinary, claudeCodeLogin, claudeLoginHint, type ClaudeCodeLogin } from "./claude-auth.ts";
 import { applyAppProxy, currentAppProxy } from "./picker.ts";
@@ -52,9 +53,9 @@ export type RecoveryDeps = {
   claudeLogin?: () => Promise<ClaudeCodeLogin>;
 };
 
-export async function fetchRouterStatus(adminUrl: string, timeoutMs: number): Promise<RouterStatus | null> {
+export async function fetchRouterStatus(adminUrl: string, timeoutMs: number, home: string = homeDir()): Promise<RouterStatus | null> {
   try {
-    const res = await fetch(`${adminUrl}/api/status`, { signal: AbortSignal.timeout(timeoutMs) });
+    const res = await adminFetch(`${adminUrl}/api/status`, { signal: AbortSignal.timeout(timeoutMs) }, home);
     if (!res.ok) return null;
     const body = (await res.json()) as { version?: unknown };
     return { version: typeof body.version === "string" ? body.version : null };
@@ -138,7 +139,7 @@ async function snapshot(deps: RecoveryDeps): Promise<Snapshot> {
   const proxyUrl = proxyUrlFor(cfg.listen.port);
   const adminUrl = `http://127.0.0.1:${adminPort(cfg)}`;
   const caPath = certPaths(deps.home).caPem;
-  const status = await (deps.routerStatus ?? fetchRouterStatus)(adminUrl, 4_000);
+  const status = await (deps.routerStatus ?? ((url, ms) => fetchRouterStatus(url, ms, deps.home)))(adminUrl, 4_000);
   const view = deps.supervisor.inspect();
   const cli = cliProxyState(settingsEnv(), proxyUrl, caPath);
   const desktop = desktopProxyState(currentAppProxy(), proxyUrl);
@@ -207,7 +208,7 @@ export async function doctor(deps: RecoveryDeps): Promise<DoctorReport> {
  */
 export async function repair(deps: RecoveryDeps): Promise<RepairReport> {
   const sleep = deps.sleep ?? sleepDefault;
-  const status = deps.routerStatus ?? fetchRouterStatus;
+  const status = deps.routerStatus ?? ((url: string, ms: number) => fetchRouterStatus(url, ms, deps.home));
   const steps: RepairStep[] = [];
   const before = await snapshot(deps);
   if (!before.installed) {

@@ -8,6 +8,7 @@ import path from "node:path";
 import { ChatGptAdapter } from "../src/providers/chatgpt/index.ts";
 import { saveChatGptAccount } from "../src/providers/chatgpt/accounts.ts";
 import { Logger } from "../src/log.ts";
+import { WINDOWS_PRIVATE_ACL_SCRIPT } from "../src/windows-private-acl.ts";
 
 const quota = { rate_limit: { primary_window: { used_percent: 25, limit_window_seconds: 18000 } } };
 const catalog = { models: [{ slug: "timeout-test-model", visibility: "list" }] };
@@ -15,6 +16,30 @@ const cases = [
   { name: "quota", timeout: 10_000, body: quota, read: (adapter: ChatGptAdapter) => adapter.fetchRateLimits() },
   { name: "catalog", timeout: 15_000, body: catalog, read: (adapter: ChatGptAdapter) => adapter.fetchModels() },
 ];
+
+// Account fixtures still use the production Windows private-file writer. Permit only its
+// fixed ACL program, with its exact bounded options and a target inside this temporary home.
+// Every other child process remains blocked, including PowerShell credential-store readers.
+function isFixtureAclCall(home: string, command: unknown, args: unknown, options: unknown, systemRoot = process.env.SystemRoot): boolean {
+  if (!systemRoot || !path.win32.isAbsolute(systemRoot) ||
+      command !== path.win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")) return false;
+  const expected = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_PRIVATE_ACL_SCRIPT];
+  if (!Array.isArray(args) || args.length !== expected.length || !args.every((arg, i) => arg === expected[i])) return false;
+  if (!options || typeof options !== "object" || Array.isArray(options)) return false;
+  const opts = options as Record<string, unknown>;
+  if (Object.keys(opts).sort().join(",") !== "encoding,input,maxBuffer,timeout,windowsHide" ||
+      opts.encoding !== "utf8" || opts.timeout !== 10_000 || opts.maxBuffer !== 16 * 1024 || opts.windowsHide !== true ||
+      typeof opts.input !== "string" || opts.input.length > 128 * 1024) return false;
+  let request: unknown;
+  try { request = JSON.parse(opts.input); } catch { return false; }
+  if (!request || typeof request !== "object" || Array.isArray(request)) return false;
+  const record = request as Record<string, unknown>;
+  if (Object.keys(record).some(key => !["path", "directory", "verifyOnly"].includes(key)) ||
+      typeof record.path !== "string" || !path.isAbsolute(record.path) || record.path.includes("\0") ||
+      typeof record.directory !== "boolean" || (record.verifyOnly !== undefined && record.verifyOnly !== true)) return false;
+  const relative = path.relative(home, record.path);
+  return relative === "" || relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
 
 function rig(t: TestContext) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-sidecall-timeout-"));
@@ -25,7 +50,11 @@ function rig(t: TestContext) {
   const noOsCredentials = () => { throw new Error("OS credential readers are disabled in this test"); };
   t.mock.method(childProcess, "execFileSync", noOsCredentials);
   t.mock.method(childProcess, "execSync", noOsCredentials);
-  t.mock.method(childProcess, "spawnSync", noOsCredentials);
+  const realSpawnSync = childProcess.spawnSync;
+  t.mock.method(childProcess, "spawnSync", (command: string, args?: readonly string[], options?: childProcess.SpawnSyncOptions) => {
+    if (process.platform !== "win32" || !isFixtureAclCall(home, command, args, options)) return noOsCredentials();
+    return realSpawnSync(command, args ?? [], options ?? {});
+  });
   syncBuiltinESMExports();
   t.after(() => {
     t.mock.restoreAll();
@@ -57,6 +86,38 @@ function rig(t: TestContext) {
   });
   return { adapter, signals, calls: () => calls, refreshes: () => refreshes, reply: (next: typeof reply) => { reply = next; } };
 }
+
+test("the credential-isolation exception accepts only the fixed private ACL helper inside the fixture home", () => {
+  const home = path.resolve(os.tmpdir(), "cr-sidecall-allowlist");
+  const root = "C:\\Windows";
+  const command = path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_PRIVATE_ACL_SCRIPT];
+  const options = { input: JSON.stringify({ path: path.join(home, "account.json"), directory: false }),
+    encoding: "utf8", timeout: 10_000, maxBuffer: 16 * 1024, windowsHide: true };
+  assert.equal(isFixtureAclCall(home, command, args, options, root), true);
+  assert.equal(isFixtureAclCall(home, command, args, { ...options, input: JSON.stringify({ path: home, directory: true, verifyOnly: true }) }, root), true);
+  for (const unsafe of ["powershell.exe", "security", "cmdkey.exe", `${command}.exe`]) {
+    assert.equal(isFixtureAclCall(home, unsafe, args, options, root), false);
+  }
+  for (const altered of [[...args, "extra"], args.slice(1), [...args.slice(0, -1), `${WINDOWS_PRIVATE_ACL_SCRIPT}\nGet-StoredCredential`]]) {
+    assert.equal(isFixtureAclCall(home, command, altered, options, root), false);
+  }
+  for (const altered of [
+    { ...options, shell: true }, { ...options, env: {} }, { ...options, timeout: 0 },
+    { ...options, maxBuffer: Infinity }, { ...options, encoding: "buffer" }, { ...options, windowsHide: false },
+    { ...options, input: "malformed" },
+    ...[path.join(home, "..", "outside.json"), path.join(`${home}-sibling`, "account.json"), "relative.json"].map(file =>
+      ({ ...options, input: JSON.stringify({ path: file, directory: false }) })),
+    { ...options, input: JSON.stringify({ path: home, directory: true, extra: "forbidden" }) },
+  ]) assert.equal(isFixtureAclCall(home, command, args, altered, root), false);
+});
+
+test("timeout fixtures keep OS credential readers blocked while using private account storage", t => {
+  rig(t);
+  assert.throws(() => childProcess.execFileSync("security", ["find-generic-password"]), /OS credential readers are disabled/);
+  assert.throws(() => childProcess.execSync("cmdkey /list"), /OS credential readers are disabled/);
+  assert.throws(() => childProcess.spawnSync("powershell.exe", ["-NoProfile", "-Command", "Get-StoredCredential"]), /OS credential readers are disabled/);
+});
 
 function stalledBody(signal: AbortSignal) {
   const reading = Promise.withResolvers<void>();

@@ -1,7 +1,8 @@
 // Append-only log file with size-based rotation. Never logs request bodies or headers.
 
 import fs from "node:fs";
-import path from "node:path";
+import { openPrivateAppend } from "./private-file.ts";
+import { redactErrorText } from "./redact.ts";
 
 export class Logger {
   private fd: number | null = null;
@@ -18,14 +19,13 @@ export class Logger {
     this.keep = keep;
     this.echo = echo;
     if (file) {
-      fs.mkdirSync(path.dirname(file), { recursive: true });
       this.open();
     }
   }
 
   private open(): void {
     if (!this.file) return;
-    this.fd = fs.openSync(this.file, "a");
+    this.fd = openPrivateAppend(this.file);
     try {
       this.bytes = fs.fstatSync(this.fd).size;
     } catch {
@@ -51,7 +51,8 @@ export class Logger {
     const d = new Date();
     const p = (n: number): string => String(n).padStart(2, "0");
     const ts = `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; // local time, like the app's own logs
-    const out = `${ts} ${level === "info" ? "" : level.toUpperCase() + " "}${msg}\n`;
+    const safeMessage = redactErrorText(msg.replace(/[\u0000-\u0008\u000b-\u001f\u007f\u0085\u2028\u2029]/g, " "), [], 16 * 1024);
+    const out = `${ts} ${level === "info" ? "" : level.toUpperCase() + " "}${safeMessage}\n`;
     if (this.echo || this.fd === null) process.stdout.write(out);
     if (this.fd !== null) {
       try {
@@ -75,5 +76,11 @@ export class Logger {
   }
   error(msg: string): void {
     this.line("error", msg);
+  }
+
+  close(): void {
+    if (this.fd === null) return;
+    fs.closeSync(this.fd);
+    this.fd = null;
   }
 }

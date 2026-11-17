@@ -7,12 +7,16 @@
 // and nothing was left to fix it from. A preload bridge lets the dashboard repair the router or
 // switch Claude to its default connection through the CLI (`doctor` / `repair` / `direct`).
 
-import { app, Menu, Tray, Notification, nativeImage, shell, dialog, clipboard, ipcMain } from "electron";
+import { app, Menu, Tray, Notification, nativeImage, shell, dialog, clipboard, ipcMain, session } from "electron";
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { fetchAdmin } from "./admin-auth";
+import { ADMIN_IPC_CHANNEL, createAdminRequestHandler } from "./admin-ipc";
+import { adminViewFromArgs, adminUserDataPath, prepareAdminUserDataPath } from "./admin-window";
+import { configurePermissions, trustedIpcSender } from "./security";
 import { claudeStartedAt, reopenClaude } from "./claude-desktop";
 import { failureAction, failureKinds, type FailureAction, type FailureKind } from "./failure-model";
 import { readUpdateSeen, readReplacementTries, rememberUpdate, releaseNotesUrl, replacementExhausted, nextReplacementTries, resolveTrayVersion, updateNotice, TrayReplacement, REPLACEMENT_LIMIT, type ReplacementTries, type RouterUpdate, type UpdateSeen, type UpdateNotice } from "./update-model";
@@ -920,7 +924,7 @@ function uiLang(): keyof typeof STRINGS {
 async function poll(): Promise<void> {
   const before = answered;
   try {
-    const res = await fetch(`${adminUrl()}api/status`, { signal: AbortSignal.timeout(3000) });
+    const res = await fetchAdmin(adminUrl(), "/api/status", home, { signal: AbortSignal.timeout(3000) });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     last = (await res.json()) as Status;
     lastError = null;
@@ -960,7 +964,7 @@ async function poll(): Promise<void> {
 /** The laptop settings for the tray, or null: a router without them (501), Linux, or a failed read. */
 async function readPower(): Promise<Power | null> {
   try {
-    const res = await fetch(`${adminUrl()}api/power`, { signal: AbortSignal.timeout(3000) });
+    const res = await fetchAdmin(adminUrl(), "/api/power", home, { signal: AbortSignal.timeout(3000) });
     if (!res.ok) return null;
     const p = (await res.json()) as Power;
     return p.awake?.setup === "unsupported" ? null : p;
@@ -972,7 +976,7 @@ async function readPower(): Promise<Power | null> {
 /** Saves one laptop setting through the router (the same PUT the dashboard sends), then redraws. */
 async function changePower(change: { awake?: { mode: AwakeMode; until: null }; tether?: { enabled: boolean } }): Promise<void> {
   try {
-    const res = await fetch(`${adminUrl()}api/power`, {
+    const res = await fetchAdmin(adminUrl(), "/api/power", home, {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(change),
@@ -1292,16 +1296,17 @@ const BRIDGE_ACTIONS = new Set<string>(["repair", "direct-on", "direct-off", "re
 
 /** Only our own page may drive the bridge, never something it navigated to. */
 function fromOurPage(event: Electron.IpcMainInvokeEvent): boolean {
-  return (event.senderFrame?.url ?? "").startsWith(`${ORIGIN}/`);
+  return trustedIpcSender(event, mainWindow()?.webContents ?? null);
 }
 
 function wireBridge(): void {
+  ipcMain.handle(ADMIN_IPC_CHANNEL, createAdminRequestHandler({ ownedContents: () => mainWindow()?.webContents ?? null, admin: adminUrl, home }));
   ipcMain.handle("ripple-app:state", (event) => (fromOurPage(event) ? bridgeState() : null));
   ipcMain.handle("ripple-app:log", (event) => (fromOurPage(event) ? logTail() : []));
   ipcMain.handle("ripple-app:act", async (event, id: unknown) => {
     if (!fromOurPage(event) || typeof id !== "string" || !BRIDGE_ACTIONS.has(id)) return null;
     await act(id as BridgeAction);
-    return bridgeState();
+    return fromOurPage(event) ? bridgeState() : null;
   });
 }
 
@@ -1590,7 +1595,7 @@ async function installUpdate(version: string): Promise<void> {
     // Share the router's coordinator with its scheduler instead of racing a second installer.
     let failure: string | null = null;
     try {
-      const response = await fetch(`${adminUrl()}api/update`, { method: "POST", signal: AbortSignal.timeout(35_000) });
+      const response = await fetchAdmin(adminUrl(), "/api/update", home, { method: "POST", signal: AbortSignal.timeout(35_000) });
       if (!response.ok) throw new Error(await response.text());
       routerUpdateUntil = Date.now() + 10 * 60_000;
     } catch (error) {
@@ -1840,17 +1845,21 @@ function uiRoot(): string {
   return candidates.find((dir) => fs.existsSync(path.join(dir, "index.html"))) ?? candidates[candidates.length - 1]!;
 }
 
+app.enableSandbox();
 registerScheme();
 
 // One tray. `clauderipple tray` run while one is up started a second icon (Windows VM,
 // 2026-10-10); the newcomer now leaves at once with code 0, which the CLI reads as "already running".
-if (process.env.CLAUDERIPPLE_APP_USER_DATA) app.setPath("userData", process.env.CLAUDERIPPLE_APP_USER_DATA);
+// The override is a profile base, not a shared lock: every installation still gets its own home hash.
+const profileDirectory = prepareAdminUserDataPath(adminUserDataPath(process.env.CLAUDERIPPLE_APP_USER_DATA ?? app.getPath("appData"), home));
+app.setPath("userData", profileDirectory);
+app.setPath("sessionData", profileDirectory);
 if (!app.requestSingleInstanceLock()) app.exit(0);
 
 // Opening the app again (Finder, Start menu, `clauderipple tray`) while it already runs in the
 // tray is someone looking for it: bring the window forward rather than nothing.
-app.on("second-instance", () => {
-  if (app.isReady()) showWindow(last ? undefined : "health");
+app.on("second-instance", (_event, argv) => {
+  if (app.isReady()) showWindow(adminViewFromArgs(argv) ?? (last ? undefined : "health"));
 });
 // macOS does not start a second instance for that: clicking the icon of a running app only sends
 // it a reopen, which Electron reports as `activate`. Without this the icon did nothing and the
@@ -1861,7 +1870,8 @@ app.on("activate", () => {
 
 app.whenReady().then(async () => {
   L = STRINGS[uiLang()];
-  handleScheme(uiRoot(), adminUrl);
+  configurePermissions(session.defaultSession, () => mainWindow()?.webContents ?? null);
+  handleScheme(uiRoot());
   wireBridge();
   // Without this, Windows attributes our notifications to "Electron" instead of ClaudeRipple.
   if (process.platform === "win32") app.setAppUserModelId("com.clauderipple.app");
@@ -1876,9 +1886,10 @@ app.whenReady().then(async () => {
   void initializeLoginItem().then(render, (error: unknown) => console.error(`ClaudeRipple login item initialization failed: ${error}`));
   // Opened from its icon (the CLI sets this; a login launch does not): show the window, not just a
   // tray icon the person may never notice. Taken out so an update's relaunch does not inherit it.
-  if (process.env.CLAUDERIPPLE_APP_SHOW === "1") {
+  const requestedAdminView = adminViewFromArgs(process.argv);
+  if (process.env.CLAUDERIPPLE_APP_SHOW === "1" || requestedAdminView) {
     delete process.env.CLAUDERIPPLE_APP_SHOW;
-    showWindow("health");
+    showWindow(requestedAdminView ?? "health");
   }
   void poll();
   setInterval(() => void poll(), POLL_MS);

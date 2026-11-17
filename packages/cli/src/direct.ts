@@ -182,7 +182,7 @@ export async function directOff(deps: RecoveryDeps, opts: { force?: boolean } = 
   }
 
   const notes: string[] = [];
-  if ((await (deps.routerStatus ?? fetchRouterStatus)(`http://127.0.0.1:${adminPort(cfg)}`, 4_000)) === null) {
+  if ((await (deps.routerStatus ?? ((url, ms) => fetchRouterStatus(url, ms, deps.home)))(`http://127.0.0.1:${adminPort(cfg)}`, 4_000)) === null) {
     const fixed = await repair(deps);
     if (!fixed.doctor.router.responding) {
       const failed = fixed.steps.filter((s) => !s.ok).map((s) => `${s.name}: ${s.detail}`).join("; ");

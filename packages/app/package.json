@@ -7,23 +7,38 @@
   "author": "pbj",
   "main": "dist/main.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node scripts/sync-private-acl.mjs --check && node scripts/sync-admin-transport.mjs --check && tsc -p tsconfig.json",
+    "sync:private-acl": "node scripts/sync-private-acl.mjs",
+    "sync:admin-transport": "node scripts/sync-admin-transport.mjs",
     "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test test/*.test.ts",
+    "test:native": "npm run build && node test-native/run.mjs",
     "start": "npm run build && electron .",
     "icons": "node scripts/make-icons.mts",
-    "dist": "npm run icons && npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --dir -c.directories.output=release-dev",
-    "release": "npm run icons && npm run build && electron-builder --mac --arm64 --x64",
-    "dist:win": "npm run icons && npm run build && electron-builder --win --dir -c.directories.output=release-dev",
-    "release:win": "npm run icons && npm run build && electron-builder --win"
+    "dist": "npm run icons && npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --dir -c.forceCodeSigning=false -c.mac.identity=null -c.mac.notarize=false -c.directories.output=release-dev",
+    "release": "node scripts/release.mjs mac",
+    "dist:win": "npm run icons && npm run build && electron-builder --win --dir -c.forceCodeSigning=false -c.win.signExecutable=false -c.directories.output=release-dev",
+    "release:win": "node scripts/release.mjs win"
   },
   "devDependencies": {
-    "electron": "^38.1.0",
-    "electron-builder": "^26.0.12"
+    "electron": "45.3.3"
   },
   "build": {
     "appId": "com.clauderipple.app",
     "productName": "ClaudeRipple",
-    "electronVersion": "38.8.6",
+    "electronVersion": "45.3.3",
+    "forceCodeSigning": true,
+    "asar": true,
+    "npmRebuild": false,
+    "nodeGypRebuild": false,
+    "beforePack": "scripts/stage-runtime.mjs",
+    "electronFuses": {
+      "runAsNode": true,
+      "enableNodeOptionsEnvironmentVariable": true,
+      "enableNodeCliInspectArguments": false,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "onlyLoadAppFromAsar": true,
+      "grantFileProtocolExtraPrivileges": false
+    },
     "directories": {
       "output": "release"
     },
@@ -51,32 +66,12 @@
     ],
     "extraResources": [
       {
-        "from": "../router/src",
-        "to": "clauderipple/packages/router/src"
+        "from": "release-native/runtime/${os}/${arch}",
+        "to": "clauderipple"
       },
       {
-        "from": "../cli/src",
-        "to": "clauderipple/packages/cli/src"
-      },
-      {
-        "from": "../ui",
-        "to": "clauderipple/packages/ui"
-      },
-      {
-        "from": "../mod",
-        "to": "clauderipple/packages/mod",
-        "filter": [
-          "**/*",
-          "!.claude-plugin/types/**"
-        ]
-      },
-      {
-        "from": "../../LICENSE",
-        "to": "clauderipple/LICENSE"
-      },
-      {
-        "from": "../../README.md",
-        "to": "clauderipple/README.md"
+        "from": "release-native/runtime/${os}/${arch}/node_modules",
+        "to": "clauderipple/node_modules"
       }
     ],
     "win": {
@@ -98,7 +93,11 @@
       ],
       "icon": "assets/icon.ico",
       "artifactName": "${productName}-${version}-win-${arch}.${ext}",
-      "signExecutable": false
+      "signExecutable": true,
+      "verifyUpdateCodeSignature": true,
+      "signtoolOptions": {
+        "signingHashAlgorithms": ["sha256"]
+      }
     },
     "nsis": {
       "oneClick": false,

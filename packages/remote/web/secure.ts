@@ -23,9 +23,24 @@ export interface RawSocket {
 
 export interface RelayPairing { url: string; server: string; hpk: string }
 
+/** A stored pairing is usable only on its authenticated HTTPS relay origin. */
+export function secureRelayPairing(value: unknown, origin: string): RelayPairing | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const p = value as Partial<RelayPairing>;
+  if (typeof p.url !== "string" || typeof p.server !== "string" || !/^[A-Za-z0-9_-]{16,64}$/.test(p.server) ||
+      typeof p.hpk !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(p.hpk)) return null;
+  try {
+    const u = new URL(p.url);
+    if (u.protocol !== "https:" || u.username || u.password || u.pathname !== "/" || u.search || u.hash ||
+        u.origin !== origin || p.url !== origin || fromB64u(p.hpk).length !== 32) return null;
+    return { url: p.url, server: p.server, hpk: p.hpk };
+  } catch { return null; }
+}
+
 export function relayClientUrl(p: RelayPairing): string {
+  if (!secureRelayPairing(p, p.url)) throw new Error("An authenticated HTTPS relay pairing is required");
   const u = new URL(p.url);
-  return `${u.protocol === "https:" ? "wss:" : "ws:"}//${u.host}/ws/client?server=${encodeURIComponent(p.server)}`;
+  return `wss://${u.host}/ws/client?server=${encodeURIComponent(p.server)}`;
 }
 
 /** tweetnacl, loaded by index.html as a classic script (vendor/nacl-fast.min.js sets self.nacl). */
@@ -52,6 +67,7 @@ export class RelaySocket implements SocketLike {
   private channel: Channel | null = null;
 
   constructor(raw: RawSocket, pairing: RelayPairing, nacl: Nacl) {
+    if (!secureRelayPairing(pairing, pairing.url)) throw new Error("An authenticated HTTPS relay pairing is required");
     this.raw = raw;
     this.nacl = nacl;
     this.hostKey = fromB64u(pairing.hpk);

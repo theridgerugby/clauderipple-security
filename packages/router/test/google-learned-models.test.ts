@@ -696,6 +696,145 @@ test("through the adapter: a file a later build wrote is left as it is, and a fi
   assert.deepEqual(storedIn(home).providers.other, { [DAILY]: { ide: ["gemini-1-kept"] } }, "another provider's lists are written back as they were");
 });
 
+test("through the adapter: a deeply nested local cache cannot reject fetchModels", async (t) => {
+  const home = homeWithAccount(t);
+  const file = path.join(home, LEARNED_MODELS_FILE);
+  // This is valid JSON and only about 20KiB. Previously it survived the cache read, then the
+  // comparison in saveLearned recursively serialized it outside its best-effort catch.
+  const nested = '{"version":2,"providers":{"ag":' + "[".repeat(10_000) + "null" + "]".repeat(10_000) + "}}";
+  fs.writeFileSync(file, nested, { mode: 0o600 });
+  const { asks } = upstream(t, fakeCatalogues() as unknown as (url: string, init?: RequestInit) => Promise<Response>);
+  const adapter = new GoogleAdapter("ag", cfg, home, log);
+  assert.deepEqual(adapter.learnedLists(), {}, "an invalid cache contributes no models");
+  const models = await adapter.fetchModels();
+  assert.ok(models?.some((model) => model.id === "gemini-5-neon"), "the readable catalogue still answers the public method");
+  assert.equal(asks.length, 4);
+  assert.ok(storedIn(home).providers.ag?.[DAILY]?.cli?.includes("gemini-5-neon-high"), "fresh bounded lists may replace the unusable cache");
+});
+
+test("through the adapter: cache byte, value and provider bounds discard oversized input before reuse", async (t) => {
+  const snapshot = { [DAILY]: { cli: ["gemini-cache-only-low", "gemini-cache-only-high"] } };
+  const valid = { version: 2, providers: { ag: snapshot } };
+  const fixtures = [
+    ["bytes", JSON.stringify(valid) + " ".repeat(2 * 1024 * 1024)],
+    ["values", JSON.stringify({ ...valid, ignored: Array.from({ length: 50_001 }, () => 0) })],
+    ["providers", JSON.stringify({ version: 2, providers: { ...Object.fromEntries(Array.from({ length: 128 }, (_, i) => [`other-${i}`, snapshot])), ag: snapshot } })],
+  ] as const;
+  upstream(t, fakeCatalogues() as unknown as (url: string, init?: RequestInit) => Promise<Response>);
+  for (const [kind, text] of fixtures) {
+    const home = homeWithAccount(t);
+    fs.writeFileSync(path.join(home, LEARNED_MODELS_FILE), text, { mode: 0o600 });
+    const adapter = new GoogleAdapter("ag", cfg, home, log);
+    assert.deepEqual(adapter.learnedLists(), {}, `${kind}: rejected before cached model data is reused`);
+    const models = await adapter.fetchModels();
+    assert.ok(models?.some((model) => model.id === "gemini-5-neon"), `${kind}: a rejected cache does not fail the catalogue`);
+    assert.equal(models?.some((model) => model.id === "gemini-cache-only"), false);
+    if (kind === "bytes") assert.equal(fs.readFileSync(path.join(home, LEARNED_MODELS_FILE), "utf8"), text, "an unreadable existing file is left untouched");
+    else assert.ok(fs.statSync(path.join(home, LEARNED_MODELS_FILE)).size <= 2 * 1024 * 1024);
+  }
+});
+
+test("through the adapter: current cache limits never authorize replacing a future-version file", async (t) => {
+  const fixtures = [
+    '{"version":3,"shape":' + "[".repeat(10_000) + "null" + "]".repeat(10_000) + "}",
+    JSON.stringify({ version: 3, shape: Array.from({ length: 50_001 }, () => 0) }),
+    JSON.stringify({ version: 3, shape: "unknown to this build" }) + " ".repeat(2 * 1024 * 1024),
+  ];
+  upstream(t, fakeCatalogues() as unknown as (url: string, init?: RequestInit) => Promise<Response>);
+  for (const text of fixtures) {
+    const home = homeWithAccount(t);
+    const file = path.join(home, LEARNED_MODELS_FILE);
+    fs.writeFileSync(file, text, { mode: 0o600 });
+    const adapter = new GoogleAdapter("ag", cfg, home, log);
+    assert.deepEqual(adapter.learnedLists(), {});
+    assert.ok((await adapter.fetchModels())?.some((model) => model.id === "gemini-5-neon"));
+    assert.equal(fs.readFileSync(file, "utf8"), text, "in-process learning must not replace a newer or unreadable disk format");
+  }
+});
+
+test("through the adapter: every provider carried through a cache save is normalized", async (t) => {
+  const home = homeWithAccount(t);
+  const file = path.join(home, LEARNED_MODELS_FILE);
+  fs.writeFileSync(file, JSON.stringify({ version: 2, providers: {
+    ag: { [DAILY]: { ide: ["gemini-stale"] } },
+    other: { [DAILY]: { ide: ["gemini-kept", "gemini-kept", "../../wrong", null, 8], cli: ["gemini-kept-low", "bad/model"], ignored: { secret: "dummy-not-cache-data" } } },
+    empty: { ignored: { secret: "dummy-not-cache-data" } },
+  } }), { mode: 0o600 });
+  upstream(t, fakeCatalogues() as unknown as (url: string, init?: RequestInit) => Promise<Response>);
+  assert.ok((await new GoogleAdapter("ag", cfg, home, log).fetchModels())?.some((model) => model.id === "gemini-5-neon"));
+  const saved = storedIn(home);
+  assert.deepEqual(saved.providers.other, { [DAILY]: { ide: ["gemini-kept"], cli: ["gemini-kept-low"] } });
+  assert.deepEqual(saved.providers.empty, {}, "an existing empty provider entry stays empty rather than borrowing another provider's lists");
+  assert.doesNotMatch(fs.readFileSync(file, "utf8"), /dummy-not-cache-data|ignored|\.\.\/|bad\/model/);
+});
+
+test("through the adapter: cache normalization preserves an explicitly pinned long custom base", async (t) => {
+  const home = homeWithAccount(t);
+  const pin = "https://custom.example/" + "a".repeat(240);
+  const snapshot = { [pin]: { cli: ["gemini-pinned-high", "gemini-pinned-low"] } };
+  fs.writeFileSync(path.join(home, LEARNED_MODELS_FILE), JSON.stringify({ version: 2, providers: { pinned: snapshot } }), { mode: 0o600 });
+  upstream(t, async () => new Response("down", { status: 500 }));
+  const adapter = new GoogleAdapter("pinned", { ...cfg, url: pin }, home, log);
+  assert.deepEqual(adapter.learnedLists(), snapshot);
+  assert.ok((await adapter.fetchModels())?.some((model) => model.id === "gemini-pinned"), "a failed catalogue retains the configured host's known family");
+  assert.deepEqual(new GoogleAdapter("ordinary", cfg, home, log).learnedLists(), {}, "an unpinned provider never inherits the custom host");
+});
+
+test("through the adapter: a serialization failure while comparing a cache remains best effort", async (t) => {
+  const home = homeWithAccount(t);
+  const file = path.join(home, LEARNED_MODELS_FILE);
+  const original = JSON.stringify({ version: 2, providers: { ag: { [DAILY]: { ide: ["gemini-stale"] } } } });
+  fs.writeFileSync(file, original, { mode: 0o600 });
+  upstream(t, fakeCatalogues() as unknown as (url: string, init?: RequestInit) => Promise<Response>);
+  const warnings: string[] = [];
+  t.mock.method(log, "warn", (message: string) => { warnings.push(message); });
+  const stringify = JSON.stringify;
+  let faults = 0;
+  t.mock.method(JSON, "stringify", (value: unknown, ...args: unknown[]) => {
+    if (value && typeof value === "object" && Object.hasOwn(value, DAILY)) {
+      faults++;
+      throw new RangeError("dummy-cache-content-must-not-appear-in-logs");
+    }
+    return Reflect.apply(stringify, JSON, [value, ...args]) as string | undefined;
+  });
+  const models = await new GoogleAdapter("ag", cfg, home, log).fetchModels();
+  assert.ok(models?.some((model) => model.id === "gemini-5-neon"));
+  assert.equal(faults, 1, "the cache comparison was actually exercised");
+  assert.equal(fs.readFileSync(file, "utf8"), original);
+  assert.ok(warnings.some((warning) => warning.includes("could not save the learned models (RangeError)")));
+  assert.ok(warnings.every((warning) => !warning.includes("dummy-cache-content")));
+});
+
+test("through the adapter: a hard-linked cache is neither learned from nor overwritten", async (t) => {
+  const home = homeWithAccount(t);
+  const file = path.join(home, LEARNED_MODELS_FILE);
+  const target = path.join(home, "linked-target.json");
+  const original = JSON.stringify({ version: 2, providers: { ag: { [DAILY]: { cli: ["gemini-cache-only-low", "gemini-cache-only-high"] } } } });
+  fs.writeFileSync(target, original, { mode: 0o600 });
+  fs.linkSync(target, file);
+  upstream(t, fakeCatalogues() as unknown as (url: string, init?: RequestInit) => Promise<Response>);
+  const adapter = new GoogleAdapter("ag", cfg, home, log);
+  assert.deepEqual(adapter.learnedLists(), {});
+  assert.ok((await adapter.fetchModels())?.some((model) => model.id === "gemini-5-neon"));
+  assert.equal(fs.readFileSync(target, "utf8"), original);
+  assert.equal(fs.statSync(file).nlink, 2);
+});
+
+test("through the adapter: a symbolic-link cache is neither read nor replaced", { skip: process.platform === "win32" ? "creating symbolic links requires separately granted Windows privileges" : false }, async (t) => {
+  const home = homeWithAccount(t);
+  const file = path.join(home, LEARNED_MODELS_FILE);
+  const target = path.join(home, "symlink-target.json");
+  const original = JSON.stringify({ version: 2, providers: { ag: { [DAILY]: { cli: ["gemini-cache-only-low", "gemini-cache-only-high"] } } } });
+  fs.writeFileSync(target, original, { mode: 0o600 });
+  fs.symlinkSync(target, file);
+  upstream(t, fakeCatalogues() as unknown as (url: string, init?: RequestInit) => Promise<Response>);
+  const adapter = new GoogleAdapter("ag", cfg, home, log);
+  assert.deepEqual(adapter.learnedLists(), {});
+  assert.ok((await adapter.fetchModels())?.some((model) => model.id === "gemini-5-neon"));
+  assert.equal(fs.readFileSync(target, "utf8"), original);
+  assert.ok(fs.lstatSync(file).isSymbolicLink());
+});
+
 test("through the adapter: proof that a learned model is spent rests only it, and the account keeps answering other models", async (t) => {
   const home = homeWithAccount(t);
   const refusal = (model: string): Response => {

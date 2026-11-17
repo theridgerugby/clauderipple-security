@@ -2,12 +2,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
-import net from "node:net";
+import https from "node:https";
+import tls from "node:tls";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, type Config, type ProviderModel } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
-import { backfillContextWindows, effortLevelsForModel, googleHealth, measureUnsettledModels, parseUpdateCheck, startAdmin, type AdminDeps, type LimitsProvider } from "../src/admin.ts";
+import { backfillContextWindows, effortLevelsForModel, googleHealth, measureUnsettledModels, parseUpdateCheck, type AdminDeps, type LimitsProvider } from "../src/admin.ts";
+import { startAdmin, fetch, adminTestTlsOptions, adminTestAuthHeaders } from "./admin-client.ts";
 import type { ImageRequest } from "../src/providers/chatgpt/index.ts";
 import type { GoogleAccountStatus } from "../src/providers/google/index.ts";
 import type { QuotaGroup } from "../src/providers/google/usage.ts";
@@ -961,10 +963,10 @@ test("admin config saves isolate client settings and restore the caller environm
 });
 
 /** fetch()/undici normalize %2e-encoded dot segments client-side before sending; use a raw
- * http.request (path passed through untouched) to actually exercise the server's own guard. */
+ * https.request (path passed through untouched) to actually exercise the server's own guard. */
 function rawGet(port: number, rawPath: string): Promise<{ status: number; body: string }> {
   return new Promise((resolveP, reject) => {
-    const req = http.request({ host: "127.0.0.1", port, path: rawPath, method: "GET" }, (res) => {
+    const req = https.request({ ...adminTestTlsOptions(`${base()}:${port}`), path: rawPath, method: "GET" }, (res) => {
       const chunks: Buffer[] = [];
       res.on("data", (c: Buffer) => chunks.push(c));
       res.on("end", () => resolveP({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
@@ -1323,7 +1325,10 @@ test("HEAD answers a read-only route with its headers and no body", async () => 
     assert.equal(headCss.headers.get("content-length"), getCss.headers.get("content-length"), "the length of the body a GET would have sent");
     // The body is the part a HEAD must not carry, and `fetch` never exposes one — read the wire.
     const wire = await new Promise<string>((done, fail) => {
-      const sock = net.connect(port, "127.0.0.1", () => sock.write(`HEAD /style.css HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`));
+      const options = adminTestTlsOptions(`${base()}:${port}`);
+      const sock = tls.connect({ host: "127.0.0.1", port: Number(options.port), ca: options.ca,
+        rejectUnauthorized: true, checkServerIdentity: options.checkServerIdentity },
+      () => sock.write(`HEAD /style.css HTTP/1.1\r\nHost: 127.0.0.1:${options.port}\r\nConnection: close\r\n\r\n`));
       let text = "";
       sock.on("data", (chunk: Buffer) => { text += chunk.toString("latin1"); });
       sock.on("close", () => done(text));
@@ -2457,10 +2462,12 @@ test("status reports the identity this process captured at start", async () => {
 
 test("admin rejects rebinding Hosts and foreign write Origins but accepts dashboard and tray requests", async () => {
   const cfg = makeCfg({ providers: { p: { type: "anthropic-compatible", url: "http://127.0.0.1:9", headers: { "x-api-key": "test-secret" } } } });
-  await withAdmin(cfg, async ({ port, configFile }) => {
+  await withAdmin(cfg, async ({ port, configFile, home }) => {
+    const options = adminTestTlsOptions(`${base()}:${port}`);
+    const tlsPort = Number(options.port);
     const request = (method: string, pathname: string, host?: string, origin?: string) => new Promise<{ status: number; body: string }>((resolve, reject) => {
-      const req = http.request({ hostname: "127.0.0.1", port, path: pathname, method, setHost: false,
-        headers: { ...(host === undefined ? {} : { host }), ...(origin === undefined ? {} : { origin }) } }, res => {
+      const req = https.request({ ...options, path: pathname, method, setHost: false,
+        headers: { ...adminTestAuthHeaders(`${base()}:${port}`), ...(host === undefined ? {} : { host }), ...(origin === undefined ? {} : { origin }) } }, res => {
         let body = "";
         res.setEncoding("utf8");
         res.on("data", (chunk: string) => { body += chunk; });
@@ -2471,24 +2478,24 @@ test("admin rejects rebinding Hosts and foreign write Origins but accepts dashbo
       req.end(method === "PUT" ? JSON.stringify(cfg) : undefined);
     });
     const before = fs.readFileSync(configFile, "utf8");
-    for (const host of [undefined, "evil.example", `evil.example:${port}`, "127.0.0.1", "localhost:1", "[::1]:1", `127.1:${port}`, `localhost.evil.example:${port}`]) {
+    for (const host of [undefined, "evil.example", `evil.example:${tlsPort}`, "127.0.0.1", "localhost:1", "[::1]:1", `127.1:${tlsPort}`, `localhost.evil.example:${tlsPort}`]) {
       for (const [method, pathname] of [["GET", "/api/config"], ["HEAD", "/api/config"], ["PUT", "/api/config"], ["GET", "/"]]) {
         const response = await request(method!, pathname!, host);
         assert.equal(response.status, host === undefined ? 400 : 403, `${method} ${pathname} Host=${host}`);
         assert.doesNotMatch(response.body, /test-secret/);
       }
     }
-    for (const origin of ["https://evil.example", "null", "", "http://localhost:1", `https://localhost:${port}`, "ripple://app"]) {
-      const response = await request("PUT", "/api/config", `127.0.0.1:${port}`, origin);
+    for (const origin of ["https://evil.example", "null", "", "http://localhost:1", `http://localhost:${tlsPort}`, "ripple://app"]) {
+      const response = await request("PUT", "/api/config", `127.0.0.1:${tlsPort}`, origin);
       assert.equal(response.status, 403, `Origin=${origin}`);
     }
     assert.equal(fs.readFileSync(configFile, "utf8"), before, "rejected requests cannot save");
-    for (const host of [`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]) {
+    for (const host of [`127.0.0.1:${tlsPort}`, `localhost:${tlsPort}`, `[::1]:${tlsPort}`]) {
       assert.equal((await request("GET", "/api/config", host)).status, 200);
-      assert.equal((await request("PUT", "/api/config", host, `http://${host}`)).status, 200);
+      assert.equal((await request("PUT", "/api/config", host, `https://${host}`)).status, 200);
     }
     // ripple://app's main-process forwarder sends the loopback Host and strips Origin.
-    assert.equal((await request("PUT", "/api/config", `127.0.0.1:${port}`)).status, 200);
+    assert.equal((await request("PUT", "/api/config", `127.0.0.1:${tlsPort}`)).status, 200);
   });
 });
 
@@ -2532,9 +2539,9 @@ test("the Origin guard covers the other state-changing endpoints too", async () 
       const res = await fetch(`${base()}:${port}${p}`, { method: "POST", headers: { origin: "http://evil.example" } });
       assert.equal(res.status, 403, `${p} must refuse a cross-site POST`);
     }
-    // Reading is not gated: a cross-site page cannot see the response anyway.
+    // Reads enforce the same browser-origin boundary as writes, even with a valid capability.
     const get = await fetch(`${base()}:${port}/api/status`, { headers: { origin: "http://evil.example" } });
-    assert.equal(get.status, 200);
+    assert.equal(get.status, 403);
   });
 });
 
@@ -3949,8 +3956,7 @@ test("GET /api/limits lists a MiniMax plan's five-hour and weekly windows", asyn
 });
 
 test("GET /api/limits forecasts a window whose average pace reaches 100% before its reset, and no other", async () => {
-  const now = Date.now();
-  const nowS = Math.floor(now / 1000);
+  let nowS = 0;
   const cfg = makeCfg({ providers: {
     mini: { type: "anthropic-compatible", preset: "minimax", url: "https://api.minimax.io/anthropic", credentials: [{ id: "key-a", label: "A", headers: { "x-api-key": "hidden-a" } }] },
   } });
@@ -3966,17 +3972,22 @@ test("GET /api/limits forecasts a window whose average pace reaches 100% before 
     // ...but it is 54% after 110.4 h of 168, so the week is projected at 82% for its reset.
     assert.equal(weekly!.projected_percent, 82);
   }, {
-    minimaxUsage: async (name: string, credentialId?: string) => name === "mini" && credentialId === "key-a" ? [
-      { kind: "five_hour", used_percent: 60, window_minutes: 300, reset_at: nowS + 4 * 3600 },
-      { kind: "seven_day", used_percent: 54, window_minutes: 10080, reset_at: nowS + Math.round(57.6 * 3600) },
-    ] : [],
+    minimaxUsage: async (name: string, credentialId?: string) => {
+      if (name !== "mini" || credentialId !== "key-a") return [];
+      // This is a fresh usage reading, taken after TLS/ACL fixture setup and client
+      // authentication. Their cold-start cost must not move the window's reference time.
+      nowS = Math.floor(Date.now() / 1000);
+      return [
+        { kind: "five_hour", used_percent: 60, window_minutes: 300, reset_at: nowS + 4 * 3600 },
+        { kind: "seven_day", used_percent: 54, window_minutes: 10080, reset_at: nowS + Math.round(57.6 * 3600) },
+      ];
+    },
   });
 });
 
 test("GET /api/limits judges a cached reading at the time it was taken, so a later poll does not move exhaust_at", async (t) => {
   const start = Date.parse("2026-11-10T00:00:00Z");
   let clock = start;
-  t.mock.method(Date, "now", () => clock);
   const startS = start / 1000;
   // 60% of the five-hour window after one hour: 40 more minutes at that pace, so exhaust_at is 2400 s after the reading.
   const resetS = startS + 4 * 3600;
@@ -4004,6 +4015,9 @@ test("GET /api/limits judges a cached reading at the time it was taken, so a lat
     mini: { type: "anthropic-compatible", preset: "minimax", url: "https://api.minimax.io/anthropic" },
   } });
   await withAdmin(cfg, async ({ port }) => {
+    // Mint/read the real TLS identity before changing the application clock. OpenSSL verifies
+    // certificate validity against the actual clock, independently of this quota-only mock.
+    t.mock.method(Date, "now", () => clock);
     const limits = async () => (await (await fetch(`${base()}:${port}/api/limits`)).json()) as { providers: LimitsProvider[] };
     const exhaustOf = (body: { providers: LimitsProvider[] }) => body.providers.map((p) => [p.provider, p.accounts[0]!.windows[0]!.exhaust_at]);
     const first = await limits();

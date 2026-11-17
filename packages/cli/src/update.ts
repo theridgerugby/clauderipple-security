@@ -6,7 +6,8 @@
 //   * The install scripts put it under their own prefix (~/.clauderipple by default) with their own
 //     command shims — a wrapper naming the Node they downloaded, and on Windows no .ps1. A plain
 //     `npm install -g` would put npm's default shims back, which find no Node on a machine where
-//     the script's Node is the only one. So a script install is updated by running its script.
+//     the script's Node is the only one. So a script install is updated by running the installer
+//     bundled with the already-installed package. It is never fetched from a moving Git branch.
 //   * An `npm install -g` is updated by npm, into the same prefix.
 //   * A packaged app or a source checkout is not updated from here.
 // Either way `install` runs afterwards from the new files; it restarts a router still running
@@ -20,7 +21,16 @@ import { windowsPowerShellEnv } from "./windows-powershell.ts";
 import type { Runtime } from "./runtime.ts";
 
 export const PACKAGE = "clauderipple";
-const SCRIPT_BASE = "https://raw.githubusercontent.com/PBJ-2/clauderipple/main/scripts";
+const VERSION_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+
+function isVersion(value: unknown): value is string {
+  if (typeof value !== "string" || value !== value.trim() || value.length > 200) return false;
+  const match = VERSION_PATTERN.exec(value);
+  if (!match || match.slice(1, 4).some((part) => !Number.isSafeInteger(Number(part)))) return false;
+  // npm can interpret a malformed version as a mutable dist-tag. Numeric prerelease identifiers
+  // with leading zeroes and empty identifiers therefore must not pass as version pins.
+  return !match[4] || match[4].split(".").every((part) => !/^\d+$/.test(part) || part === "0" || !part.startsWith("0"));
+}
 
 export type InstallKind =
   | { kind: "script"; prefix: string }
@@ -99,18 +109,18 @@ export function dropPowerShellShim(kind: InstallKind, platform: NodeJS.Platform 
 
 /** The version npm would install now. */
 export async function latestVersion(fetchImpl: typeof fetch = fetch): Promise<string> {
-  const res = await fetchImpl(`https://registry.npmjs.org/${PACKAGE}/latest`, { signal: AbortSignal.timeout(10_000), headers: { accept: "application/json" } });
+  const res = await fetchImpl(`https://registry.npmjs.org/${PACKAGE}/latest`, { redirect: "error", signal: AbortSignal.timeout(10_000), headers: { accept: "application/json" } });
   if (!res.ok) throw new Error(`npm registry answered HTTP ${res.status}`);
   const version = ((await res.json()) as { version?: unknown }).version;
-  if (typeof version !== "string") throw new Error("npm registry answered without a version");
+  if (!isVersion(version)) throw new Error("npm registry answered without a valid, pinned version");
   return version;
 }
 
 /** The npm that came with the Node running us, as a script that same Node can run. */
-function npmCli(): string | null {
+function npmCli(node: string = process.execPath): string | null {
   const candidates = [
-    path.resolve(path.dirname(process.execPath), "../lib/node_modules/npm/bin/npm-cli.js"),
-    path.resolve(path.dirname(process.execPath), "node_modules/npm/bin/npm-cli.js"),
+    path.resolve(path.dirname(node), "../lib/node_modules/npm/bin/npm-cli.js"),
+    path.resolve(path.dirname(node), "node_modules/npm/bin/npm-cli.js"),
   ];
   return candidates.find((candidate) => fs.existsSync(candidate)) ?? null;
 }
@@ -121,38 +131,58 @@ function npmCli(): string | null {
  */
 type UpdateRunner = (program: string, args: string[], opts: { env: NodeJS.ProcessEnv; stdio: "inherit"; windowsHide?: boolean }) => { status: number | null; signal?: NodeJS.Signals | null };
 
-export function runUpdate(target: InstallKind & { kind: "script" | "npm" }, rt: Pick<Runtime, "node" | "env" | "cli">, spec: string, opts: { run?: UpdateRunner; platform?: NodeJS.Platform; tempDir?: string } = {}): { ok: boolean; message: string } {
-  const run = opts.run ?? spawnSync;
-  const env = { ...process.env, CLAUDERIPPLE_PREFIX: target.prefix, CLAUDERIPPLE_PACKAGE: spec };
-  if (target.kind === "script") {
-    // A local path stands in for the published script when checking an update before release.
-    const script = process.env.CLAUDERIPPLE_INSTALLER;
-    if ((opts.platform ?? process.platform) === "win32") {
-      const result = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", `$ErrorActionPreference = 'Stop'; ${script ? `& ${psQuote(script)}` : `irm ${SCRIPT_BASE}/install.ps1 | iex`}`], { env: windowsPowerShellEnv(env), stdio: "inherit", windowsHide: true });
-      return result.status === 0 ? { ok: true, message: "✓ updated" } : { ok: false, message: `the installer exited with ${result.status ?? result.signal}` };
-    }
-    const temp = script ? null : fs.mkdtempSync(path.join(opts.tempDir ?? os.tmpdir(), "clauderipple-update-"));
-    const installer = script ?? path.join(temp!, "install.sh");
-    try {
-      if (!script) {
-        const downloaded = run("curl", ["-fsSL", `${SCRIPT_BASE}/install.sh`, "-o", installer], { env, stdio: "inherit" });
-        if (downloaded.status !== 0) return { ok: false, message: `the installer download failed (${downloaded.status ?? downloaded.signal})` };
-      }
-      const result = run("sh", [installer], { env, stdio: "inherit" });
-      // The script ends by running `install` itself; a failed download never reaches this step.
-      return result.status === 0 ? { ok: true, message: "✓ updated" } : { ok: false, message: `the installer exited with ${result.status ?? result.signal}` };
-    } finally {
-      if (temp) fs.rmSync(temp, { recursive: true, force: true });
-    }
-  }
-  const npm = npmCli();
-  if (!npm) return { ok: false, message: `found no npm next to ${process.execPath}; update with: npm install -g ${PACKAGE}@latest` };
-  const installed = spawnSync(process.execPath, [npm, "install", "--global", "--prefix", target.prefix, "--loglevel", "error", spec], { env, stdio: "inherit" });
-  if (installed.status !== 0) return { ok: false, message: `npm could not install ${spec}` };
-  const setup = spawnSync(rt.node, [rt.cli, "install"], { env: { ...process.env, ...rt.env }, stdio: "inherit" });
-  return setup.status === 0 ? { ok: true, message: "✓ updated" } : { ok: false, message: "the new version is installed, but `clauderipple install` did not finish" };
+/** The build puts both reviewed installers alongside dist/cli, inside the published package. */
+export function bundledInstaller(cli: string, platform: NodeJS.Platform = process.platform): string {
+  return path.resolve(path.dirname(cli), "../../installers", platform === "win32" ? "install.ps1" : "install.sh");
 }
 
-function psQuote(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`;
+export function runUpdate(target: InstallKind & { kind: "script" | "npm" }, rt: Pick<Runtime, "node" | "env" | "cli">, spec: string, opts: { run?: UpdateRunner; platform?: NodeJS.Platform; tempDir?: string; npmCli?: string } = {}): { ok: boolean; message: string } {
+  const run = opts.run ?? spawnSync;
+  // Only the exact package/version observed by the check can be installed. Tags, alternate
+  // packages, URLs and tarballs would create a second update trust path.
+  if (!spec.startsWith(`${PACKAGE}@`) || !isVersion(spec.slice(PACKAGE.length + 1))) {
+    return { ok: false, message: "resolve a specific ClaudeRipple version before updating" };
+  }
+  const env = { ...process.env, ...rt.env, CLAUDERIPPLE_PREFIX: target.prefix, CLAUDERIPPLE_PACKAGE: spec };
+  if (target.kind === "script") {
+    const platform = opts.platform ?? process.platform;
+    const source = bundledInstaller(rt.cli, platform);
+    let script: Buffer;
+    try {
+      const before = fs.lstatSync(source);
+      if (!before.isFile() || before.nlink !== 1) throw new Error("installer is not a singly linked regular file");
+      const fd = fs.openSync(source, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+      try {
+        const opened = fs.fstatSync(fd);
+        if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== before.dev || opened.ino !== before.ino || opened.size > 1024 * 1024) throw new Error("installer changed or is not a bounded regular file");
+        script = fs.readFileSync(fd);
+      } finally { fs.closeSync(fd); }
+      if (script.length === 0) throw new Error("installer is empty");
+    } catch (error) {
+      // Fail closed. Falling back to a remote installer would restore the original trust gap.
+      return { ok: false, message: `the installed package has no usable bundled installer: ${(error as Error).message}; reinstall a verified release manually` };
+    }
+    // npm replaces the current package while the shell is reading the installer. A private copy
+    // keeps that exact, already-installed script intact throughout the update.
+    const temp = fs.mkdtempSync(path.join(opts.tempDir ?? os.tmpdir(), "clauderipple-update-"));
+    const installer = path.join(temp, path.basename(source));
+    try {
+      fs.writeFileSync(installer, script, { flag: "wx", mode: 0o600 });
+      const result = platform === "win32"
+        ? run("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", installer], { env: windowsPowerShellEnv(env), stdio: "inherit", windowsHide: true })
+        : run("sh", [installer], { env, stdio: "inherit" });
+      // The bundled script reinstates the pinned-Node wrappers and runs `install` afterwards.
+      return result.status === 0 ? { ok: true, message: "✓ updated" } : { ok: false, message: `the installer exited with ${result.status ?? result.signal}` };
+    } finally {
+      fs.rmSync(temp, { recursive: true, force: true });
+    }
+  }
+  const npm = opts.npmCli ?? npmCli(rt.node);
+  if (!npm) return { ok: false, message: `found no npm next to ${rt.node}; install a verified ClaudeRipple release manually` };
+  // The shipped package and its production dependencies need no install lifecycle hooks. Run
+  // only our explicit setup step, after npm has checked the registry's package integrity.
+  const installed = run(rt.node, [npm, "install", "--global", "--prefix", target.prefix, "--registry", "https://registry.npmjs.org", "--ignore-scripts", "--loglevel", "error", spec], { env, stdio: "inherit" });
+  if (installed.status !== 0) return { ok: false, message: `npm could not install ${spec}` };
+  const setup = run(rt.node, [rt.cli, "install"], { env: { ...process.env, ...rt.env }, stdio: "inherit" });
+  return setup.status === 0 ? { ok: true, message: "✓ updated" } : { ok: false, message: "the new version is installed, but `clauderipple install` did not finish" };
 }

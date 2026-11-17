@@ -33,6 +33,39 @@ for (const script of [cli, main]) for (const flag of ["--help", "-h"]) {
   });
 }
 
+for (const stored of [false, true]) {
+  test(`--new-token is refused before any configuration or service mutation (${stored ? "existing" : "new"} state)`, async t => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-refused-rotation-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const home = path.join(dir, "remote");
+    const file = path.join(home, "host.json");
+    const original = JSON.stringify({ bind: "127.0.0.1", port: 8797, token: "x".repeat(43), pairingSecurityVersion: 2,
+      serverId: "test-server-id-000", relaySecret: "y".repeat(43), adminUrl: "http://127.0.0.1:1" });
+    if (stored) { fs.mkdirSync(home); fs.writeFileSync(file, original, { mode: 0o600 }); }
+    const invocations = [
+      [main, "--new-token", "--port", "54321"],
+      [main, "pair", "--new-token"],
+      [main, "install", "--new-token", "--port", "54321"],
+      [main, "status", "--new-token"],
+      [cli, "remote", "pair", "--new-token"],
+    ];
+    for (const args of invocations) {
+      await assert.rejects(exec(process.execPath, args, { env: isolatedEnv(dir), timeout: 10_000 }), error => {
+        assert.ok(error instanceof Error && "stderr" in error);
+        assert.match(String(error.stderr), /--new-token is disabled/);
+        assert.match(String(error.stderr), /authenticated Phone settings/);
+        assert.doesNotMatch(String(error.stderr), /EADDRINUSE|legacy host control|service.*unsupported/);
+        return true;
+      });
+      assert.deepEqual(fs.readdirSync(dir), stored ? ["remote"] : []);
+      if (stored) {
+        assert.deepEqual(fs.readdirSync(home), ["host.json"]);
+        assert.equal(fs.readFileSync(file, "utf8"), original);
+      }
+    }
+  });
+}
+
 test("a host that cannot bind leaves pending permissions untouched for the real restart's expiry event", async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-startup-"));
   const occupied = http.createServer((_req, res) => res.end("occupied"));
@@ -59,6 +92,7 @@ test("a host that cannot bind leaves pending permissions untouched for the real 
   // These are dummy fixture values, not credentials for a service.
   fs.writeFileSync(path.join(home, "host.json"), JSON.stringify({ bind: "127.0.0.1", port: address.port,
     token: "x".repeat(32), serverId: "test-server-id-000", relaySecret: "y".repeat(32), adminUrl: "http://127.0.0.1:1" }));
+  const hostBytes = fs.readFileSync(path.join(home, "host.json"));
   const before = new Map(fs.readdirSync(sessionDir).map(name => [name, fs.readFileSync(path.join(sessionDir, name))]));
   await assert.rejects(exec(process.execPath, [main], { env: isolatedEnv(dir), timeout: 10_000 }), error => {
     assert.ok(error instanceof Error && "stderr" in error);
@@ -66,6 +100,7 @@ test("a host that cannot bind leaves pending permissions untouched for the real 
     return true;
   });
   assert.equal(fs.readFileSync(path.join(home, "sessions.json"), "utf8"), records);
+  assert.deepEqual(fs.readFileSync(path.join(home, "host.json")), hostBytes, "the losing process did not rotate the running host's phone token");
   assert.deepEqual(fs.readdirSync(sessionDir).sort(), [...before.keys()].sort());
   for (const [name, bytes] of before) assert.deepEqual(fs.readFileSync(path.join(sessionDir, name)), bytes, name);
   assert.deepEqual(fs.readFileSync(permissionsFile), permissionBytes, "the losing process did not expire the live host's approval");

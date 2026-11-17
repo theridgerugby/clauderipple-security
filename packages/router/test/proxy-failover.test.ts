@@ -15,7 +15,8 @@ import path from "node:path";
 import tls from "node:tls";
 import zlib from "node:zlib";
 
-import { startAdmin, type LimitsProvider } from "../src/admin.ts";
+import type { LimitsProvider } from "../src/admin.ts";
+import { startAdmin, fetch } from "./admin-client.ts";
 import { CertStore } from "../src/certs.ts";
 import { DEFAULTS, providerFor, validate, type Config, type Provider } from "../src/config.ts";
 import { UpstreamHealth } from "../src/health.ts";

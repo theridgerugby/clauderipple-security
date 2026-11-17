@@ -11,7 +11,7 @@ import * as systemd from "./systemd.ts";
 import type { AgentRemove, AgentRestart, AgentStart, AgentStop, Ownership } from "./ownership.ts";
 import { type RouterIdentity, adminUrl, awaitIdentity, routerIdentity } from "./router-state.ts";
 import { runtime } from "./runtime.ts";
-import { windowsPowerShellEnv } from "./windows-powershell.ts";
+import { adminRequestSync } from "./admin-client.ts";
 
 /** `unknown` is a lookup that failed: neither "loaded" nor "absent" may be claimed from it. */
 export type AgentState = "running" | "loaded" | "not-loaded" | "unknown";
@@ -341,17 +341,10 @@ function windowsOps(home: string): WindowsRouterOps {
 /** Blocking POST to the router's shutdown endpoint, naming this installation. */
 function askShutdown(home: string): boolean {
   const id = readInstallationId(home);
-  const headers = id ? ` -Headers @{ 'x-clauderipple-install-id' = '${id}' }` : "";
-  try {
-    execFileSync(
-      "powershell.exe",
-      ["-NoProfile", "-NonInteractive", "-Command", `Invoke-RestMethod -Method Post -Uri '${adminUrl(home)}/api/shutdown'${headers} -TimeoutSec 10 | Out-Null`],
-      { env: windowsPowerShellEnv(), stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
-    );
-    return true;
-  } catch {
-    return false;
-  }
+  return adminRequestSync(`${adminUrl(home)}/api/shutdown`, home, {
+    method: "POST", timeoutMs: 10_000,
+    headers: id ? { "x-clauderipple-install-id": id } : {},
+  }) !== null;
 }
 
 function sleepSync(ms: number): void {

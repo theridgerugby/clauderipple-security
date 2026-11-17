@@ -37,6 +37,34 @@ test("the leaf's issuer is byte-identical to the CA's subject", () => {
   assert.ok(leafDer.includes(caSubject), "the CA's exact subject bytes appear in the leaf");
 });
 
+test("IPv4 and IPv6 hosts use binary IP SANs, including compressed and mapped forms", () => {
+  for (const host of ["127.0.0.1", "::1", "2001:db8:1:2:3:4:5:6", "::ffff:192.0.2.1", "::"]) {
+    const issued = createLeaf({ host, caCertPem: ca.certPem, caKeyPem: ca.keyPem });
+    const cert = new crypto.X509Certificate(issued.certPem);
+    assert.match(cert.subjectAltName!, /^IP Address:/);
+    assert.ok(cert.checkIP(host), host);
+    assert.equal(cert.checkHost("collector.example"), undefined);
+    assert.ok(cert.verify(new crypto.X509Certificate(ca.certPem).publicKey));
+  }
+  assert.throws(() => createLeaf({ host: "fe80::1%lo", caCertPem: ca.certPem, caKeyPem: ca.keyPem }), /scope identifier/);
+});
+
+test("literal loopback TLS hostname validation accepts the new IP SAN", async () => {
+  const issued = createLeaf({ host: "127.0.0.1", caCertPem: ca.certPem, caKeyPem: ca.keyPem });
+  const server = tls.createServer({ cert: issued.certPem, key: issued.keyPem }, socket => socket.end("ok"));
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as { port: number };
+  try {
+    assert.equal(await new Promise<boolean>((resolve, reject) => {
+      const socket = tls.connect({ host: "127.0.0.1", port, ca: ca.certPem, rejectUnauthorized: true }, () => {
+        resolve(socket.authorized);
+        socket.end();
+      });
+      socket.on("error", reject);
+    }), true);
+  } finally { server.close(); }
+});
+
 test("a real TLS handshake against the leaf is authorized", async () => {
   const server = tls.createServer({ cert: leaf.certPem, key: leaf.keyPem }, (s) => s.end("ok"));
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));

@@ -2,6 +2,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import zlib from "node:zlib";
 import path from "node:path";
+import { appendPrivateFile, assertPrivateTarget, ensureStorageDirectory, readPrivateFile } from "./private-file.ts";
+import { redactErrorText } from "./redact.ts";
 import type { ThinkingBlock } from "./thinking.ts";
 import { loadAaPricesFrom } from "./prices.ts";
 import { UsageHistory, addConversations, emptyConversations, finishConversations, modelRowOf, recordConversations, addTotals, emptyTotals, finishTotals, recordTotals, sortByVolume, type BucketTotals, type SummaryBucket, type UsageSummary } from "./usage-history.ts";
@@ -133,12 +135,14 @@ export class RequestLog {
   }
 
   add(record: RequestRecord): void {
+    if (record.note) record = { ...record, note: redactErrorText(record.note, [], 2_000) };
     this.history.add(record);
     this.records.push(record);
     if (this.records.length > this.max) this.records.splice(0, this.records.length - this.max);
     const line = JSON.stringify(record) + "\n";
     try {
-      fs.mkdirSync(path.dirname(this.file), { recursive: true });
+      ensureStorageDirectory(path.dirname(this.file));
+      assertPrivateTarget(this.file);
       const bytes = Buffer.byteLength(line);
       const size = fs.existsSync(this.file) ? fs.statSync(this.file).size : 0;
       if (size > 0 && size + bytes > this.maxBytes) {
@@ -146,7 +150,7 @@ export class RequestLog {
         fs.rmSync(previous, { force: true });
         fs.renameSync(this.file, previous);
       }
-      fs.appendFileSync(this.file, line, "utf8");
+      appendPrivateFile(this.file, line);
     } catch {
       // Request logging must never alter the proxy response path.
     }
@@ -204,7 +208,10 @@ export class RequestLog {
 
   private readRecords(file: string): RequestRecord[] {
     try {
-      return fs.readFileSync(file, "utf8")
+      // Both the active and rotated log get the same descriptor/owner checks at startup.
+      // A record can cross the configured rotation boundary, so allow up to the global
+      // private-read ceiling rather than rejecting a legitimate last record at maxBytes.
+      return readPrivateFile(file, 64 * 1024 * 1024).toString("utf8")
         .split("\n")
         .flatMap((line) => {
           try {

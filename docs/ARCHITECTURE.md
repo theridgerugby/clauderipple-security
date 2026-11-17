@@ -2621,7 +2621,7 @@ The always-running router owns the scheduler, not the optional tray. `autoupdate
 first `update --check --json` after ten minutes and checks again every twelve hours with ±30 minutes
 of jitter. Only script and global npm installs are eligible; packaged apps, source checkouts and
 unknown layouts are checked but never automatically installed. The dashboard's **Automatic updates**
-switch saves `Config.autoUpdate`; omission means on, and changes are hot-reloaded without restarting.
+switch saves `Config.autoUpdate`; only explicit `true` enables installation, and changes are hot-reloaded without restarting.
 
 Installation waits for zero model calls in flight across both the proxy and OpenAI ingress, and ten
 minutes since the latest request start/end (or router startup). Busy routers are checked every five

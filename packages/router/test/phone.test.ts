@@ -1,36 +1,79 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import http from "node:http";
+import https from "node:https";
 import os from "node:os";
 import path from "node:path";
-import { startAdmin } from "../src/admin.ts";
+import { startAdmin, fetch, adminTestTlsOptions, adminTestAuthHeaders } from "./admin-client.ts";
 import { DEFAULTS } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
 import { RequestLog } from "../src/requestlog.ts";
 import { phoneRequest } from "../src/phone.ts";
 import type { PhoneDeps } from "../src/phone.ts";
 import { APPROVAL_WAIT_MS } from "../../remote/src/mod-approval.ts";
+import { ensureAdminToken, ADMIN_TOKEN_HEADER } from "../src/admin-auth.ts";
+import { ensureAdminTlsIdentity, writeAdminEndpoint, readAdminEndpoint } from "../src/admin-transport-state.ts";
+import { localControlHome } from "../../remote/src/local-transport.ts";
+import { writePrivateFileAtomic } from "../src/locked-file.ts";
 
-async function admin(t: import("node:test").TestContext, phone: PhoneDeps) {
+// Application responses are configurable; the production bridge always crosses real,
+// pinned TLS. This callback is never supplied to PhoneDeps or the transport client.
+async function admin(t: import("node:test").TestContext, phone: PhoneDeps & { fetch?: typeof globalThis.fetch }) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-phone-admin-"));
-  fs.writeFileSync(path.join(home, "host.json"), JSON.stringify({ port: 18797 }));
-  fs.writeFileSync(path.join(home, "local.secret"), "s".repeat(43), { mode: 0o600 });
-  const server = await startAdmin({
+  let control: https.Server | undefined;
+  let server: Awaited<ReturnType<typeof startAdmin>> | undefined;
+  t.after(async () => {
+    try { server?.close(); }
+    finally {
+      try {
+        if (control) {
+          control.closeAllConnections();
+          await new Promise<void>(resolve => control!.close(() => resolve()));
+        }
+      } finally { fs.rmSync(home, { recursive: true, force: true }); }
+    }
+  });
+  // A running production host persists its private configuration before TLS discovery.
+  writePrivateFileAtomic(path.join(home, "host.json"), JSON.stringify({ port: 18797 }));
+  const controlHome = localControlHome(home);
+  const identity = ensureAdminTlsIdentity(controlHome);
+  const token = ensureAdminToken(controlHome);
+  const { fetch: respond = async () => Response.json({ ok: true }), ...phoneDeps } = phone;
+  let controlBase = "";
+  control = https.createServer({ cert: identity.certPem, key: identity.keyPem }, (request, response) => {
+    void (async () => {
+      assert.equal(request.headers[ADMIN_TOKEN_HEADER], token);
+      assert.equal(request.headers["x-clauderipple-instance-id"], "a".repeat(32));
+      assert.equal(request.headers["x-ripple-local"], undefined);
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const controller = new AbortController();
+      response.on("close", () => { if (!response.writableEnded) controller.abort(); });
+      const reply = await respond(`${controlBase}${request.url}`, {
+        method: request.method ?? "GET", headers: request.headers as Record<string, string>,
+        ...(chunks.length ? { body: Buffer.concat(chunks).toString("utf8") } : {}), signal: controller.signal,
+      });
+      response.writeHead(reply.status, Object.fromEntries(reply.headers));
+      response.end(Buffer.from(await reply.arrayBuffer()));
+    })().catch(() => { response.destroy(); });
+  });
+  await new Promise<void>(resolve => control.listen(0, "127.0.0.1", resolve));
+  const address = control.address(); assert.ok(address && typeof address !== "string");
+  controlBase = `https://127.0.0.1:${address.port}`;
+  writeAdminEndpoint(controlHome, { version: 1, instanceId: "a".repeat(32), publicPort: 18797, tlsPort: address.port });
+  server = await startAdmin({
     config: () => ({ ...DEFAULTS, admin: { port: 0 } }), configFile: path.join(home, "config.json"),
     log: new Logger(null, 1_000_000, 1, false), version: "test", health: () => 0,
     stats: () => ({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 }),
-    requests: new RequestLog(path.join(home, "requests.jsonl")), phone: { home, ...phone },
+    requests: new RequestLog(path.join(home, "requests.jsonl")), phone: { home, ...phoneDeps },
   });
-  t.after(() => { server.close(); fs.rmSync(home, { recursive: true, force: true }); });
-  return { base: `http://127.0.0.1:${server.port}`, home };
+  return { base: `http://127.0.0.1:${server.port}`, home, controlHome, controlBase };
 }
 
 test("admin proxies only allowed phone routes to the configured loopback port with the secret", async t => {
   const calls: { url: string; method: string; body: string | undefined }[] = [];
   const f = await admin(t, { fetch: async (url, init) => {
-    assert.equal(new Headers(init?.headers).get("x-ripple-local"), "s".repeat(43));
-    assert.equal(init?.redirect, "error");
+    assert.match(new Headers(init?.headers).get(ADMIN_TOKEN_HEADER) ?? "", /^[a-f0-9]{64}$/);
     calls.push({ url: String(url), method: init?.method ?? "GET", body: typeof init?.body === "string" ? init.body : undefined });
     return Response.json(String(url).endsWith("status") ? { mode: "relay", phones: [] } : String(url).endsWith("pairing") ? { url: "https://relay.example/#pair=secret", svg: "<svg/>" } : { ok: true });
   } });
@@ -42,13 +85,13 @@ test("admin proxies only allowed phone routes to the configured loopback port wi
   assert.equal(pair.headers.get("cache-control"), "no-store");
   assert.deepEqual(await pair.json(), { url: "https://relay.example/#pair=secret", svg: "<svg/>" });
   for (const route of ["settings", "rotate"]) assert.equal((await fetch(`${f.base}/api/phone/${route}`, { method: "POST", body: JSON.stringify({ bind: "local" }) })).status, 200);
-  assert.deepEqual(calls.map(c => [c.url, c.method]), [["http://127.0.0.1:18797/local/status", "GET"], ["http://127.0.0.1:18797/local/pairing", "GET"], ["http://127.0.0.1:18797/local/settings", "POST"], ["http://127.0.0.1:18797/local/rotate", "POST"]]);
+  assert.deepEqual(calls.map(c => [c.url, c.method]), [[`${f.controlBase}/api/local/status`, "GET"], [`${f.controlBase}/api/local/pairing`, "GET"], [`${f.controlBase}/api/local/settings`, "POST"], [`${f.controlBase}/api/local/rotate`, "POST"]]);
   assert.equal(calls[2]?.body, '{"bind":"local"}');
   for (const route of ["../config", "other", "settings/extra"]) await fetch(`${f.base}/api/phone/${route}`);
   assert.equal(calls.length, 4);
   assert.equal((await fetch(`${f.base}/api/phone/pairing`, { headers: { origin: "https://evil.example" } })).status, 403);
   const rebound = await new Promise<number | undefined>((resolve, reject) => {
-    const request = http.get(`${f.base}/api/phone/pairing`, { headers: { host: "evil.example" } }, response => {
+    const request = https.get({ ...adminTestTlsOptions(f.base), path: "/api/phone/pairing", headers: { ...adminTestAuthHeaders(f.base), host: "evil.example" } }, response => {
       response.resume();
       response.on("end", () => resolve(response.statusCode));
     });
@@ -62,7 +105,7 @@ test("admin proxies only allowed phone routes to the configured loopback port wi
 test("inbox routes validate, forward only their own requests and preserve host responses", async t => {
   const calls: { url: string; method: string; body?: string }[] = [];
   const f = await admin(t, { fetch: async (url, init) => {
-    assert.equal(new Headers(init?.headers).get("x-ripple-local"), "s".repeat(43));
+    assert.match(new Headers(init?.headers).get(ADMIN_TOKEN_HEADER) ?? "", /^[a-f0-9]{64}$/);
     calls.push({ url: String(url), method: init?.method ?? "GET", ...(typeof init?.body === "string" ? { body: init.body } : {}) });
     return String(url).endsWith("/claim") ? Response.json({ error: "offer unavailable" }, { status: 409 })
       : Response.json(String(url).includes("/inbox?") ? { offers: [{ sessionId: "a &b", itemId: "one", text: "private", offeredAt: 1 }] } : { ok: true });
@@ -77,9 +120,9 @@ test("inbox routes validate, forward only their own requests and preserve host r
   assert.equal(result.status, 200);
   assert.deepEqual(await result.json(), { ok: true });
   assert.deepEqual(calls, [
-    { url: "http://127.0.0.1:18797/local/inbox?session=a%20%26b", method: "GET" },
-    { url: "http://127.0.0.1:18797/local/inbox/claim", method: "POST", body: '{"itemId":"one"}' },
-    { url: "http://127.0.0.1:18797/local/inbox/result", method: "POST", body: '{"itemId":"one","outcome":"submitted"}' },
+    { url: `${f.controlBase}/api/local/inbox?session=a%20%26b`, method: "GET" },
+    { url: `${f.controlBase}/api/local/inbox/claim`, method: "POST", body: '{"itemId":"one"}' },
+    { url: `${f.controlBase}/api/local/inbox/result`, method: "POST", body: '{"itemId":"one","outcome":"submitted"}' },
   ]);
   for (const query of ["", "?session=", "?session=a&session=b", `?session=${"x".repeat(201)}`]) assert.equal((await fetch(`${f.base}/api/phone-inbox${query}`)).status, 400);
   for (const [route, body] of [["claim", "{}"], ["claim", '{"itemId":"a/b"}'], ["claim", '{"itemId":"a","extra":1}'], ["result", '{"itemId":"a"}'], ["result", '{"itemId":"a","outcome":"other"}'], ["claim", "x".repeat(4097)]] as const) {
@@ -102,7 +145,7 @@ test("every inbox route reports an unreachable host", async t => {
 test("settings job routes validate and forward through the authenticated host boundary", async t => {
   const calls: { url: string; method: string; body?: string }[] = [];
   const f = await admin(t, { fetch: async (url, init) => {
-    assert.equal(new Headers(init?.headers).get("x-ripple-local"), "s".repeat(43));
+    assert.match(new Headers(init?.headers).get(ADMIN_TOKEN_HEADER) ?? "", /^[a-f0-9]{64}$/);
     calls.push({ url: String(url), method: init?.method ?? "GET", ...(typeof init?.body === "string" ? { body: init.body } : {}) });
     return String(url).endsWith("/claim") ? Response.json({ error: "job unavailable" }, { status: 409 }) : Response.json(String(url).includes("?exclude=") ? { jobs: [] } : { ok: true });
   } });
@@ -111,9 +154,9 @@ test("settings job routes validate and forward through the authenticated host bo
   assert.equal((await fetch(`${f.base}/api/settings-jobs/claim`, { method: "POST", body: '{"jobId":"job-1","helper":"local_helper"}' })).status, 409);
   assert.equal((await fetch(`${f.base}/api/settings-jobs/result`, { method: "POST", body: '{"jobId":"job-1","outcome":"failed","detail":"refused"}' })).status, 200);
   assert.deepEqual(calls, [
-    { url: "http://127.0.0.1:18797/local/settings-jobs?exclude=local_helper", method: "GET" },
-    { url: "http://127.0.0.1:18797/local/settings-jobs/claim", method: "POST", body: '{"jobId":"job-1","helper":"local_helper"}' },
-    { url: "http://127.0.0.1:18797/local/settings-jobs/result", method: "POST", body: '{"jobId":"job-1","outcome":"failed","detail":"refused"}' },
+    { url: `${f.controlBase}/api/local/settings-jobs?exclude=local_helper`, method: "GET" },
+    { url: `${f.controlBase}/api/local/settings-jobs/claim`, method: "POST", body: '{"jobId":"job-1","helper":"local_helper"}' },
+    { url: `${f.controlBase}/api/local/settings-jobs/result`, method: "POST", body: '{"jobId":"job-1","outcome":"failed","detail":"refused"}' },
   ]);
   for (const query of ["", "?exclude=a%20b", "?exclude=a&exclude=b", `?exclude=${"x".repeat(101)}`]) assert.equal((await fetch(`${f.base}/api/settings-jobs${query}`)).status, 400);
   for (const [route, body] of [["claim", "{}"], ["claim", '{"jobId":"a","helper":"bad/id"}'], ["claim", '{"jobId":"a","helper":"b","extra":1}'], ["result", '{"jobId":"a","outcome":"other"}'], ["result", JSON.stringify({ jobId: "a", outcome: "failed", detail: "x".repeat(1001) })], ["claim", "x".repeat(4097)]] as const) assert.equal((await fetch(`${f.base}/api/settings-jobs/${route}`, { method: "POST", body })).status, 400);
@@ -135,17 +178,19 @@ test("host-down status gives the install hint; mutations fail without exposing e
   assert.deepEqual(await (await fetch(`${f.base}/api/phone/status`)).json(), { hostRunning: false, hint: "clauderipple remote install" });
   assert.equal((await fetch(`${f.base}/api/phone/pairing`)).status, 503);
   assert.equal((await fetch(`${f.base}/api/phone/rotate`, { method: "POST" })).status, 503);
-  fs.unlinkSync(path.join(f.home, "local.secret"));
+  fs.unlinkSync(path.join(f.controlHome, "admin-tls-token"));
   assert.deepEqual(await (await fetch(`${f.base}/api/phone/status`)).json(), { hostRunning: false, hint: "clauderipple remote install" });
 });
 
 test("proxy preserves settings refusals, reports live incompatible hosts, and defaults to port 8797", async t => {
   let status = 400;
   const f = await admin(t, { fetch: async url => {
-    assert.equal(new URL(String(url)).port, "8797");
+    assert.equal(new URL(String(url)).protocol, "https:");
     return Response.json({ error: "never reflect arbitrary upstream credential detail" }, { status });
   } });
-  fs.unlinkSync(path.join(f.home, "host.json"));
+  // A missing port uses DEFAULT_PORT. Missing protected configuration is incomplete state.
+  writePrivateFileAtomic(path.join(f.home, "host.json"), "{}");
+  writeAdminEndpoint(f.controlHome, { ...readAdminEndpoint(f.controlHome)!, publicPort: 8797 });
   assert.equal((await fetch(`${f.base}/api/phone/settings`, { method: "POST", body: "{}" })).status, 400);
   status = 403;
   const denied = await fetch(`${f.base}/api/phone/status`);
@@ -154,6 +199,21 @@ test("proxy preserves settings refusals, reports live incompatible hosts, and de
   status = 200;
   // The byte limit is enforced before forwarding.
   assert.equal((await fetch(`${f.base}/api/phone/settings`, { method: "POST", body: "x".repeat(4097) })).status, 413);
+});
+
+test("published TLS discovery with missing host configuration fails closed without contacting or recreating the host", async t => {
+  let calls = 0;
+  const f = await admin(t, { fetch: async () => { calls++; return Response.json({ mode: "relay", phones: [] }); } });
+  assert.equal((await (await fetch(`${f.base}/api/phone/status`)).json() as { hostRunning: boolean }).hostRunning, true);
+  assert.equal(calls, 1);
+  const file = path.join(f.home, "host.json");
+  fs.unlinkSync(file);
+  assert.deepEqual(await (await fetch(`${f.base}/api/phone/status`)).json(), { hostRunning: false, hint: "clauderipple remote install" });
+  for (const route of ["settings", "rotate"]) {
+    assert.equal((await fetch(`${f.base}/api/phone/${route}`, { method: "POST", body: "{}" })).status, 503);
+  }
+  assert.equal(calls, 1, "partial state cannot send any request to the existing TLS listener");
+  assert.equal(fs.existsSync(file), false, "read-only control never fabricates configuration or credentials");
 });
 
 test("phone vocabulary is complete in all six dashboard languages", () => {
@@ -232,13 +292,12 @@ test("restart targets only the Mac host job or installs the Windows/Linux host s
 test("mod approval and move routes forward through the authenticated host boundary and relay the host's status", async t => {
   const calls: { url: string; method: string; body?: string }[] = [];
   const f = await admin(t, { fetch: async (url, init) => {
-    assert.equal(new Headers(init?.headers).get("x-ripple-local"), "s".repeat(43));
-    assert.equal(init?.redirect, "error");
+    assert.match(new Headers(init?.headers).get(ADMIN_TOKEN_HEADER) ?? "", /^[a-f0-9]{64}$/);
     calls.push({ url: String(url), method: init?.method ?? "GET", ...(typeof init?.body === "string" ? { body: init.body } : {}) });
     const pathname = new URL(String(url)).pathname;
-    if (pathname === "/local/mod/moved") return Response.json({ error: "move unavailable" }, { status: 409 });
-    if (pathname === "/local/mod/approval" && init?.method === "POST") return Response.json({ state: "hold" });
-    if (pathname === "/local/mod/approval") return Response.json({ state: "pending" });
+    if (pathname === "/api/local/mod/moved") return Response.json({ error: "move unavailable" }, { status: 409 });
+    if (pathname === "/api/local/mod/approval" && init?.method === "POST") return Response.json({ state: "hold" });
+    if (pathname === "/api/local/mod/approval") return Response.json({ state: "pending" });
     return Response.json({ ok: true });
   } });
   const poll = await fetch(`${f.base}/api/mod/approval?askId=ask-1_A`);
@@ -259,11 +318,11 @@ test("mod approval and move routes forward through the authenticated host bounda
   const move = await fetch(`${f.base}/api/mod/moved`, { method: "POST", body: '{"itemId":"item-1","from":"sess","to":"sess-2"}' });
   assert.equal(move.status, 409);
   assert.deepEqual(calls, [
-    { url: "http://127.0.0.1:18797/local/mod/approval?askId=ask-1_A", method: "GET" },
-    { url: "http://127.0.0.1:18797/local/mod/approval", method: "POST", body: startBody },
-    { url: "http://127.0.0.1:18797/local/mod/approval/done", method: "POST", body: '{"askId":"ask-1_A"}' },
-    { url: "http://127.0.0.1:18797/local/mod/moved", method: "POST", body: '{"itemId":"item-1","from":"sess","to":""}' },
-    { url: "http://127.0.0.1:18797/local/mod/moved", method: "POST", body: '{"itemId":"item-1","from":"sess","to":"sess-2"}' },
+    { url: `${f.controlBase}/api/local/mod/approval?askId=ask-1_A`, method: "GET" },
+    { url: `${f.controlBase}/api/local/mod/approval`, method: "POST", body: startBody },
+    { url: `${f.controlBase}/api/local/mod/approval/done`, method: "POST", body: '{"askId":"ask-1_A"}' },
+    { url: `${f.controlBase}/api/local/mod/moved`, method: "POST", body: '{"itemId":"item-1","from":"sess","to":""}' },
+    { url: `${f.controlBase}/api/local/mod/moved`, method: "POST", body: '{"itemId":"item-1","from":"sess","to":"sess-2"}' },
   ]);
 });
 
@@ -275,7 +334,7 @@ test("the mod poll's send time is forwarded to the host as sentAt, and a malform
   for (const query of ["sentAt=", "sentAt=-1", "sentAt=1.5", "sentAt=soon", "sentAt=1&sentAt=2", `sentAt=${"9".repeat(16)}`]) {
     assert.equal((await fetch(`${f.base}/api/mod/approval?askId=ask-1&${query}`)).status, 400, query);
   }
-  assert.deepEqual(urls, ["http://127.0.0.1:18797/local/mod/approval?askId=ask-1&sentAt=1700000000000", "http://127.0.0.1:18797/local/mod/approval?askId=ask-1"]);
+  assert.deepEqual(urls, [`${f.controlBase}/api/local/mod/approval?askId=ask-1&sentAt=1700000000000`, `${f.controlBase}/api/local/mod/approval?askId=ask-1`]);
   // The phone bridge itself takes a send time only on the approval poll, and only as a whole number of milliseconds.
   assert.equal((await phoneRequest("mod/approval", "GET", undefined, {}, "ask-1", "soon")).status, 404);
   assert.equal((await phoneRequest("inbox", "GET", undefined, {}, "sess", "1700000000000")).status, 404);
@@ -317,7 +376,13 @@ test("mod routes refuse other methods, cross-site callers and malformed input be
   assert.equal((await post("approval", '{"askId":"a"}', { origin: "https://evil.example" })).status, 403);
   assert.equal((await post("approval/done", '{"askId":"a"}', { origin: "https://evil.example" })).status, 403);
   assert.equal((await post("moved", '{"itemId":"a","from":"s","to":"t"}', { origin: "https://evil.example" })).status, 403);
-  assert.equal((await fetch(`${f.base}/api/mod/approval?askId=a`, { headers: { "sec-fetch-site": "cross-site" } })).status, 403);
+  const crossSiteStatus = await new Promise<number>((resolve, reject) => {
+    const request = https.get({ ...adminTestTlsOptions(f.base), path: "/api/mod/approval?askId=a", headers: {
+      ...adminTestAuthHeaders(f.base), "sec-fetch-site": "cross-site",
+    } }, response => { response.resume(); response.on("end", () => resolve(response.statusCode!)); });
+    request.on("error", reject);
+  });
+  assert.equal(crossSiteStatus, 403);
   assert.equal(calls.length, 0);
 });
 

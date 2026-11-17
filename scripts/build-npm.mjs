@@ -10,6 +10,7 @@
 //   dist/ui/                     the dashboard, served by the router's admin API
 //   dist/mod/                    the status mod, a plugin folder Claude Code loads
 //   dist/app/dist/main.js        the tray, with dist/app/assets (tray and app icons) next to it as it expects
+//   dist/installers/             the reviewed installers used by in-place updates (never fetched from main)
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -26,9 +27,19 @@ export function npmBuildSteps(platform = process.platform, run = execFileSync) {
   run(npm, ["--workspace", "@clauderipple/app", "run", "build"], options);
 }
 
+/** @param {string} sourceRoot @param {string} outputRoot */
+export function bundleInstallers(sourceRoot = root, outputRoot = dist) {
+  const destination = path.join(outputRoot, "installers");
+  fs.mkdirSync(destination, { recursive: true });
+  for (const name of ["install.sh", "install.ps1"]) {
+    fs.copyFileSync(path.join(sourceRoot, "scripts", name), path.join(destination, name));
+  }
+}
+
 function build() {
   fs.rmSync(dist, { recursive: true, force: true });
   npmBuildSteps();
+  bundleInstallers();
 
   fs.cpSync(path.join(root, "packages", "ui"), path.join(dist, "ui"), { recursive: true });
   // Host runtime metadata and browser modules are not TypeScript server compilation outputs.

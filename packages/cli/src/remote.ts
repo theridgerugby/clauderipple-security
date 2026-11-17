@@ -6,6 +6,7 @@
 // `remote install|uninstall|status|pair` and the bare `remote`; these verbs are new beside them.
 
 import fs from "node:fs";
+import path from "node:path";
 import { defaultAgentDir } from "../../router/src/agents.ts";
 import { ConfigStore, adminPort, configPath, homeDir } from "../../router/src/config.ts";
 import { writeJsonAtomic } from "../../router/src/locked-file.ts";
@@ -16,6 +17,7 @@ import {
 } from "../../router/src/remote-host.ts";
 import type { TunnelStatus } from "../../router/src/remote-tunnel.ts";
 import { refuseForeignProxy } from "./settings.ts";
+import { adminFetch, localAdminBase } from "./admin-client.ts";
 
 export type RemoteOptions = {
   /** Runs ssh; injected in tests. */
@@ -121,10 +123,10 @@ function updateHosts(configFile: string, mutate: (hosts: HostEntry[]) => HostEnt
 
 type RouterAnswer = { ok: true; hosts: TunnelStatus[] } | { ok: false; why: string };
 
-async function routerCall(adminUrl: string | null, method: "GET" | "POST", pathname: string): Promise<RouterAnswer> {
+async function routerCall(adminUrl: string | null, method: "GET" | "POST", pathname: string, home: string): Promise<RouterAnswer> {
   if (adminUrl === null) return { ok: false, why: "not asked" };
   try {
-    const res = await fetch(`${adminUrl}${pathname}`, { method, signal: AbortSignal.timeout(5_000) });
+    const res = await adminFetch(`${localAdminBase(adminUrl)}${pathname}`, { method, signal: AbortSignal.timeout(5_000) }, home);
     if (res.status === 404 || res.status === 501) return { ok: false, why: "the running router does not manage remote tunnels (an older version?); restart it with `clauderipple restart`" };
     if (!res.ok) return { ok: false, why: `the router answered HTTP ${res.status}` };
     return { ok: true, hosts: ((await res.json()) as { hosts?: TunnelStatus[] }).hosts ?? [] };
@@ -205,7 +207,7 @@ export async function remoteAdd(host: string, o: { port?: number; force?: boolea
   updateHosts(r.configFile, (hosts) => [...hosts.filter((h) => h.host !== host), { host, port }]);
   r.print(`✓ ${host} saved in ${r.configFile}`);
 
-  const reload = await routerCall(r.adminUrl, "POST", "/api/remote/reload");
+  const reload = await routerCall(r.adminUrl, "POST", "/api/remote/reload", path.dirname(r.configFile));
   if (!reload.ok) {
     if (r.adminUrl !== null) r.print(`  ${reload.why}`);
     return;
@@ -215,7 +217,7 @@ export async function remoteAdd(host: string, o: { port?: number; force?: boolea
   let last = reload.hosts.find((h) => h.host === host);
   while (last?.state !== "up" && Date.now() < deadline) {
     await new Promise((res) => setTimeout(res, 500));
-    const now = await routerCall(r.adminUrl, "GET", "/api/remote");
+    const now = await routerCall(r.adminUrl, "GET", "/api/remote", path.dirname(r.configFile));
     if (now.ok) last = now.hosts.find((h) => h.host === host);
   }
   if (last?.state === "up") r.print(`✓ tunnel up: 127.0.0.1:${port} on ${host} reaches ClaudeRipple. New Claude Desktop sessions on ${host} go through it.`);
@@ -234,7 +236,7 @@ export async function remoteRemove(host: string, o: RemoteOptions = {}): Promise
   if (entry) {
     updateHosts(r.configFile, (hosts) => hosts.filter((h) => h.host !== host));
     r.print(`✓ ${host} removed from ${r.configFile}`);
-    const reload = await routerCall(r.adminUrl, "POST", "/api/remote/reload");
+    const reload = await routerCall(r.adminUrl, "POST", "/api/remote/reload", path.dirname(r.configFile));
     r.print(reload.ok ? "✓ tunnel stopped" : `  ${reload.why}`);
   } else r.print(`  ${host} was not in ${r.configFile}; cleaning up the host anyway`);
 
@@ -267,7 +269,7 @@ export async function remoteHosts(o: RemoteOptions = {}): Promise<void> {
     r.print("no remote (SSH) hosts. Add one with: clauderipple remote add <ssh-host> [--port N]");
     return;
   }
-  const live = await routerCall(r.adminUrl, "GET", "/api/remote");
+  const live = await routerCall(r.adminUrl, "GET", "/api/remote", path.dirname(r.configFile));
   const w = Math.max(...hosts.map((h) => h.host.length));
   for (const h of hosts) {
     const s = live.ok ? live.hosts.find((x) => x.host === h.host) : undefined;

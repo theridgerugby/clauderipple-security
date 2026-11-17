@@ -17,6 +17,7 @@ import type { Logger } from "../../log.ts";
 import type { Credential } from "../../pool.ts";
 import { redactErrorText } from "../../redact.ts";
 import { withFileLock, writeJsonAtomic } from "../../locked-file.ts";
+import { readPrivateFile } from "../../private-file.ts";
 import type { ProviderModel } from "../../config.ts";
 import { GOOGLE_OAUTH, type FetchLike } from "./antigravity.ts";
 
@@ -78,7 +79,7 @@ function validAccount(value: unknown): value is GoogleAccount {
 /** The file's accounts; [] when absent, null when unreadable (so a mutation refuses to overwrite it). */
 function parseAccountsFile(home: string): GoogleAccount[] | null {
   try {
-    const parsed = JSON.parse(fs.readFileSync(googleAccountsPath(home), "utf8")) as Partial<AccountsFile>;
+    const parsed = JSON.parse(readPrivateFile(googleAccountsPath(home)).toString("utf8")) as Partial<AccountsFile>;
     if (parsed.version !== 1 || !Array.isArray(parsed.accounts) || !parsed.accounts.every(validAccount)) return null;
     const seen = new Set<string>();
     return parsed.accounts.filter((account) => !seen.has(account.id) && seen.add(account.id)).map((account) => ({ ...account }));

@@ -8,13 +8,20 @@ import os from "node:os";
 import path from "node:path";
 
 import { DEFAULTS, type Config, type Provider } from "../src/config.ts";
-import { agentAliases, agentNameFor, agentRenames, generatedAgents, legacyAgentAliases, PinnedAgentSync, removeGeneratedAgentFiles, retouchLater, syncAgentFiles, withAgentAliases } from "../src/agents.ts";
+import { agentAliases, agentNameFor, agentRenames, generatedAgents, imageLine, legacyAgentAliases, PinnedAgentSync, removeGeneratedAgentFiles, retouchLater, syncAgentFiles, withAgentAliases } from "../src/agents.ts";
 import { removeChatGptAccount, replaceChatGptTokens, saveChatGptAccount, updateChatGptAccount } from "../src/providers/chatgpt/accounts.ts";
 import { resolve } from "../src/routing.ts";
 
 function tmp(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "cr-agents-"));
 }
+
+test("image instructions use the authenticated CLI without embedding credentials or raw admin HTTP", () => {
+  const line = imageLine(8792);
+  assert.match(line, /clauderipple image '…' -o/);
+  assert.match(line, /--ref/);
+  assert.doesNotMatch(line, /curl|\/api\/image|x-clauderipple-admin|admin-token=/);
+});
 
 function cfgWith(providers: Record<string, Provider>, over: Partial<Config> = {}): Config {
   return { ...DEFAULTS, providers, routes: {}, direct: [], aliases: {}, ...over };
@@ -49,7 +56,7 @@ test("(a2) a generated file carries the exact body, its own name, and @high when
   assert.match(file, /처음 만지는 파일은 Read로 통독하고/, "workers read and edit with the dedicated tools");
   assert.match(file, /조사·감사·대조 작업이라도 그 경로에는 반드시 만든다/);
   assert.doesNotMatch(file, /\ntools:/, "by default a worker inherits the session's tools");
-  assert.doesNotMatch(file, /\/api\/image/, "no ChatGPT provider, no image instruction");
+  assert.doesNotMatch(file, /clauderipple image/, "no ChatGPT provider, no image instruction");
   assert.match(file, /Start the Agent description with "deepseek-v4\.1-flash·<level> · " \(the marker's level, else high\)/, "no display name: the id");
 });
 
@@ -61,12 +68,13 @@ test("(a5) the parent is asked for the title prefix the agent-title hook writes"
   assert.match(fs.readFileSync(path.join(dir, "plain.md"), "utf8"), /Start the Agent description with "plain · " so/, "no effort offered, no level");
 });
 
-test("(a4) with a ChatGPT provider configured, a worker is told how to make an image on this router's admin port", () => {
+test("(a4) with a ChatGPT provider configured, a worker is told how to make an image through the authenticated CLI", () => {
   const dir = tmp();
   const chatgpt: Provider = { type: "chatgpt", models: [{ id: "gpt-6-luna" }] };
   syncAgentFiles(cfgWith({ gpt: chatgpt }, { admin: { port: 9555 } }), dir, undefined, { manifestPath: path.join(dir, "m.json") });
   const file = fs.readFileSync(path.join(dir, "gpt-6-luna.md"), "utf8");
-  assert.match(file, /http:\/\/127\.0\.0\.1:9555\/api\/image/);
+  assert.match(file, /clauderipple image '…' -o/);
+  assert.doesNotMatch(file, /http:\/\/127\.0\.0\.1:9555\/api\/image/);
 });
 
 test("(a3) cli.limitWorkerTools adds a tools line, and turning it off takes the line away again", () => {

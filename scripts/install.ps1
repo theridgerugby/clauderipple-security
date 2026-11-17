@@ -1,6 +1,6 @@
 # ClaudeRipple installer for Windows.
 #
-#   irm https://raw.githubusercontent.com/PBJ-2/clauderipple/main/scripts/install.ps1 | iex
+# Run a reviewed local copy from the intended release: powershell -File .\install.ps1
 #
 # Installing from npm needs npm, which needs Node, which is the one thing a first-time user is not
 # guaranteed to have. So this script brings its own: it uses a Node 24+ already on PATH when there
@@ -23,20 +23,22 @@ $NodeMajor = 24
 # the pin is only what to use when the release index cannot be reached.
 $NodeFallback = 'v24.21.0'
 $Runtime = Join-Path $Prefix 'runtime'
+$NodeBackup = $null
+$NodeStaging = $null
 
 function Get-NodeMajor([string]$exe) {
   # `node -v` and a regex, not `node -e`: PowerShell 5.1 mangles the quotes inside an -e script, and
   # the resulting SyntaxError on stderr becomes a terminating error under ErrorActionPreference Stop.
   # Measured 2026-09-16 in a Windows 11 arm64 VM: a perfectly good Node 24 was reported as absent and
   # the installer downloaded a second copy.
+  $old = $ErrorActionPreference
   try {
-    $old = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     $out = (& $exe -v 2>$null | Out-String).Trim()
-    $ErrorActionPreference = $old
     if ($out -match '^v(\d+)\.') { return [int]$Matches[1] }
     return 0
   } catch { return 0 }
+  finally { $ErrorActionPreference = $old }
 }
 
 function Find-Node {
@@ -56,7 +58,7 @@ function Install-Node {
   $version = $NodeFallback
   try {
     $index = Invoke-RestMethod -Uri 'https://nodejs.org/dist/index.json' -UseBasicParsing
-    $newest = $index | Where-Object { $_.version -like "v$NodeMajor.*" } | Select-Object -First 1
+    $newest = $index | Where-Object { $_.version -match "^v$NodeMajor\.[0-9]+\.[0-9]+$" } | Select-Object -First 1
     if ($newest) { $version = $newest.version }
   } catch { }
 
@@ -64,26 +66,60 @@ function Install-Node {
   $base = "https://nodejs.org/dist/$version"
   $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
   New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+  try {
   Write-Host "Downloading Node $version (win-$arch)..."
   $zip = Join-Path $tmp "$name.zip"
   Invoke-WebRequest -Uri "$base/$name.zip" -OutFile $zip -UseBasicParsing
   # The download is verified against the release's own checksum file before anything is unpacked.
   $sums = (Invoke-WebRequest -Uri "$base/SHASUMS256.txt" -UseBasicParsing).Content
-  $line = ($sums -split "`n" | Where-Object { $_ -match [regex]::Escape("$name.zip") } | Select-Object -First 1)
+  $checksumPattern = '^[0-9a-fA-F]{64}\s+' + [regex]::Escape("$name.zip") + '\s*$'
+  $line = ($sums -split "`n" | Where-Object { $_ -match $checksumPattern } | Select-Object -First 1)
   if (-not $line) { throw "no checksum published for $name.zip" }
   $expected = ($line -split '\s+')[0]
   $actual = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLower()
   if ($actual -ne $expected.ToLower()) { throw 'the Node download does not match its published checksum' }
 
-  if (Test-Path $Runtime) { Remove-Item -Recurse -Force $Runtime }
-  # The prefix may not exist yet, and Move-Item will not create a missing parent (measured: it fails
-  # with "part of the path could not be found" after the download has already succeeded).
+  # Unpack and verify before touching a working runtime. Both renames stay on the prefix's
+  # filesystem; the backup survives until npm and the command shim have completed successfully.
   New-Item -ItemType Directory -Path (Split-Path $Runtime -Parent) -Force | Out-Null
   Expand-Archive -Path $zip -DestinationPath $tmp -Force
-  Move-Item -Path (Join-Path $tmp $name) -Destination $Runtime
-  Remove-Item -Recurse -Force $tmp
+  $unpacked = Join-Path $tmp $name
+  $unpackedNode = Join-Path $unpacked 'node.exe'
+  if (-not (Test-Path -LiteralPath $unpackedNode -PathType Leaf) -or (Get-NodeMajor $unpackedNode) -lt $NodeMajor) {
+    throw 'the unpacked Node runtime is missing or is not a supported version'
+  }
+  $script:NodeStaging = "$Runtime.new.$([Guid]::NewGuid().ToString('N'))"
+  Move-Item -LiteralPath $unpacked -Destination $script:NodeStaging
+  if (Test-Path -LiteralPath $Runtime) {
+    $script:NodeBackup = "$Runtime.old.$([Guid]::NewGuid().ToString('N'))"
+    Move-Item -LiteralPath $Runtime -Destination $script:NodeBackup
+  }
+  Move-Item -LiteralPath $script:NodeStaging -Destination $Runtime
+  $script:NodeStaging = $null
+  } finally {
+    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+  }
 }
 
+function Restore-NodeRuntime {
+  if ($script:NodeBackup -and (Test-Path -LiteralPath $script:NodeBackup)) {
+    if (Test-Path -LiteralPath $Runtime) { Remove-Item -LiteralPath $Runtime -Recurse -Force }
+    Move-Item -LiteralPath $script:NodeBackup -Destination $Runtime
+    $script:NodeBackup = $null
+  }
+  if ($script:NodeStaging -and (Test-Path -LiteralPath $script:NodeStaging)) {
+    Remove-Item -LiteralPath $script:NodeStaging -Recurse -Force
+    $script:NodeStaging = $null
+  }
+}
+
+try {
+# Recover a single old-only copy after an interruption that prevented finally from running.
+if (-not (Test-Path -LiteralPath $Runtime) -and (Test-Path -LiteralPath $Prefix)) {
+  $oldCopies = @(Get-ChildItem -LiteralPath $Prefix -Directory | Where-Object { $_.Name -like 'runtime.old.*' })
+  if ($oldCopies.Count -gt 1) { throw 'multiple previous Node runtimes remain; inspect the installation before retrying' }
+  if ($oldCopies.Count -eq 1) { Move-Item -LiteralPath $oldCopies[0].FullName -Destination $Runtime }
+}
 $node = Find-Node
 if ($node) {
   Write-Host "Using Node $(& $node -v) at $node"
@@ -124,7 +160,7 @@ if ((Test-Path $OldElectron) -and -not (Test-Path $NewElectron)) {
 # Installed under our own prefix rather than the Node installation's: nothing to elevate, and
 # uninstalling is removing one directory.
 Write-Host "Installing $Package..."
-& $node $npmCli install --global --prefix $Prefix --loglevel error $Package
+& $node $npmCli install --global --prefix $Prefix --registry https://registry.npmjs.org --ignore-scripts --loglevel error $Package
 if ($LASTEXITCODE -ne 0) { throw "npm could not install $Package" }
 
 # Record the method even for --no-setup and a prefix chosen only for this invocation.
@@ -144,8 +180,20 @@ if ($node.StartsWith($Runtime, [StringComparison]::OrdinalIgnoreCase)) {
   if (-not (Test-Path $entry)) { throw "the installed package has no entry point at $entry" }
   # cmd.exe reads each line in the active console code page. Switch on an ASCII-only line
   # before it reads the UTF-8 paths; no BOM (cmd would treat it as part of the first command).
-  $wrapper = "@echo off`r`nchcp 65001 >nul`r`n`"$node`" `"$entry`" %*`r`n"
+  # Percent signs are expanded even inside cmd quotes. Delayed expansion would likewise expand
+  # !name! in a path. Escape the former and disable the latter before cmd reads any path.
+  $nodeLiteral = $node.Replace('%', '%%')
+  $entryLiteral = $entry.Replace('%', '%%')
+  $wrapper = "@echo off`r`nsetlocal DisableDelayedExpansion`r`nchcp 65001 >nul`r`n`"$nodeLiteral`" `"$entryLiteral`" %*`r`n"
   [System.IO.File]::WriteAllText($cmd, $wrapper, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# After npm and the shim succeed, retain the new runtime even if later service setup fails.
+$committedBackup = $script:NodeBackup
+$script:NodeBackup = $null
+if ($committedBackup) {
+  try { Remove-Item -LiteralPath $committedBackup -Recurse -Force }
+  catch { Write-Warning "The new Node runtime is installed; its previous backup could not be removed: $committedBackup" }
 }
 
 # PowerShell picks clauderipple.ps1 over clauderipple.cmd, and under the default execution policy
@@ -205,3 +253,6 @@ if ($env:CLAUDERIPPLE_NO_TRAY -ne '1') {
 if ($RestartTray -or $trayReady) { & $cmd tray }
 Write-Host ''
 Write-Host 'Open the dashboard with: clauderipple ui'
+} finally {
+  Restore-NodeRuntime
+}

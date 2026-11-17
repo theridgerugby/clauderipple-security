@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { appendPrivateFile, openPrivateRead } from "./private-file.ts";
 import type { RequestRecord } from "./requestlog.ts";
 import { chargeOf, priceOf } from "./prices.ts";
 
@@ -455,8 +456,7 @@ export class UsageHistory {
   private append(lines: HourBucket[]): void {
     if (lines.length === 0) return;
     try {
-      fs.mkdirSync(path.dirname(this.file), { recursive: true });
-      fs.appendFileSync(this.file, lines.map(toLine).join(""), "utf8");
+      appendPrivateFile(this.file, lines.map(toLine).join(""));
     } catch {
       // Usage history is best-effort: it must never alter the proxy response path.
     }
@@ -465,7 +465,12 @@ export class UsageHistory {
   private load(): void {
     let text: string;
     try {
-      text = fs.readFileSync(this.file, "utf8");
+      // This durable history is not a rotated request log. Preserve the complete accounting
+      // record while sharing the descriptor/owner checks, rather than silently dropping old
+      // totals at an arbitrary credential-file byte limit. Retention is a separate policy.
+      const fd = openPrivateRead(this.file);
+      try { text = fs.readFileSync(fd, "utf8"); }
+      finally { fs.closeSync(fd); }
     } catch {
       return;
     }

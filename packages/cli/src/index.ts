@@ -36,6 +36,8 @@ import { dropPowerShellShim, installKind, isNewer, latestVersion, PACKAGE, runUp
 import { ClaudeOAuthSession } from "../../router/src/providers/claude-oauth.ts";
 import { requestHostUpdate } from "../../remote/src/host-update.ts";
 import { purgeHome } from "./purge.ts";
+import { adminFetch, openAdminDashboard } from "./admin-client.ts";
+import { recordAdminRuntime } from "./admin-runtime.ts";
 
 async function pickerOn(): Promise<void> {
   const home = homeDir();
@@ -187,7 +189,7 @@ async function image(): Promise<void> {
   const headers = { "content-type": "application/json", ...(session && /^[\w-]{1,128}$/.test(session) ? { "x-claude-code-session-id": session } : {}) };
   let res: Response;
   try {
-    res = await fetch(`http://127.0.0.1:${port}/api/image`, { method: "POST", headers, body: JSON.stringify(body) });
+    res = await adminFetch(`http://127.0.0.1:${port}/api/image`, { method: "POST", headers, body: JSON.stringify(body) }, path.dirname(configPath()));
   } catch {
     throw new Error(`the router is not answering on 127.0.0.1:${port}; start it with: clauderipple start`);
   }
@@ -203,7 +205,7 @@ async function image(): Promise<void> {
 /** The version the router on this admin port reports, or null when it does not answer. */
 async function runningVersion(port: number): Promise<string | null> {
   try {
-    const res = await fetch(`http://127.0.0.1:${port}/api/status`, { signal: AbortSignal.timeout(10_000) });
+    const res = await adminFetch(`http://127.0.0.1:${port}/api/status`, { signal: AbortSignal.timeout(10_000) }, path.dirname(configPath()));
     const version = res.ok ? ((await res.json()) as { version?: unknown }).version : null;
     return typeof version === "string" ? version : null;
   } catch {
@@ -244,6 +246,7 @@ async function install(): Promise<void> {
   // Persist the single execution contract so the GUI, admin API, hooks, and supervisor all use
   // this installation's runtime rather than any Node installation on the user's PATH.
   writePaths(installedRuntime, home);
+  recordAdminRuntime(home, installedRuntime);
   const shim = dropPowerShellShim(installKind(installedRuntime));
   if (shim) console.log(`✓ removed ${shim}: PowerShell's default policy refuses it, and clauderipple.cmd runs instead`);
   // Windows and Linux register node + the router script directly (schtasks.ts writes its own .cmd
@@ -508,12 +511,11 @@ function cliVersions(): string {
   return "none cached";
 }
 
-function ui(): void {
+async function ui(): Promise<void> {
   const cfg = new ConfigStore(configPath()).get();
   const port = adminPort(cfg);
   const url = `http://127.0.0.1:${port}/`;
-  if (openBrowser(url)) console.log(`opened ${url}`);
-  else console.log(`could not open a browser automatically; open this URL yourself: ${url}`);
+  if (!await openAdminDashboard(url, path.dirname(configPath()))) process.exitCode = 1;
 }
 
 function logs(): void {
@@ -555,7 +557,7 @@ function logs(): void {
  */
 async function update(): Promise<void> {
   const kind = installKind(installedRuntime);
-  // CLAUDERIPPLE_PACKAGE names what to install instead of the registry's latest (a tarball, say).
+  // CLAUDERIPPLE_PACKAGE can select an exact clauderipple@x.y.z version instead of registry latest.
   const override = process.env.CLAUDERIPPLE_PACKAGE;
   const latest = override ? null : await latestVersion();
   const newer = latest ? isNewer(latest, VERSION) : true;
@@ -608,6 +610,7 @@ function recoveryDeps(): RecoveryDeps {
       // paths.json is part of what install registers: the GUI and hooks run what it names.
       register: () => {
         writePaths(installedRuntime, home);
+        recordAdminRuntime(home, installedRuntime);
         return ops.register();
       },
       start: () => ops.start(),
@@ -715,7 +718,7 @@ function help(): void {
   remote remove <ssh-host>   undo "remote add" on that host and stop its tunnel
   remote hosts      list remote (SSH) hosts and their tunnels (also shown by "remote status")
   config            print the config file path
-  ui                open the dashboard in your browser
+  ui                open the installed native dashboard (no browser fallback)
   tray [--install]  start the menu-bar / tray app (--install fetches Electron, ~270MB, once)
   update [--check]  install the latest version the way this one was installed (--check only reports)
   login             add a ChatGPT account (opens your browser; run again to add another — they take turns when one runs out)
@@ -793,6 +796,7 @@ async function dispatchCommand(): Promise<void> {
       await recovery();
       break;
     case "start": {
+      recordAdminRuntime(homeDir(), installedRuntime);
       const r = startAgent({ onProgress: (m) => console.log(`  ${m}`) });
       console.log(
         r === "already-running" ? "already running"
@@ -805,6 +809,7 @@ async function dispatchCommand(): Promise<void> {
       break;
     }
     case "restart": {
+      recordAdminRuntime(homeDir(), installedRuntime);
       const r = restartAgent({ onProgress: (m) => console.log(`  ${m}`) });
       console.log(describeRestart(r));
       if (r === "failed" || r === "other-installation" || r === "ownership-unknown" || r === "identity-unknown") process.exitCode = 1;
@@ -867,6 +872,7 @@ async function dispatchCommand(): Promise<void> {
       const sub = args[1];
       const { setStatusMod, statusModEnabled } = await import("./settings.ts");
       if (sub === "on" || sub === "off") {
+        if (sub === "on") recordAdminRuntime(homeDir(), installedRuntime);
         const r = setStatusMod(sub === "on", installedRuntime.modDir);
         for (const n of r.notes) console.log(`✓ ${n}`);
         if (!r.changed) console.log(`✓ already ${sub}`);
@@ -959,7 +965,7 @@ async function dispatchCommand(): Promise<void> {
       const { execRunner } = await import("../../router/src/awake.ts");
       const run = execRunner();
       process.exitCode = await powerCli(args, {
-        call: adminPowerCall(adminPort(new ConfigStore(configPath()).get())),
+        call: adminPowerCall(adminPort(new ConfigStore(configPath()).get()), path.dirname(configPath())),
         configFile: configPath(),
         rippleHome: homeDir(),
         run,
@@ -970,7 +976,7 @@ async function dispatchCommand(): Promise<void> {
       break;
     }
     case "ui":
-      ui();
+      await ui();
       break;
     case "update":
       await update();

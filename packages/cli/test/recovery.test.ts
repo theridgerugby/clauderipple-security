@@ -12,13 +12,14 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
-import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { posixModes, posixPaths } from "../../../test/capabilities.ts";
 import { syncAgentFiles } from "../../router/src/agents.ts";
 import { DEFAULTS } from "../../router/src/config.ts";
+import { ADMIN_TOKEN_HEADER } from "../../router/src/admin-auth.ts";
+import { adminTlsFixture } from "../../router/test/admin-tls-fixture.ts";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "cr-recovery-"));
 const label = `com.clauderipple.check-${crypto.randomBytes(4).toString("hex")}`;
@@ -318,6 +319,28 @@ test("doctor: shape, mode and proxies on a healthy install", async () => {
     cli: { proxy: "ripple", url: proxyUrl },
     problems: [],
   });
+});
+
+test("doctor authenticates over TLS using an existing recovery fixture home", async t => {
+  const { home } = scratch();
+  const received: string[] = [];
+  const fixture = await adminTlsFixture(t, (req, res) => {
+    assert.equal(req.headers[ADMIN_TOKEN_HEADER], fixture.token);
+    assert.equal(req.headers["x-clauderipple-instance-id"], fixture.endpoint.instanceId);
+    received.push(req.url!);
+    req.resume();
+    res.setHeader("content-type", "application/json");
+    res.end('{"version":"9.9.9"}');
+  }, { home });
+  const file = path.join(home, "config.json");
+  const config = JSON.parse(fs.readFileSync(file, "utf8"));
+  fs.writeFileSync(file, JSON.stringify({ ...config, admin: { port: fixture.endpoint.publicPort } }));
+  const { ops, calls } = fakeSupervisor({});
+  const result = await doctor({ home, version: "9.9.9", supervisor: ops, remoteHostInstalled: () => false });
+  assert.equal(result.router.responding, true);
+  assert.equal(result.router.version, "9.9.9");
+  assert.deepEqual(received, ["/api/status"]);
+  assert.deepEqual(calls, [], "a healthy TLS diagnostic must not repair or start a service");
 });
 
 test("doctor: a phone host whose Claude Code CLI has no login is named, with the fix (issue #71)", async () => {
@@ -656,18 +679,23 @@ test("Linux launcher: a desktop entry; Windows: shortcuts through a hidden Power
 
 // ---- the CLI itself, end to end (macOS only: a fake launchctl stands in for launchd) -------
 
-test("CLI: doctor, direct on/off and app print one JSON object each and exit 0", { skip: os.type() !== "Darwin" }, async () => {
+test("CLI: doctor, direct on/off and app print one JSON object each and exit 0", { skip: os.type() !== "Darwin" }, async t => {
   const ctx = directSetup();
   const calls = path.join(root, "e2e-launchctl.log");
   const fake = path.join(root, "e2e-launchctl");
   fs.writeFileSync(fake, `#!/bin/sh\necho "$*" >> "${calls}"\nexit 113\n`, { mode: 0o755 });
-  // A stand-in for the admin API on a free port, so direct off finds a router and repairs nothing.
-  const server = http.createServer((req, res) => {
+  // A real protected TLS stand-in, so direct off finds a router and repairs nothing.
+  // The subprocess uses this home's private identity/endpoint, never plaintext HTTP.
+  const received: string[] = [];
+  const fixture = await adminTlsFixture(t, (req, res) => {
+    assert.equal(req.headers[ADMIN_TOKEN_HEADER], fixture.token);
+    assert.equal(req.headers["x-clauderipple-instance-id"], fixture.endpoint.instanceId);
+    received.push(req.url!);
+    req.resume();
     res.setHeader("content-type", "application/json");
     res.end(JSON.stringify({ version: "0.0.0-test" }));
-  });
-  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
-  const adminPort = (server.address() as { port: number }).port;
+  }, { home: ctx.home });
+  const adminPort = fixture.endpoint.publicPort;
   const cfg = JSON.parse(fs.readFileSync(path.join(ctx.home, "config.json"), "utf8"));
   fs.writeFileSync(path.join(ctx.home, "config.json"), JSON.stringify({ ...cfg, admin: { port: adminPort } }));
   const env: NodeJS.ProcessEnv = { ...process.env, CLAUDERIPPLE_HOME: ctx.home, CLAUDERIPPLE_LAUNCHCTL: fake };
@@ -691,8 +719,10 @@ test("CLI: doctor, direct on/off and app print one JSON object each and exit 0",
     assert.equal(app.ok, true);
     assert.ok((app.paths as string[]).every((p) => p.startsWith(root)));
   } finally {
-    server.close();
+    fixture.server.closeAllConnections();
+    await new Promise<void>(resolve => fixture.server.close(() => resolve()));
   }
+  assert.ok(received.includes("/api/status"), "the real CLI must authenticate its diagnostic request over TLS");
   const used = fs.existsSync(calls) ? fs.readFileSync(calls, "utf8").trim().split("\n") : [];
   assert.ok(used.length > 0 && used.every((l) => l.startsWith("print ") && l.endsWith(`/${label}`)), used.join("\n"));
 });

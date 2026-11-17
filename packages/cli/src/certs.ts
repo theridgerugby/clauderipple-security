@@ -6,6 +6,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createCa, createLeaf } from "../../router/src/x509.ts";
+import { assertPrivateTarget, ensurePrivateDirectory, readPrivateFile } from "../../router/src/private-file.ts";
+import { withFileLock, writePrivateFileAtomic } from "../../router/src/locked-file.ts";
 
 export type CertPaths = { caPem: string; caKey: string; leafPem: string; leafKey: string };
 
@@ -19,20 +21,25 @@ export function certPaths(home: string): CertPaths {
 }
 
 export function generateCerts(home: string, upstream = "api.anthropic.com", days = 3650): CertPaths {
-  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  ensurePrivateDirectory(home);
   const p = certPaths(home);
-  const ca = createCa({ days });
-  fs.writeFileSync(p.caPem, ca.certPem);
-  fs.writeFileSync(p.caKey, ca.keyPem, { mode: 0o600 });
-  const leaf = createLeaf({ host: upstream, caCertPem: ca.certPem, caKeyPem: ca.keyPem, days: Math.min(days, 825) });
-  fs.writeFileSync(p.leafPem, leaf.certPem);
-  fs.writeFileSync(p.leafKey, leaf.keyPem, { mode: 0o600 });
-  // Pre-existing installs were written before the mode argument; make sure the keys are private.
-  for (const f of [p.caKey, p.leafKey]) fs.chmodSync(f, 0o600);
+  withFileLock(path.join(home, "certificates"), () => {
+    // Refuse unsafe destinations before changing any member of the certificate set.
+    for (const file of Object.values(p)) assertPrivateTarget(file);
+    const ca = createCa({ days });
+    const leaf = createLeaf({ host: upstream, caCertPem: ca.certPem, caKeyPem: ca.keyPem, days: Math.min(days, 825) });
+    writePrivateFileAtomic(p.caPem, ca.certPem);
+    writePrivateFileAtomic(p.caKey, ca.keyPem);
+    writePrivateFileAtomic(p.leafPem, leaf.certPem);
+    writePrivateFileAtomic(p.leafKey, leaf.keyPem);
+  });
   return p;
 }
 
 export function certsExist(home: string): boolean {
   const p = certPaths(home);
-  return [p.caPem, p.caKey, p.leafPem, p.leafKey].every((f) => fs.existsSync(f));
+  if (![p.caPem, p.caKey, p.leafPem, p.leafKey].every((f) => fs.existsSync(f))) return false;
+  // Validate and tighten existing key files too, not only freshly generated certificates.
+  for (const file of Object.values(p)) readPrivateFile(file, 64 * 1024);
+  return true;
 }
