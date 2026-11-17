@@ -1283,6 +1283,7 @@ test("a config that failed validation is reported as a problem, with its errors"
     assert.deepEqual(status.config.errors, errors);
     const ready = await fetch(`${base()}:${port}/readyz`);
     assert.equal(ready.status, 503);
+    await ready.arrayBuffer();
   }, { configErrors: () => errors });
 });
 
@@ -1311,13 +1312,12 @@ test("GET /api/status returns a snapshot", async () => {
 // itself dead — while the CSRF check above it had been written to expect HEAD all along.
 test("HEAD answers a read-only route with its headers and no body", async () => {
   await withAdmin(makeCfg(), async ({ port }) => {
-    // HEAD with a nonzero Content-Length and an intentionally closed TLS connection triggers
-    // an assertion in the test runner's Undici HTTP/1 parser on Windows. The production
-    // authenticated admin client uses node:https; exercise the real pinned HTTPS wire here.
-    const requestHead = (route: string): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer }> =>
+    // Use the native pinned HTTPS client for both methods. Mixing a paused Undici GET
+    // body with a separate HEAD socket can trip Undici's parser on Windows connection close.
+    const requestNative = (method: "GET" | "HEAD", route: string): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer }> =>
       new Promise((resolve, reject) => {
         const options = adminTestTlsOptions(`${base()}:${port}`);
-        const request = https.request({ ...options, method: "HEAD", path: route,
+        const request = https.request({ ...options, method, path: route,
           headers: adminTestAuthHeaders(`${base()}:${port}`) }, response => {
           const chunks: Buffer[] = [];
           response.on("data", chunk => chunks.push(Buffer.from(chunk)));
@@ -1331,23 +1331,21 @@ test("HEAD answers a read-only route with its headers and no body", async () => 
     // The contract is that a HEAD answers exactly as the GET does, whatever that answer is:
     // `/readyz` is a 503 until the proxy reports ready, and a HEAD has to say the same thing.
     for (const route of ["/readyz", "/api/status", "/style.css", "/"]) {
-      const get = await fetch(`${base()}:${port}${route}`);
-      const head = await requestHead(route);
+      const get = await requestNative("GET", route);
+      const head = await requestNative("HEAD", route);
       assert.notEqual(head.status, 404, `HEAD ${route} must reach its route`);
       assert.equal(head.status, get.status, `HEAD ${route} answers as the GET does`);
-      // Fully drain each GET before closing the test server. Undici's HTTP/1 parser can
-      // assert on a paused unread response when an idle keep-alive connection is closed.
-      await get.arrayBuffer();
       assert.equal(head.body.byteLength, 0);
     }
     // A static file is the same bytes on both calls, so its stated length can be compared exactly;
     // `/api/status` carries live counters and would differ between two reads.
-    const [getCss, headCss] = [await fetch(`${base()}:${port}/style.css`), await requestHead("/style.css")];
-    assert.ok(Number(getCss.headers.get("content-length")) > 0);
-    assert.equal(headCss.headers["content-length"], getCss.headers.get("content-length"), "the length of the body a GET would have sent");
-    await getCss.arrayBuffer();
+    const getCss = await requestNative("GET", "/style.css");
+    const headCss = await requestNative("HEAD", "/style.css");
+    assert.ok(Number(getCss.headers["content-length"]) > 0);
+    assert.equal(headCss.headers["content-length"], getCss.headers["content-length"], "the length of the body a GET would have sent");
+    assert.ok(getCss.body.byteLength > 0, "GET serves the static asset bytes");
     assert.equal(headCss.body.byteLength, 0);
-    // The body is the part a HEAD must not carry, and `fetch` never exposes one — read the wire.
+    // Inspect the raw TLS wire to confirm that no bytes follow HEAD response headers.
     const wire = await new Promise<string>((done, fail) => {
       const options = adminTestTlsOptions(`${base()}:${port}`);
       const sock = tls.connect({ host: "127.0.0.1", port: Number(options.port), ca: options.ca,

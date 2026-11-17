@@ -106,10 +106,10 @@ jobs:
         if: runner.os == 'Windows'
         # Keep full-file platform regressions visible before the larger suite finishes.
         run: node --test --test-reporter=tap packages/app/test/release-source.test.ts packages/router/test/chatgpt-sidecall-timeout.test.ts packages/router/test/proxy-requestlog.test.ts
-      - name: Native Windows limits forecast regression
+      - name: Native Windows admin limits and HEAD regressions
         if: runner.os == 'Windows'
         # The full matrix still runs every admin test; isolate fresh and cached reading semantics.
-        run: node --test --test-reporter=tap --test-name-pattern="GET /api/limits forecasts a window|GET /api/limits judges a cached reading" packages/router/test/admin.test.ts
+        run: node --test --test-reporter=tap --test-name-pattern="GET /api/limits forecasts a window|GET /api/limits judges a cached reading|a config that failed validation is reported|HEAD answers a read-only route" packages/router/test/admin.test.ts
       - name: Native Windows personal sensitive-data gates
         if: runner.os == 'Windows'
         # Synthetic secrets only: real CurrentUser DPAPI, cross-process reads, native-app
