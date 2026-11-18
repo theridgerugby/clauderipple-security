@@ -11,11 +11,12 @@ import { egressFetch } from "../src/egress.ts";
 import { Logger } from "../src/log.ts";
 import { RequestLog } from "../src/requestlog.ts";
 import { startAdmin, fetch as adminFetch, unauthenticatedFetch } from "./admin-client.ts";
+import type { AdminDeps } from "../src/admin.ts";
 
 const ORIGIN = "https://school.example.test";
 const SECRET = "SYNTHETIC-KEY-ADMIN-PERSONAL-NOT-REAL";
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, controls: Pick<AdminDeps, "runCli" | "picker"> = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-personal-admin-"));
   const previous = { home: process.env.CLAUDERIPPLE_HOME, settings: process.env.CLAUDE_SETTINGS_PATH };
   process.env.CLAUDERIPPLE_HOME = home;
@@ -41,12 +42,13 @@ async function fixture(t: TestContext) {
     stats: () => ({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 }),
     health: () => 0, version: "synthetic-personal-policy",
     claudeCodeCredentialReaders: { keychain: () => null, credentialsFile: () => null },
+    ...controls,
   });
   const base = `https://127.0.0.1:${server.tlsPort}`;
   const send = (resource: string, body: unknown, method = "POST") => adminFetch(base + resource, {
     method, headers: { "content-type": "application/json" }, body: JSON.stringify(body),
   });
-  return { base, file, store, send };
+  return { base, file, store, send, settings: process.env.CLAUDE_SETTINGS_PATH! };
 }
 
 test("native admin approval is explicit, exact, credential-preserving and immediately revocable", async t => {
@@ -111,4 +113,80 @@ test("ordinary config saving cannot silently approve an external destination", a
   assert.equal(refused.status, 403, await refused.text());
   assert.deepEqual(fs.readFileSync(f.file), before);
   assert.deepEqual(f.store.get().security?.approvedOrigins, []);
+});
+
+test("picker activation errors are bounded and redacted without hiding a refusal", async t => {
+  const calls: string[][] = [];
+  const f = await fixture(t, { runCli: async args => {
+    calls.push(args);
+    return { ok: false, output: "Desktop activation refused: apiKey=PRIVATE-TEST-KEY " + "x".repeat(9000) };
+  } });
+  const invalid = await f.send("/api/picker", { enabled: "yes" });
+  assert.equal(invalid.status, 400);
+  assert.deepEqual(calls, []);
+  const response = await f.send("/api/picker", { enabled: true });
+  assert.equal(response.status, 500);
+  const result = await response.json() as { ok: boolean; error: string; output: string };
+  assert.equal(result.ok, false);
+  assert.equal(result.error, result.output);
+  assert.ok(result.output.startsWith("Desktop activation refused:"));
+  assert.ok(result.output.length <= 8192);
+  assert.ok(!result.output.includes("PRIVATE-TEST-KEY"));
+  assert.deepEqual(calls, [["picker", "on"]]);
+});
+
+test("picker status exposes bounded destination diagnostics and unapproved native origin", async t => {
+  const f = await fixture(t, { picker: () => ({ enabled: true, hosts: ["claude.ai"], last: null,
+    blockedOrigins: ["https://example.test"] }) });
+  const status = await (await adminFetch(f.base + "/api/status")).json() as {
+    picker: { blockedOrigins: string[] }; readiness: { ready: boolean; problems: string[] };
+  };
+  assert.deepEqual(status.picker.blockedOrigins, ["https://example.test"]);
+  assert.equal(status.readiness.ready, false);
+  assert.ok(status.readiness.problems.includes("picker-origin"));
+});
+
+test("personal provider and checklist saves leave existing Claude settings byte-for-byte unchanged", async t => {
+  const f = await fixture(t);
+  const original = '{\n  "env": {"EXISTING_SETTING": "keep", "ANTHROPIC_MODEL": "sonnet"},\n  "theme": "dark"\n}\n';
+  fs.writeFileSync(f.settings, original);
+  const snapshot = await (await adminFetch(f.base + "/api/config")).json() as Record<string, any>;
+  snapshot.cli.extraModels = [{ model: "synthetic-model", name: "Synthetic extra" }];
+  const response = await f.send("/api/config", snapshot, "PUT");
+  assert.equal(response.status, 200, await response.text());
+  assert.equal(fs.readFileSync(f.settings, "utf8"), original);
+});
+
+test("personal config saving cannot bypass explicit Desktop activation or recovery", async t => {
+  const f = await fixture(t);
+  const snapshot = await (await adminFetch(f.base + "/api/config")).json() as Record<string, any>;
+  const before = fs.readFileSync(f.file);
+  const response = await f.send("/api/config", { ...snapshot, picker: { enabled: true } }, "PUT");
+  assert.equal(response.status, 403, await response.text());
+  assert.deepEqual(fs.readFileSync(f.file), before);
+  assert.equal(fs.existsSync(f.settings), false);
+});
+
+test("active personal Desktop rejects later native-slot and safety-service overrides", async t => {
+  const f = await fixture(t);
+  const initial = JSON.parse(readPrivateFile(f.file).toString("utf8"));
+  writeSecretJsonAtomic(f.file, { ...initial, picker: { enabled: true } });
+  const snapshot = await (await adminFetch(f.base + "/api/config")).json() as Record<string, any>;
+  const before = fs.readFileSync(f.file);
+  for (const change of [
+    { cli: { ...snapshot.cli, models: { main: "synthetic-model" } } },
+    { routes: { opus: { provider: "school", model: "synthetic-model" } } },
+    { webSearch: { provider: "school", model: "synthetic-model" } },
+    { autoModeClassifier: { provider: "school", model: "synthetic-model" } },
+  ]) {
+    const response = await f.send("/api/config", { ...snapshot, ...change }, "PUT");
+    const message = await response.text();
+    assert.equal(response.status, 400, message);
+    assert.match(message, /personal Desktop mode/);
+    assert.deepEqual(fs.readFileSync(f.file), before);
+    assert.equal(fs.existsSync(f.settings), false);
+  }
+  const deactivate = await f.send("/api/config", { ...snapshot, picker: { enabled: false } }, "PUT");
+  assert.equal(deactivate.status, 403, await deactivate.text());
+  assert.deepEqual(fs.readFileSync(f.file), before);
 });

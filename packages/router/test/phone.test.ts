@@ -15,6 +15,7 @@ import { ensureAdminToken, ADMIN_TOKEN_HEADER } from "../src/admin-auth.ts";
 import { ensureAdminTlsIdentity, writeAdminEndpoint, readAdminEndpoint } from "../src/admin-transport-state.ts";
 import { localControlHome } from "../../remote/src/local-transport.ts";
 import { writePrivateFileAtomic } from "../src/locked-file.ts";
+import { desktopUiGuardSource } from "./ui-native-fixture.ts";
 
 // Application responses are configurable; the production bridge always crosses real,
 // pinned TLS. This callback is never supplied to PhoneDeps or the transport client.
@@ -232,8 +233,11 @@ test("QR is fetched only on reveal and late responses cannot undo hiding or leav
   const source = fs.readFileSync(new URL("../../ui/app.js", import.meta.url), "utf8");
   const block = source.slice(source.indexOf("function hidePhoneQr()"), source.indexOf("function renderPhoneStatus("));
   type Node = { addEventListener(): void };
-  type Controls = { showPhoneQr(button: { disabled: boolean }): Promise<void>; hidePhoneQr(): void; busy(value: boolean): void };
-  const make = new Function("$", "api", "el", "t", "toast", `let phoneQrGeneration = 0, phoneBusy = false; ${block}; return { showPhoneQr, hidePhoneQr, busy(value) { phoneBusy = value; } };`) as
+  type Controls = { showPhoneQr(button: { disabled: boolean }): Promise<void>; hidePhoneQr(): void; busy(value: boolean): void;
+    phonePost(route: string, body?: unknown): Promise<unknown>; config(value: { security?: { mode: "personal" } } | null): void };
+  // The existing phone flow belongs to generic mode. Evaluate the real Desktop guard with a
+  // loaded generic config, rather than stubbing it away or relying on an implicit global.
+  const make = new Function("$", "api", "el", "t", "toast", `let currentConfig = {}, phoneQrGeneration = 0, phoneBusy = false; ${desktopUiGuardSource(source)} ${block}; return { showPhoneQr, hidePhoneQr, phonePost, busy(value) { phoneBusy = value; }, config(value) { currentConfig = value; } };`) as
     (select: (selector: string) => unknown, api: () => Promise<{ url: string; svg: string }>, el: () => Node, t: (key: string) => string, toast: () => void) => Controls;
   let active = true;
   let children: Node[] = [];
@@ -270,6 +274,15 @@ test("QR is fetched only on reveal and late responses cannot undo hiding or leav
   assert.equal(children.length, 3);
   controls.hidePhoneQr();
   assert.deepEqual(children, []);
+  const genericCalls = calls;
+  for (const config of [null, { security: { mode: "personal" as const } }]) {
+    controls.config(config);
+    await controls.showPhoneQr(button);
+    await assert.rejects(controls.phonePost("rotate"), /desktop\.only/);
+    assert.equal(calls, genericCalls, "pending or Desktop-only configuration cannot contact the phone service");
+    assert.deepEqual(children, []);
+    assert.equal(button.disabled, false);
+  }
 });
 
 test("restart targets only the Mac host job or installs the Windows/Linux host service", async t => {

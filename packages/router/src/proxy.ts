@@ -47,11 +47,12 @@ import type { GrokWindow } from "./providers/grok/usage.ts";
 import { conversationKey, type AnthropicRequest } from "./providers/chatgpt/translate.ts";
 import { adminPort, providerFor, searchProviderFor, terminateHosts, webSearchBackend, webSearchNative } from "./config.ts";
 import type { CertStore } from "./certs.ts";
-import { chatPickerModels, injectPickerModels, isBootstrapPath } from "./picker.ts";
+import { chatPickerModels, injectPickerModels, isBootstrapPath, type InjectResult } from "./picker.ts";
+import { DesktopSelectionCache, type DesktopSelectionToken } from "./desktop-selection.ts";
 import { effortLevelsForModel } from "./admin.ts";
 import { CLAUDE_SMALL_MODEL, claudeLastResortProviders, effortLevels, isTargetProvider, runsServerTools } from "./targets.ts";
 import { requestConversationKey, ResponseUsageTap, requestId, type RequestLog, type RequestRecord, type RequestUsage } from "./requestlog.ts";
-import { credentialHeaderValues, redactErrorText, redactHeaders } from "./redact.ts";
+import { credentialHeaderValues, redactErrorText } from "./redact.ts";
 import type { ObservedClaudeCodeAuth } from "./providers/anthropic-observed.ts";
 import { approvedOrigin, assertApprovedDestination, personalMode, personalFallbacks } from "./personal-policy.ts";
 import { isEgressPolicyError } from "./egress.ts";
@@ -61,8 +62,70 @@ import { ClaudeModelCatalog } from "./providers/anthropic-models.ts";
 import { ClaudeUsage, claudeLimitResetMs, claudeModelFamily } from "./providers/anthropic-usage.ts";
 import { ClaudeCurrentIdentity, LoginEmailWatch, PendingRowWrites } from "./providers/anthropic-identity.ts";
 import { dropForeignThinking, ThinkingOrigins } from "./thinking.ts";
+import { preserveNativeDesktopModel } from "./desktop-policy.ts";
 
 const MAX_BODY = 64 * 1024 * 1024;
+// Bootstrap editing is optional. Crossing either bound returns the native response intact.
+export const BOOTSTRAP_BUFFER_LIMIT = 2 * 1024 * 1024;
+export const BOOTSTRAP_DECODE_LIMIT = 8 * 1024 * 1024;
+type BootstrapEncoding = "identity" | "gzip" | "deflate" | "br" | "zstd" | "unsupported";
+type BootstrapOutcome = "injected" | "unchanged" | "upstream-status" | "unsupported-encoding" | "encoded-limit" |
+  "decoded-limit" | "decode-failed" | "invalid-json" | "unsupported-schema" | "no-extra-models" | "injection-failed" | "stream-failed" | "integrity-protected" | "upstream-error";
+type JsonShape = "absent" | "null" | "array" | "object" | "string" | "number" | "boolean";
+type PickerSchemaFacts = { config: JsonShape; state: JsonShape; surfaces: number; codeSurfaces: number; models: number };
+export type PickerObservation = { status: number; outcome: BootstrapOutcome; encoding: BootstrapEncoding; schema: PickerSchemaFacts; eligibleExtras: number };
+
+function bootstrapEncoding(value: unknown): BootstrapEncoding {
+  if (value === undefined || value === "" || value === "identity") return "identity";
+  if (typeof value !== "string") return "unsupported";
+  const encoding = value.toLowerCase().trim();
+  if (encoding === "gzip" || encoding === "x-gzip") return "gzip";
+  if (encoding === "deflate" || encoding === "br") return encoding;
+  if (encoding === "zstd" && typeof zlib.zstdDecompressSync === "function") return "zstd";
+  return "unsupported";
+}
+
+function decodeBootstrap(raw: Buffer, encoding: BootstrapEncoding): { body: Buffer } | { reason: BootstrapOutcome } {
+  if (encoding === "unsupported") return { reason: "unsupported-encoding" };
+  try {
+    const options = { maxOutputLength: BOOTSTRAP_DECODE_LIMIT };
+    const body = encoding === "gzip" ? zlib.gunzipSync(raw, options)
+      : encoding === "deflate" ? zlib.inflateSync(raw, options)
+      : encoding === "br" ? zlib.brotliDecompressSync(raw, options)
+      : encoding === "zstd" ? zlib.zstdDecompressSync(raw, options) : raw;
+    return body.length > BOOTSTRAP_DECODE_LIMIT ? { reason: "decoded-limit" } : { body };
+  } catch (error) {
+    return { reason: (error as NodeJS.ErrnoException).code === "ERR_BUFFER_TOO_LARGE" ? "decoded-limit" : "decode-failed" };
+  }
+}
+
+const DESKTOP_CODE_SURFACES = new Set(["code", "ccd"]);
+function jsonShape(value: unknown): JsonShape {
+  return value === undefined ? "absent" : value === null ? "null" : Array.isArray(value) ? "array" : typeof value as JsonShape;
+}
+function pickerSchemaFacts(value?: Record<string, unknown>): PickerSchemaFacts {
+  const config = value?.model_selector_config;
+  const facts: PickerSchemaFacts = { config: jsonShape(config), state: jsonShape(value?.model_selector_state), surfaces: 0, codeSurfaces: 0, models: 0 };
+  if (!Array.isArray(config)) return facts;
+  facts.surfaces = Math.min(config.length, 10_000);
+  for (const surface of config) {
+    if (!surface || typeof surface !== "object" || !DESKTOP_CODE_SURFACES.has(surface.id) || !Array.isArray(surface.models) ||
+        !surface.models.every((model: unknown) => model !== null && typeof model === "object" && !Array.isArray(model))) continue;
+    facts.codeSurfaces = Math.min(facts.codeSurfaces + 1, 10_000);
+    facts.models = Math.min(facts.models + surface.models.length, 10_000);
+  }
+  return facts;
+}
+
+/** The admin model checklist needs catalogue labels, distinct from the count-only observation. */
+function boundedPickerCatalogue(surfaces: InjectResult["surfaces"], personal: boolean, secrets: readonly string[]): InjectResult["surfaces"] {
+  return surfaces.filter(surface => !personal || DESKTOP_CODE_SURFACES.has(surface.id)).slice(0, personal ? 3 : 16).map(surface => {
+    const entries = surface.entries.slice(0, 256).filter(entry => typeof entry.id === "string" && /^[A-Za-z0-9._:/@#\[\]-]{1,160}$/.test(entry.id))
+      .map(entry => ({ id: entry.id, name: redactErrorText(entry.name, [...secrets], 160) }));
+    const models = entries.map(entry => entry.id);
+    return { id: surface.id.slice(0, 64), models, entries, injected: surface.injected.filter(id => models.includes(id)).slice(0, 256) };
+  });
+}
 
 /** The headers a client sent that identify its login, for the profile lookup that names it. */
 function loginHeaders(headers: http.IncomingHttpHeaders): Record<string, string> {
@@ -107,6 +170,45 @@ const CLIENT_AUTH = new Set(["authorization", "x-api-key"]);
 const ERROR_HEAD_MAX = 4096;
 /** Methods safe to send twice (RFC 9110 §9.2.2), and so the only ones resent after a stale socket. */
 const IDEMPOTENT = new Set(["GET", "HEAD", "OPTIONS"]);
+
+const MAX_DESKTOP_STREAMS = 128;
+const DESKTOP_HANDSHAKE_MS = 10_000;
+type DesktopStreamKind = "tunnel" | "websocket";
+
+/** Personal CONNECT uses canonical DNS names/IPv4 literals, never URL syntax or alternate ports. */
+function canonicalHttpsConnectHost(host: string): boolean {
+  if (host.length > 253 || !/^[a-z0-9.-]+$/.test(host) || host.endsWith(".")) return false;
+  if (host.split(".").some(label => !label || label.length > 63 || label.startsWith("-") || label.endsWith("-"))) return false;
+  try { return new URL(`https://${host}`).hostname === host; } catch { return false; }
+}
+
+function personalTerminatedHost(cfg: Config, host: string): boolean {
+  // The personal Desktop profile never mints interception leaves for extra approved origins.
+  return host === cfg.upstream || (cfg.picker?.enabled === true && host === "claude.ai");
+}
+
+function desktopStreamAllowed(cfg: Config, origin: string, kind: DesktopStreamKind): boolean {
+  if (!personalMode(cfg) || cfg.picker?.enabled !== true) return false;
+  try {
+    const url = new URL(origin);
+    if (url.port || !canonicalHttpsConnectHost(url.hostname)) return false;
+    assertApprovedDestination(origin, cfg.security!);
+    return kind === "websocket" ? origin === "https://claude.ai" : !personalTerminatedHost(cfg, url.hostname);
+  } catch { return false; }
+}
+
+/** Return a browser-owned redirect; the router never follows it or retransmits a request body. */
+function desktopRedirectAllowed(cfg: Config, requestPath: string, location: unknown): boolean {
+  if (!personalMode(cfg) || !cfg.picker?.enabled || typeof location !== "string" || !location || /[\s\u0000-\u001f\u007f\\]/.test(location)) return false;
+  try {
+    const destination = new URL(location, new URL(requestPath, "https://claude.ai"));
+    if (destination.protocol !== "https:" || destination.port || !canonicalHttpsConnectHost(destination.hostname) || destination.username || destination.password) return false;
+    // Fragment navigation stays in the browser and is not an outbound component.
+    destination.hash = "";
+    assertApprovedDestination(destination, cfg.security!);
+    return true;
+  } catch { return false; }
+}
 
 export type AbsoluteProxyRequest = { host: string; port: number; path: string; head: Buffer; tls: boolean };
 
@@ -314,6 +416,10 @@ export class Proxy {
   private readonly inFlightSockets = new Set<Duplex>();
   /** The upstream authority approved before this locally terminated TLS socket was created. */
   private readonly terminatedAuthorities = new WeakMap<net.Socket, string>();
+  /** Extra Desktop streams are opaque TLS or the native claude.ai WebSocket, never model routes. */
+  private readonly desktopStreams = new Map<Duplex, { origin: string; kind: DesktopStreamKind; stop: () => void }>();
+  /** Bounded, hostname-only diagnostics. An observed destination is never an approval. */
+  readonly blockedDesktopOrigins: string[] = [];
   /** Set by drain(): new model calls are refused with a retryable 503 so the count can only fall. */
   private draining = false;
   /** Model calls waiting at the hold gate (not yet in `stats`): drain() waits for them too. */
@@ -355,6 +461,7 @@ export class Proxy {
   /** Which conversation each native pool answer belonged to, for a later `continue` of that thread. */
   private readonly threadAffinity = new ThreadAffinity();
   private readonly thinkingOrigins = new ThinkingOrigins();
+  private readonly desktopSelection = new DesktopSelectionCache();
   readonly providerHealth = new ProviderHealth();
   readonly modelHealth = new ModelHealth();
   readonly compactPicks = new CompactPicks();
@@ -639,8 +746,17 @@ export class Proxy {
     this.claudeAccounts.setCurrentAuthorization(allow);
   }
 
+  /** Every accepted configuration reload invalidates in-flight local selection decisions. */
+  resetDesktopSelection(): void { this.desktopSelection.clear(); }
+
   /** ConfigStore calls this on reload; requests also reconcile injected/mutable configs. */
   reconcileConfig(cfg: Config): void {
+    for (let i = this.blockedDesktopOrigins.length - 1; i >= 0; i--) {
+      if (Array.isArray(cfg.security?.approvedOrigins) && cfg.security.approvedOrigins.includes(this.blockedDesktopOrigins[i]!)) this.blockedDesktopOrigins.splice(i, 1);
+    }
+    for (const stream of this.desktopStreams.values()) {
+      if (!desktopStreamAllowed(cfg, stream.origin, stream.kind)) stream.stop();
+    }
     const digest = (value: unknown): string => crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
     for (const [name, provider] of Object.entries(cfg.providers)) {
       const authentication = Object.entries(provider).filter(([field]) =>
@@ -712,8 +828,8 @@ export class Proxy {
     this.server = net.createServer((sock) => this.onConnect(sock));
   }
 
-  /** Surfaces + model ids seen in the last injected bootstrap (admin GUI / debugging). */
-  lastPickerInjection: { at: string; injected: number; surfaces: { id: string; models: string[]; entries: { id: string; name: string }[]; injected: string[] }[] } | null = null;
+  /** A bounded current catalogue for UI use, plus a separate value-free schema observation. */
+  lastPickerInjection: ({ at: string; observation: PickerObservation } & InjectResult) | null = null;
 
   listen(): Promise<void> {
     const { host, port } = this.deps.config().listen;
@@ -727,8 +843,10 @@ export class Proxy {
   }
 
   close(): void {
+    this.desktopSelection.clear();
     this.server.close();
     this.httpServer.close();
+    for (const stream of this.desktopStreams.values()) stream.stop();
     for (const s of this.inFlightSockets) s.destroy();
   }
 
@@ -796,17 +914,39 @@ export class Proxy {
         sock.end("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
         return;
       }
-      if (personalMode(this.deps.config())) {
-        try { assertApprovedDestination(`https://${host}:${port}`, this.deps.config().security!); }
-        catch { sock.end("HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"); return; }
-        if (!terminateHosts(this.deps.config()).includes(host) || port !== 443) {
+      const cfg = this.deps.config();
+      const personal = personalMode(cfg);
+      const intercept = personal ? personalTerminatedHost(cfg, host) : terminateHosts(cfg).includes(host);
+      if (personal) {
+        if (!canonicalHttpsConnectHost(host) || port !== 443 || (colon > 0 && target.slice(colon + 1) !== "443")) {
           sock.end("HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+          return;
+        }
+        const origin = `https://${host}`;
+        try { assertApprovedDestination(origin, cfg.security!); }
+        catch {
+          if (cfg.picker?.enabled && !this.blockedDesktopOrigins.includes(origin)) {
+            this.blockedDesktopOrigins.push(origin);
+            if (this.blockedDesktopOrigins.length > 16) this.blockedDesktopOrigins.shift();
+            log.warn(`Desktop connection blocked: ${origin} is not explicitly approved`);
+          }
+          sock.end("HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+          return;
+        }
+        // The Desktop proxy also carries auth/assets/MCP connections. Only explicit exact
+        // approvals may pass as opaque TLS; they are never decrypted or auto-approved here.
+        if (!intercept && !desktopStreamAllowed(cfg, origin, "tunnel")) {
+          sock.end("HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+          return;
+        }
+        if (!intercept && this.desktopStreams.size >= MAX_DESKTOP_STREAMS) {
+          sock.end("HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
           return;
         }
       }
       sock.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       if (rest.length > 0) sock.unshift(rest);
-      if (terminateHosts(this.deps.config()).includes(host)) {
+      if (intercept) {
         this.terminate(sock, host);
       } else {
         this.tunnel(sock, host, port);
@@ -866,7 +1006,9 @@ export class Proxy {
       SNICallback: (servername, cb) => {
         try {
           if (personalMode(this.deps.config()) && servername !== host) { cb(new Error("TLS authority does not match CONNECT")); return; }
-          cb(null, terminateHosts(this.deps.config()).includes(servername) ? this.deps.certs.contextFor(servername) : ctx);
+          const cfg = this.deps.config();
+          const intercept = personalMode(cfg) ? personalTerminatedHost(cfg, servername) : terminateHosts(cfg).includes(servername);
+          cb(null, intercept ? this.deps.certs.contextFor(servername) : ctx);
         } catch (e) {
           cb(e as Error);
         }
@@ -884,10 +1026,8 @@ export class Proxy {
   /** WebSocket / other upgrades on a terminated host: re-open TLS upstream and splice the sockets. */
   private upgrade(req: http.IncomingMessage, socket: net.Socket, head: Buffer): void {
     const cfg = this.deps.config();
-    // An Upgrade Host is independent of CONNECT's approved authority. Personal deployments
-    // keep inference on the guarded HTTP/SSE path instead of splicing uninspected sockets.
     if (personalMode(cfg)) {
-      socket.end("HTTP/1.1 426 Upgrade Required\r\nconnection: close\r\ncontent-length: 0\r\n\r\n");
+      this.upgradePersonalDesktop(req, socket, head);
       return;
     }
     const host = (req.headers.host ?? cfg.upstream).split(":")[0]!;
@@ -915,6 +1055,10 @@ export class Proxy {
   }
 
   private tunnel(sock: net.Socket, host: string, port: number): void {
+    if (personalMode(this.deps.config())) {
+      this.tunnelPersonalDesktop(sock, host, port);
+      return;
+    }
     const up = net.connect({ host, port });
     const kill = (): void => {
       sock.destroy();
@@ -928,6 +1072,143 @@ export class Proxy {
     });
     up.on("close", () => sock.destroy());
     sock.on("close", () => up.destroy());
+  }
+
+  /** Only the native claude.ai WebSocket is eligible; API/model-provider upgrades stay disabled. */
+  private upgradePersonalDesktop(req: http.IncomingMessage, socket: net.Socket, head: Buffer): void {
+    const origin = "https://claude.ai";
+    const count = (name: string, raw = req.rawHeaders): number => raw.filter((value, index) => index % 2 === 0 && value.toLowerCase() === name).length;
+    const key = req.headers["sec-websocket-key"];
+    const host = typeof req.headers.host === "string" ? approvedOrigin(`https://${req.headers.host}`) : null;
+    const valid = this.desktopStreamPermitted(origin, "websocket") &&
+      this.terminatedAuthorities.get(req.socket) === origin && req.socket === socket && count("host") === 1 && host === origin &&
+      req.method === "GET" && req.httpVersion === "1.1" && typeof req.url === "string" && req.url.startsWith("/") && !req.url.startsWith("//") && !/[\u0000-\u0020\u007f\\]/.test(req.url) &&
+      count("upgrade") === 1 && req.headers.upgrade?.toLowerCase() === "websocket" &&
+      String(req.headers.connection ?? "").toLowerCase().split(",").map(value => value.trim()).includes("upgrade") &&
+      count("sec-websocket-version") === 1 && req.headers["sec-websocket-version"] === "13" &&
+      count("sec-websocket-key") === 1 && typeof key === "string" && /^[A-Za-z0-9+/]{22}==$/.test(key) && Buffer.from(key, "base64").toString("base64") === key &&
+      req.headers["content-length"] === undefined && req.headers["transfer-encoding"] === undefined && head.length <= 64 * 1024;
+    if (!valid) {
+      socket.end("HTTP/1.1 426 Upgrade Required\r\nconnection: close\r\ncontent-length: 0\r\n\r\n");
+      return;
+    }
+    if (this.desktopStreams.size >= MAX_DESKTOP_STREAMS) {
+      socket.end("HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n");
+      return;
+    }
+    socket.pause();
+    let upstream: net.Socket | undefined;
+    let request: http.ClientRequest | undefined;
+    let timer: NodeJS.Timeout | undefined;
+    let stopped = false;
+    let upgraded = false;
+    const stop = (): void => {
+      if (stopped) return;
+      stopped = true;
+      clearTimeout(timer);
+      this.desktopStreams.delete(socket);
+      socket.destroy();
+      request?.destroy();
+      upstream?.destroy();
+    };
+    const fail = (): void => {
+      if (!stopped && !upgraded && socket.writable) socket.end("HTTP/1.1 502 Bad Gateway\r\nconnection: close\r\ncontent-length: 0\r\n\r\n");
+      stop();
+    };
+    const checkApproval = (): void => { if (!this.desktopStreamPermitted(origin, "websocket")) stop(); };
+    this.desktopStreams.set(socket, { origin, kind: "websocket", stop });
+    socket.once("error", stop);
+    socket.once("close", stop);
+    socket.on("data", checkApproval);
+    timer = setTimeout(fail, DESKTOP_HANDSHAKE_MS).unref();
+    const ignored = hopByHopHeaders(req.rawHeaders, HOP_BY_HOP);
+    const headers: string[] = [];
+    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+      const name = req.rawHeaders[i]!;
+      if (!ignored.has(name.toLowerCase()) && name.toLowerCase() !== "sec-websocket-key") headers.push(name, req.rawHeaders[i + 1]!);
+    }
+    headers.push("Host", "claude.ai", "Connection", "Upgrade", "Upgrade", "websocket", "Sec-WebSocket-Key", key as string);
+    const accept = crypto.createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
+    try {
+      request = https.request({ host: "claude.ai", port: 443, servername: "claude.ai", method: "GET", path: req.url,
+        headers, agent: this.agentFor("host:claude.ai", "https:"), maxHeaderSize: 64 * 1024 });
+    } catch { fail(); return; }
+    request.once("error", fail);
+    request.once("response", response => { response.destroy(); fail(); });
+    request.once("socket", assigned => { upstream = assigned; if (stopped) assigned.destroy(); });
+    request.once("upgrade", (response, connected, responseHead) => {
+      upstream = connected;
+      connected.once("error", stop);
+      connected.once("close", stop);
+      if (stopped || !this.desktopStreamPermitted(origin, "websocket") || response.statusCode !== 101 ||
+          count("upgrade", response.rawHeaders) !== 1 || response.headers.upgrade?.toLowerCase() !== "websocket" ||
+          !String(response.headers.connection ?? "").toLowerCase().split(",").map(value => value.trim()).includes("upgrade") ||
+          count("sec-websocket-accept", response.rawHeaders) !== 1 || response.headers["sec-websocket-accept"] !== accept || responseHead.length > 64 * 1024) {
+        connected.destroy(); fail(); return;
+      }
+      clearTimeout(timer);
+      const ignoredResponse = hopByHopHeaders(response.rawHeaders, HOP_BY_HOP);
+      const lines = ["HTTP/1.1 101 Switching Protocols", "Connection: Upgrade", "Upgrade: websocket", `Sec-WebSocket-Accept: ${accept}`];
+      for (let i = 0; i < response.rawHeaders.length; i += 2) {
+        const name = response.rawHeaders[i]!;
+        if (!ignoredResponse.has(name.toLowerCase()) && name.toLowerCase() !== "sec-websocket-accept") lines.push(`${name}: ${response.rawHeaders[i + 1]}`);
+      }
+      upgraded = true;
+      socket.write(lines.join("\r\n") + "\r\n\r\n");
+      if (responseHead.length) socket.write(responseHead);
+      if (head.length) connected.write(head);
+      connected.on("data", checkApproval);
+      socket.pipe(connected);
+      connected.pipe(socket);
+      socket.resume();
+    });
+    if (!this.desktopStreamPermitted(origin, "websocket")) { stop(); return; }
+    request.end();
+  }
+
+  private desktopStreamPermitted(origin: string, kind: DesktopStreamKind): boolean {
+    try { return desktopStreamAllowed(this.deps.config(), origin, kind); }
+    catch { return false; }
+  }
+
+  private tunnelPersonalDesktop(sock: net.Socket, host: string, port: number): void {
+    const origin = `https://${host}`;
+    if (port !== 443 || !canonicalHttpsConnectHost(host) || !this.desktopStreamPermitted(origin, "tunnel") || this.desktopStreams.size >= MAX_DESKTOP_STREAMS) {
+      sock.destroy();
+      return;
+    }
+    let up: net.Socket | undefined;
+    let timer: NodeJS.Timeout | undefined;
+    let stopped = false;
+    const stop = (): void => {
+      if (stopped) return;
+      stopped = true;
+      clearTimeout(timer);
+      this.desktopStreams.delete(sock);
+      sock.destroy();
+      up?.destroy();
+    };
+    const checkApproval = (): void => { if (!this.desktopStreamPermitted(origin, "tunnel")) stop(); };
+    this.desktopStreams.set(sock, { origin, kind: "tunnel", stop });
+    sock.once("error", stop);
+    sock.once("close", stop);
+    // Check before every forwarded chunk as well as on ConfigStore reload: revocation also
+    // works for injected configurations and a slow connection that was pending during a reload.
+    sock.on("data", checkApproval);
+    timer = setTimeout(stop, DESKTOP_HANDSHAKE_MS).unref();
+    try { up = net.connect({ host, port }); }
+    catch { stop(); return; }
+    const connected = up;
+    up.once("error", stop);
+    up.once("close", stop);
+    up.on("data", checkApproval);
+    up.once("connect", () => {
+      if (stopped || !this.desktopStreamPermitted(origin, "tunnel")) { stop(); return; }
+      clearTimeout(timer);
+      sock.pipe(connected);
+      connected.pipe(sock);
+      sock.resume();
+    });
   }
 
   // ---- per-request handling ----------------------------------------------------------
@@ -959,7 +1240,9 @@ export class Proxy {
     }
     // The agent files' derived aliases join the config's own, so a marker naming a worker resolves
     // the same way here as it does everywhere else. Explicit aliases win; the scan is mtime-cached.
-    const cfg = withAgentAliases(this.deps.config(), this.deps.agentDir ?? defaultAgentDir(), log);
+    const sourceConfig = this.deps.config();
+    const cfg = personalMode(sourceConfig) ? sourceConfig : withAgentAliases(sourceConfig, this.deps.agentDir ?? defaultAgentDir(), log);
+    const desktopOnly = personalMode(cfg) && cfg.picker?.enabled === true;
     this.reconcileConfig(cfg);
     const t0 = Date.now();
     const method = req.method ?? "?";
@@ -970,6 +1253,8 @@ export class Proxy {
     // The CLI sends `/v1/messages?beta=true`: compare the pathname, not the raw path.
     const pathname = path.split("?")[0] ?? path;
     const isLoggedRequest = pathname === "/v1/messages" || pathname === "/v1/messages/count_tokens";
+    const selectionPath = /^\/api\/organizations\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\/model_selector_state\/(?:code|ccd)(?:\?|$)/.test(path);
+    const bootstrapDiagnostics = isBootstrapPath(path) || path.startsWith(BOOTSTRAP_PATH) || selectionPath;
     if (isMessages) {
       this.stats.messagesInFlight++;
       this.stats.lastMessageStartedAt = t0;
@@ -1031,7 +1316,8 @@ export class Proxy {
       if (failed) this.stats.failed++;
       else this.stats.completed++;
       const ms = Date.now() - t0;
-      log.info(`${record.purpose === "compaction" ? "COMPACTION " : ""}${tag} ${method} ${path} -> ${status} ${bytes}B ${(ms / 1000).toFixed(1)}s${record.credential ? ` credential=${record.credential}` : ""}${note ? " " + note : ""}`);
+      if (bootstrapDiagnostics) log.info(`${selectionPath ? "DESKTOP-STATE" : "BOOTSTRAP"} status=${status} bytes=${bytes} failed=${failed ? 1 : 0}`);
+      else log.info(`${record.purpose === "compaction" ? "COMPACTION " : ""}${tag} ${method} ${path} -> ${status} ${bytes}B ${(ms / 1000).toFixed(1)}s${record.credential ? ` credential=${record.credential}` : ""}${note ? " " + note : ""}`);
       if (isLoggedRequest) {
         const numericStatus = Number(status);
         const usage = extra?.usage ?? observedUsage;
@@ -1098,6 +1384,16 @@ export class Proxy {
     const reqHost = (req.headers.host ?? cfg.upstream).split(":")[0]!;
     const isApiHost = reqHost === cfg.upstream;
     const ownKey = isApiHost && isMessages && callerOwnsKey(req.headers);
+    const selectionContext = { authority: req.headers.host ?? "", path, rawHeaders: req.rawHeaders };
+    const isDesktopSelection = reqHost === "claude.ai" && method === "PATCH" && selectionPath && personalMode(cfg) && cfg.picker?.enabled === true;
+    let selectionToken: DesktopSelectionToken | null = null;
+    if (isDesktopSelection) {
+      let selectionBody: unknown;
+      if (body.length <= 16 * 1024 && !req.headers["content-encoding"]) {
+        try { selectionBody = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body)); } catch { /* native request stays untouched */ }
+      }
+      selectionToken = this.desktopSelection.prepareSelection(selectionContext, method, selectionBody, sourceConfig);
+    }
 
     // Route decision: only Messages requests carry a model.
     let json: Record<string, unknown> | null = null;
@@ -1125,7 +1421,10 @@ export class Proxy {
     // together meant an unconfigured router could not tell a search from any other turn.
     // `webSearch: "native"` names no backend, so nothing is intercepted for it: `searchBackend` is
     // the object form only, and the native form is read where a refusal would otherwise be written.
-    const searchBackend = webSearchBackend(cfg);
+    const nativeDesktopModel = preserveNativeDesktopModel(cfg, model);
+    // Native Desktop subscription turns keep their own search/page-reader services even if
+    // an earlier router configuration selected a different backend for those side requests.
+    const searchBackend = desktopOnly ? undefined : webSearchBackend(cfg);
     if (json) {
       record.source = record.target = typeof model === "string" ? model : "-";
       record.stream = json.stream === true;
@@ -1261,10 +1560,15 @@ export class Proxy {
     let compactModel: string | undefined;
     if (kind === "compaction" && method === "POST") {
       record.purpose = "compaction";
-      try {
-        compactModel = this.compactPicks.take(record.session, subagent, () => readCompactModel(this.deps.home));
-      } catch (error) {
-        log.warn(`compaction: saved settings unavailable; keeping session model (${(error as Error).message})`);
+      if (desktopOnly) {
+        // Do not let an ignored one-off pick leak into a later extra-model compaction.
+        if (record.session && !subagent) this.compactPicks.clear(record.session);
+      } else {
+        try {
+          compactModel = this.compactPicks.take(record.session, subagent, () => readCompactModel(this.deps.home));
+        } catch (error) {
+          log.warn(`compaction: saved settings unavailable; keeping session model (${(error as Error).message})`);
+        }
       }
     }
     type Override = { route: Resolved | null; model: string; label: string; purpose: "web-fetch" | "compaction"; refusal?: string | null };
@@ -1341,7 +1645,7 @@ export class Proxy {
         : json ? decide(model, json, cfg, kind, poolUnlisted) : { route: null, refusal: null };
       let resolved = decision.route;
       const ladderKey = subagent && record.session ? `${record.session}:${agentId}` : undefined;
-      if (!fetchTarget && subagent && resolved && json) {
+      if (!desktopOnly && !fetchTarget && subagent && resolved && json) {
         resolved = this.workerFallbacks(resolved, json, cfg, typeof model === "string" ? model : "", ladderKey);
       }
 
@@ -1965,14 +2269,6 @@ export class Proxy {
       headers.push("host", target.protocol === "https:" && target.port === 443 ? target.host : `${target.host}:${target.port}`);
       // No content-length on body-less GET/HEAD: some edges reject it; Chromium never sends it.
       if (body.length > 0 || (method !== "GET" && method !== "HEAD")) headers.push("content-length", String(body.length));
-      if (isPickerBootstrap) {
-        const shown: string[] = [];
-        for (const [rawName, value] of Array.from({ length: headers.length / 2 }, (_, i) => [headers[i * 2]!, headers[i * 2 + 1]!] as [string, string])) {
-          const safe = redactHeaders({ [rawName]: value })[rawName];
-          shown.push(safe === "[REDACTED]" ? `${rawName.toLowerCase()}=<${value.length}B>` : `${rawName.toLowerCase()}=${value}`);
-        }
-        log.info(`PICKER request ${method} ${path.slice(0, 80)} headers: ${shown.join(" | ")}`);
-      }
       // Keep every credential this turn sends. A retry can use an opaque token that does not match a
       // known token shape; retaining its actual value is what keeps a reflected refusal out of logs.
       const errorSecrets = new Set(credentialHeaderValues(Array.from({ length: headers.length / 2 }, (_, i) => [headers[i * 2]!, headers[i * 2 + 1]!] as [string, string])));
@@ -2082,13 +2378,21 @@ export class Proxy {
         const code = (e as NodeJS.ErrnoException).code;
         if (upReq.reusedSocket && (code === "ECONNRESET" || code === "EPIPE") && IDEMPOTENT.has(method) && !clientAborted && !res.headersSent && staleRetries < 2) {
           staleRetries++;
-          log.info(`STALE ${reqHost}: kept-alive socket was closed (${code}); resending ${method} ${path.slice(0, 60)}`);
+          if (bootstrapDiagnostics) log.info("BOOTSTRAP retry=stale-connection");
+          else log.info(`STALE ${reqHost}: kept-alive socket was closed (${code}); resending ${method} ${path.slice(0, 60)}`);
           send(lastAttemptHeaders);
           return;
         }
         // Our own abort is neither a stuck router nor a failed credential. The close
         // handler records it; do not count the ECONNRESET that destroy() caused.
         if (clientAborted) return;
+        if (isPickerBootstrap) {
+          this.desktopSelection.clear();
+          this.lastPickerInjection = { at: new Date().toISOString(), injected: 0, surfaces: [], observation: {
+            status: 0, outcome: "upstream-error", encoding: "identity", schema: pickerSchemaFacts(), eligibleExtras: 0,
+          } };
+          log.info("PICKER status=0 outcome=upstream-error");
+        }
         if (target.host === cfg.upstream) this.deps.health.failure(e);
         // Nothing reached the provider, so this says nothing about the credential — but it does say
         // the route is unusable for a moment, and a pool with somewhere else to go should use it.
@@ -2105,7 +2409,14 @@ export class Proxy {
       const onUpstreamResponse = (upRes: http.IncomingMessage): void => {
         if (target.host === cfg.upstream) this.deps.health.success();
         const status = upRes.statusCode ?? 0;
-        if (status >= 300 && status < 400) {
+        // 304 is valid cache validation only for GET/HEAD; it must not trigger a model
+        // POST's deferred-error fallback. Inference/provider 3xx stays fail-closed.
+        // The native Desktop browser may receive an approved redirect; we never follow it.
+        const nativeCacheValidation = status === 304 && !route && (method === "GET" || method === "HEAD");
+        const nativeDesktopRedirect = status >= 300 && status < 400 && status !== 304 && !isApiHost && !route && reqHost === "claude.ai" && target.host === "claude.ai" &&
+          upRes.rawHeaders.filter((value, index) => index % 2 === 0 && value.toLowerCase() === "location").length === 1 &&
+          (() => { try { return desktopRedirectAllowed(this.deps.config(), path, upRes.headers.location); } catch { return false; } })();
+        if (status >= 300 && status < 400 && !nativeCacheValidation && !nativeDesktopRedirect) {
           terminalPolicyFailure = true;
           upRes.destroy();
           const out = JSON.stringify({ type: "error", error: { type: "api_error", message: "Upstream redirects are forbidden" } });
@@ -2121,7 +2432,7 @@ export class Proxy {
         // with `x-should-retry: false` before the headers go out, and only its body says whether a
         // 429 is exhausted or an ordinary rate limit (#89). A bootstrap response is never a model
         // turn and is forwarded as it arrives.
-        if (override?.purpose === "compaction" && (status < 200 || status >= 300) || status === 403 || (!isBootstrap && (status === 400 || status === 402 || status === 429))) {
+        if (override?.purpose === "compaction" && (status < 200 || status >= 300) || (!isBootstrap && !isDesktopSelection && (status === 403 || status === 400 || status === 402 || status === 429))) {
           bufferBody(upRes, ERROR_HEAD_MAX).then((whole) => onUpstreamJudged(upRes, status, whole)).catch((e: Error) => {
             log.warn(`upstream ${status}: could not read the body: ${e.message}`);
             finish(String(status), 0, `upstream ${status}: body read failed`);
@@ -2256,61 +2567,137 @@ export class Proxy {
           const lk = r[i]!.toLowerCase();
           if (responseIgnored.has(lk)) continue;
           if (personalMode(cfg) && route && target.dropClientAuth && PERSONAL_ROUTED_RESPONSE_BLOCKED.has(lk)) continue;
-          if (isBootstrap && (lk === "content-length" || lk === "content-encoding")) continue;
-          if (isPickerBootstrap && (lk === "etag" || lk === "last-modified")) continue;
           // A truncated 403 is forwarded decoded (its bytes are no longer a whole compressed
           // stream), so neither the upstream's encoding nor its length describes what is sent.
           if (errTruncated && (lk === "content-length" || lk === "content-encoding")) continue;
           outHeaders.push(r[i]!, r[i + 1]!);
         }
         let bytes = 0;
-        if (isBootstrap) {
-          const chunks: Buffer[] = [];
-          upRes.on("data", (c: Buffer) => chunks.push(c));
-          upRes.on("end", () => {
-            let out: Buffer = Buffer.concat(chunks);
-            const enc = String(upRes.headers["content-encoding"] ?? "").toLowerCase();
-            try {
-              if (enc === "gzip" || enc === "x-gzip") out = zlib.gunzipSync(out);
-              else if (enc === "deflate") out = zlib.inflateSync(out);
-              else if (enc === "br") out = zlib.brotliDecompressSync(out);
-              else if (enc === "zstd" && typeof (zlib as unknown as { zstdDecompressSync?: unknown }).zstdDecompressSync === "function")
-                out = (zlib as unknown as { zstdDecompressSync: (b: Buffer) => Buffer }).zstdDecompressSync(out);
-            } catch (e) {
-              log.warn(`bootstrap decode (${enc}) failed: ${(e as Error).message}`);
-            }
-            if (status === 200 && isCliBootstrap) {
-              try {
-                out = injectBootstrap(out, cfg);
-              } catch (e) {
-                log.warn(`bootstrap inject failed: ${(e as Error).message}`);
-              }
-            } else if (isPickerBootstrap && status !== 200 && status !== 304) {
-              log.warn(`PICKER bootstrap upstream ${status}; headers: ${JSON.stringify(redactHeaders(upRes.headers))}; body: ${redactErrorText(out.toString("utf8"), [...errorSecrets], 300)}`);
-            } else if (status === 200 && isPickerBootstrap) {
-              try {
-                const j = JSON.parse(out.toString("utf8")) as Record<string, unknown>;
-                const r = injectPickerModels(j, chatPickerModels(cfg), cfg.cli.autoCompactWindow, (model) => effortLevelsForModel(cfg, model));
-                if (r.surfaces.length > 0) {
-                  this.lastPickerInjection = { at: new Date().toISOString(), ...r };
-                  out = Buffer.from(JSON.stringify(j));
-                  log.info(`PICKER injected ${r.injected} model(s); surfaces: ${r.surfaces.map((s) => `${s.id}[${s.models.length}]`).join(" ")}`);
-                } else {
-                  log.info(`PICKER bootstrap had no model_selector_config (${path.slice(0, 60)})`);
-                }
-              } catch (e) {
-                log.warn(`picker inject failed: ${(e as Error).message}`);
-              }
-            }
-            outHeaders.push("content-length", String(out.length));
+        if (isBootstrap || isDesktopSelection) {
+          // Nothing removes native representation/cache headers until an edit succeeds.
+          // A cap, unsupported encoding/schema or parse error returns the same native bytes.
+          let chunks: Buffer[] = [];
+          let buffered = 0;
+          let passthrough = false;
+          let ended = false;
+          let schema = pickerSchemaFacts();
+          let eligibleExtras = 0;
+          const encoding = bootstrapEncoding(upRes.headers["content-encoding"]);
+          const observe = (outcome: BootstrapOutcome, result: InjectResult = { injected: 0, surfaces: [] }): void => {
+            if (!isPickerBootstrap) return;
+            if (!["injected", "unchanged", "no-extra-models"].includes(outcome)) this.desktopSelection.clear();
+            const observation: PickerObservation = { status, outcome, encoding, schema, eligibleExtras };
+            this.lastPickerInjection = { at: new Date().toISOString(), injected: Math.min(result.injected, 10_000),
+              surfaces: boundedPickerCatalogue(result.surfaces, personalMode(cfg), [...errorSecrets]), observation };
+            log.info(`PICKER status=${status} outcome=${outcome} encoding=${encoding} surfaces=${schema.surfaces} codeSurfaces=${schema.codeSurfaces} models=${schema.models} injected=${Math.min(result.injected, 10_000)}`);
+          };
+          const resume = (): void => { if (!ended && !res.destroyed) upRes.resume(); };
+          const write = (chunk: Buffer): void => {
+            if (!res.write(chunk)) { upRes.pause(); res.once("drain", resume); }
+          };
+          const pass = (reason: BootstrapOutcome): void => {
+            if (passthrough) return;
+            passthrough = true;
+            if (isDesktopSelection) this.desktopSelection.completeSelection(selectionToken, status, undefined, this.deps.config());
+            observe(reason);
             res.writeHead(status, outHeaders);
-            res.end(out);
-            finish(String(status), out.length);
-          });
-          upRes.on("error", (e) => {
-            finish(String(status), bytes, `upstream stream error ${(e as Error).message}`);
+            if (buffered) write(Buffer.concat(chunks, buffered));
+            chunks = [];
+            buffered = 0;
+          };
+          const fail = (): void => {
+            if (ended) return;
+            ended = true;
+            chunks = [];
+            res.off("drain", resume);
+            observe("stream-failed");
+            finish(String(status), bytes, "bootstrap stream failed");
             res.destroy();
+          };
+          res.once("close", () => { if (!res.writableEnded) fail(); chunks = []; buffered = 0; res.off("drain", resume); });
+          // Non-200 bootstrap errors are native responses, including 403. Reading them into
+          // the inference error buffer would consume their stream before this relay sees it.
+          if (isDesktopSelection && (!selectionToken || !(status === 400 || status >= 200 && status < 300))) {
+            this.desktopSelection.completeSelection(selectionToken, status, undefined, this.deps.config());
+            pass("upstream-status");
+          }
+          else if (!isDesktopSelection && (status !== 200 || method !== "GET")) pass("upstream-status");
+          else if (encoding === "unsupported") pass("unsupported-encoding");
+          else if (["signature", "signature-input", "content-md5", "digest", "content-digest", "repr-digest"].some(name => upRes.headers[name] !== undefined)) pass("integrity-protected");
+          else if (Number(upRes.headers["content-length"]) > BOOTSTRAP_BUFFER_LIMIT) pass("encoded-limit");
+          upRes.on("data", (chunk: Buffer) => {
+            bytes += chunk.length;
+            if (!passthrough && buffered + chunk.length > BOOTSTRAP_BUFFER_LIMIT) pass("encoded-limit");
+            if (passthrough) write(chunk);
+            else { chunks.push(chunk); buffered += chunk.length; }
           });
+          upRes.once("end", () => {
+            if (ended) return;
+            ended = true;
+            res.off("drain", resume);
+            if (passthrough) { res.end(); finish(String(status), bytes); return; }
+            const raw = Buffer.concat(chunks, buffered);
+            chunks = [];
+            let output: Buffer | undefined;
+            let outputStatus = status;
+            const decoded = decodeBootstrap(raw, encoding);
+            if ("reason" in decoded) {
+              observe(decoded.reason);
+              if (isDesktopSelection) this.desktopSelection.completeSelection(selectionToken, status, undefined, this.deps.config());
+            }
+            else if (isDesktopSelection) {
+              let parsed: unknown;
+              try { parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(decoded.body)); } catch { /* preserve original status/body */ }
+              const replacement = this.desktopSelection.completeSelection(selectionToken, status, parsed, this.deps.config());
+              if (replacement) { output = Buffer.from(JSON.stringify(replacement)); outputStatus = 200; }
+            }
+            else if (isCliBootstrap) {
+              try {
+                const edited = injectBootstrap(decoded.body, cfg);
+                if (!edited.equals(decoded.body) && edited.length <= BOOTSTRAP_DECODE_LIMIT) output = edited;
+              } catch { log.warn("BOOTSTRAP outcome=injection-failed"); }
+            } else {
+              let parsed: unknown;
+              try { parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(decoded.body)); }
+              catch { observe("invalid-json"); }
+              if (parsed !== undefined) {
+                if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) observe("unsupported-schema");
+                else {
+                  const j = parsed as Record<string, unknown>;
+                  schema = pickerSchemaFacts(j);
+                  try {
+                    // Observe only a successfully parsed native reply, before adding extras.
+                    const currentConfig = this.deps.config();
+                    this.desktopSelection.observeBootstrap(selectionContext, j, currentConfig);
+                    const extra = currentConfig.picker?.enabled ? chatPickerModels(currentConfig) : [];
+                    eligibleExtras = Math.min(extra.length, 10_000);
+                    const result = injectPickerModels(j, extra, currentConfig.cli.autoCompactWindow, model => effortLevelsForModel(currentConfig, model), { codeOnly: personalMode(currentConfig) });
+                    const selectedStates = this.desktopSelection.overlayBootstrap(selectionContext, j, currentConfig);
+                    if (result.injected > 0 || selectedStates > 0) {
+                      const edited = Buffer.from(JSON.stringify(j));
+                      if (edited.length <= BOOTSTRAP_DECODE_LIMIT) { output = edited; observe("injected", result); }
+                      else observe("decoded-limit");
+                    } else if (!Array.isArray(j.model_selector_config) || (personalMode(cfg) && schema.codeSurfaces === 0)) observe("unsupported-schema");
+                    else observe(extra.length === 0 ? "no-extra-models" : "unchanged", result);
+                  } catch { observe("injection-failed"); }
+                }
+              }
+            }
+            if (!output) { res.writeHead(status, outHeaders); res.end(raw); finish(String(status), raw.length); return; }
+            const editedHeaders: string[] = [];
+            const changed = new Set(["content-length", "content-encoding", "etag", "last-modified", "content-md5", "digest", "content-digest", "repr-digest", "cache-control"]);
+            for (let i = 0; i < outHeaders.length; i += 2) if (!changed.has(outHeaders[i]!.toLowerCase())) editedHeaders.push(outHeaders[i]!, outHeaders[i + 1]!);
+            if (isDesktopSelection) {
+              for (let i = editedHeaders.length - 2; i >= 0; i -= 2) if (editedHeaders[i]!.toLowerCase() === "content-type") editedHeaders.splice(i, 2);
+              editedHeaders.push("content-type", "application/json");
+            }
+            editedHeaders.push("content-length", String(output.length), "cache-control", "no-store");
+            res.writeHead(outputStatus, editedHeaders);
+            res.end(output);
+            finish(String(outputStatus), output.length);
+          });
+          upRes.once("error", fail);
+          upRes.once("aborted", fail);
           return;
         }
         // A definite exhaustion (a spending cap, a used-up quota) is not worth asking again in the

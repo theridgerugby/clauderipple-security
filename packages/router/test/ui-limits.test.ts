@@ -74,6 +74,7 @@ function limitsUi(api: (path: string) => Promise<unknown>, status: Record<string
   const selectAll = () => [card, desktop, meters].flatMap((root) => findAll(root, (node) => node.attrs["data-quota-windows"] !== undefined));
   const build = new Function("api", "el", "t", "$", "status", "config", "localStorage", "$all", `
     let currentConfig = config;
+    const applyDesktopUiProfile = () => {};
     const stateFor = () => null, chevronIcon = () => null, openProvider = () => {}, refreshProviderUsage = () => {}, chatgptLoginButton = () => el("button", { text: "Sign in" }), chatgptLoginMessage = "", providerLabel = (name) => name, providerTitle = (name) => name, providerDisplayName = (name) => name, offline = () => false, providerHue = () => "#000";
     const svgIcon = () => el("svg", { "aria-hidden": "true" });
     const APP = null, clientsLoaded = false, modState = {}, updateState = {}, renderDiagnostics = () => {}, modRedraw = () => {}, versionRow = () => null, autoUpdateRow = () => null, priorityRow = () => null;

@@ -123,3 +123,9 @@ jobs:
         # Unique disposable task, synthetic DPAPI key and private client-settings path.
         # Never imports a CA into the Windows trust store or touches an installed Claude app.
         run: node --test --test-reporter=tap packages/cli/test/windows-personal-install.test.ts
+      - name: Native Windows Desktop picker and subscription-preservation regressions
+        if: runner.os == 'Windows'
+        # Disposable local TLS endpoints and synthetic state only. These verify the native
+        # runtime, not a real Claude Desktop account or the owner's current graphical build.
+        # Every case also runs in the full four-shard suite.
+        run: node --test --test-reporter=tap --test-concurrency=1 packages/cli/test/desktop-activation.test.ts packages/cli/test/desktop-config-preservation.test.ts packages/cli/test/desktop-install-settings.test.ts packages/router/test/desktop-policy.test.ts packages/router/test/desktop-runtime.test.ts packages/router/test/desktop-selection.test.ts packages/router/test/personal-google-desktop.test.ts packages/router/test/picker.test.ts packages/router/test/proxy-bootstrap.test.ts packages/router/test/proxy-desktop-transport.test.ts packages/router/test/ui-desktop-profile.test.ts

@@ -12,6 +12,8 @@ import { isJudgeOnlyModel } from "./model-policy.ts";
 import { qualifiedModel } from "./routing.ts";
 import { chatPickerModels, pickerWindowOverride, providerModelWindow, resolvedModelWindow } from "./picker.ts";
 import { chatgptModelWindow } from "./providers/chatgpt/windows.ts";
+import { preserveNativeDesktopModel } from "./desktop-policy.ts";
+import { personalMode } from "./personal-policy.ts";
 
 export const BOOTSTRAP_PATH = "/api/claude_cli/bootstrap";
 
@@ -66,6 +68,9 @@ function routable(id: string, cfg: Config): boolean {
 }
 
 export function bootstrapModels(cfg: Config, agentDirs?: string[]): ReturnType<typeof chatPickerModels> {
+  // Desktop extras are explicit. Reading global terminal workers would import unrelated
+  // aliases and touch settings outside this personal installation's scope.
+  if (personalMode(cfg)) return chatPickerModels(cfg);
   const known = new Set(cfg.cli.extraModels.map((m) => m.model));
   // The agent files' derived aliases are the same set a marker resolves against, so an id an agent
   // file names (and its base) is routable here too — otherwise the CLI never lists it and the
@@ -90,10 +95,12 @@ export function bootstrapModels(cfg: Config, agentDirs?: string[]): ReturnType<t
 export function bootstrapWindows(cfg: Config, extra = bootstrapModels(cfg)): Record<string, number> {
   const windows: Record<string, number> = {};
   for (const m of extra) {
+    if (preserveNativeDesktopModel(cfg, m.model)) continue;
     const window = resolvedModelWindow(cfg, m.model).contextWindow ?? m.contextWindow ?? cfg.cli.autoCompactWindow;
     if (window) windows[m.model] = window;
   }
   for (const alias of Object.keys(cfg.routes)) {
+    if (preserveNativeDesktopModel(cfg, alias)) continue;
     const window = resolvedModelWindow(cfg, alias).contextWindow ?? cfg.cli.autoCompactWindow;
     if (window) windows[alias] = window;
   }
@@ -118,7 +125,9 @@ export function injectBootstrap(body: Buffer, cfg: Config, agentDirs?: string[])
   }
   if (anyWindow) {
     const acw = { ...((j.auto_compact_windows as Record<string, number> | undefined) ?? {}) };
-    for (const [id, window] of Object.entries(windows)) acw[id] = Math.min(window, CLI_WINDOW_MAX);
+    for (const [id, window] of Object.entries(windows)) {
+      if (!preserveNativeDesktopModel(cfg, id)) acw[id] = Math.min(window, CLI_WINDOW_MAX);
+    }
     j.auto_compact_windows = acw;
   }
   return Buffer.from(JSON.stringify(j));

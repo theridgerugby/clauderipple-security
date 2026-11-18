@@ -1,5 +1,13 @@
 import assert from "node:assert/strict";
 
+/** Use the production profile predicate in isolated UI sections that do not evaluate navigation. */
+export function desktopUiGuardSource(source: string): string {
+  const start = source.indexOf("function genericControlsAvailable(");
+  const end = source.indexOf("const GENERIC_ONLY_VIEWS =", start);
+  assert.ok(start >= 0 && end > start);
+  return source.slice(start, end);
+}
+
 /** Business-logic fixtures run in the supported native renderer, never a browser dashboard.
  * The real Electron top-frame, IPC and pinned-TLS boundaries have separate integration tests.
  * This window intentionally contains no admin token or credential-reading bridge.

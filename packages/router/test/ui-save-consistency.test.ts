@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { assertNativeAdminFetch, nativeDashboardWindow } from './ui-native-fixture.ts';
+import { assertNativeAdminFetch, nativeDashboardWindow, desktopUiGuardSource } from './ui-native-fixture.ts';
 
 // Execute the native dashboard's real rendering, save, retry, toast and keyboard functions.
 // DOM/timers and the native IPC backend are replaced; no real configuration or network is used.
@@ -127,7 +127,8 @@ async function harness(initial = fixture()) {
   };
   const ui = new Function('document', 'window', 'Node', 'fetch', 'setTimeout', 'clearTimeout', `
     const t = key => key, APP = window.rippleApp;
-    let currentConfig = null, slotsLoaded = false, effortCatalog = null;
+    let currentConfig = {}, slotsLoaded = false, effortCatalog = null;
+    ${desktopUiGuardSource(source)}
     const claudeModels = ['a', 'b', 'c'].map(id => ({id})), CHATGPT_MODELS = [];
     const loadCatalogs = async () => {}, presets = [];
     ${block('function $(', '// Inside the ClaudeRipple app')}

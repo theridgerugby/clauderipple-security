@@ -108,7 +108,7 @@ export type ModelSlots = Partial<Record<keyof typeof MODEL_SLOT_ENV, string>>;
 
 /** Claude Code resolves its built-in aliases and optional context suffix before sending requests. */
 export function isNativeClaudeModel(value: string): boolean {
-  return /^(?:claude-[a-z0-9][a-z0-9._-]*|opus|sonnet|haiku)(?:\[1m\])?$/i.test(value);
+  return /^(?:claude-[a-z0-9][a-z0-9._-]*|opus|sonnet|haiku|fable|best|default|opusplan)(?:\[1m\])?$/i.test(value);
 }
 
 /** Also applied to a remote host's settings.json (remote.ts): one rule for whose proxy wins. */

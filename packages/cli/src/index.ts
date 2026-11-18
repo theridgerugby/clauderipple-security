@@ -16,7 +16,6 @@ import { readInstallationId } from "../../router/src/installation-id.ts";
 import { writeSecretJsonAtomic } from "../../router/src/locked-file.ts";
 import { configurePersonalEgressPolicy, personalMode } from "../../router/src/personal-policy.ts";
 import { adminPort } from "../../router/src/admin.ts";
-import { CLI_WINDOW_MAX } from "../../router/src/bootstrap.ts";
 import { certsExist, certPaths, generateCerts } from "./certs.ts";
 import { applyProxyEnv, checkProxyEnv, currentProxyEnv, removeProxyEnv, settingsPath } from "./settings.ts";
 import { agentDefinitionPath, agentState, installAgent, isLinux, isSupported, isWindows, removeAgent, restartAgent, serviceOwnership, startAgent, stopAgent, supervisorName } from "./supervisor.ts";
@@ -26,6 +25,7 @@ import { nativeSupervisor, registration, writePaths } from "./registration.ts";
 import { installLauncher, uninstallLauncher } from "./launcher.ts";
 import type { RecoveryDeps } from "./doctor.ts";
 import { applyAppProxy, caTrusted, CA_NAME, currentAppProxy, migrateLegacyAppProxy, nssDb, removeAppProxy, trustCa, untrustCa } from "./picker.ts";
+import { activateDesktopPicker, checkAppProxyActivation, commitDesktopPicker, readDesktopActivationState } from "./desktop-activation.ts";
 import { removeClientIntegrations, setPickerEnabled } from "./integrations.ts";
 import { withCommandHelp } from "./help-gate.ts";
 import { runtime } from "./runtime.ts";
@@ -43,35 +43,54 @@ import { purgeHome } from "./purge.ts";
 import { adminFetch, openAdminDashboard } from "./admin-client.ts";
 import { recordAdminRuntime } from "./admin-runtime.ts";
 import { captureRouterCodeIdentity, verifyAndApplyInstall } from "./install-runtime.ts";
+import { installModelOptions } from "./install-model-options.ts";
 import { assertPersonalCliCommandAllowed, SECURITY_USAGE, updateApprovedOrigin } from "./security-config.ts";
 import { assertPersonalWindowsNodeEnv } from "../../router/src/windows-node-env.ts";
 
 async function pickerOn(): Promise<void> {
   const home = homeDir();
-  const cfg = new ConfigStore(configPath()).get();
+  const file = configPath();
   const caPem = certPaths(home).caPem;
   if (!fs.existsSync(path.join(home, "ca.key"))) throw new Error("ca.key missing; run `clauderipple install` first");
-  // With picker mode on, every byte Claude Desktop sends goes through the router (ARCHITECTURE §5):
-  // pointing the app at one that is not answering leaves it a blank page, so check first.
-  const ready = await probe({ host: cfg.listen.host, port: cfg.listen.port, caPem, upstream: cfg.upstream });
-  if (!ready.ok) throw new Error(`the router is not answering (${ready.detail}); picker mode not enabled. Start it with \`clauderipple start\` and try again.`);
-  console.log("Picker mode makes Claude Desktop's own claude.ai traffic go through ClaudeRipple so the model picker can list your GPT models.");
-  console.log(
-    isWindows
-      ? "Step 1/3: trusting the ClaudeRipple CA for your Windows user account. Windows will show a confirmation dialog with the certificate fingerprint — answer Yes. No administrator rights are needed."
-      : isLinux
-        ? `Step 1/3: trusting the ClaudeRipple CA in your NSS database (${nssDb()}), which Chromium and so Claude Desktop reads. Your user only; no password, no sudo.`
-        : "Step 1/3: trusting the ClaudeRipple CA in your login keychain. macOS will ask for your password (ClaudeRipple never sees it).",
-  );
-  trustCa(caPem);
-  if (!caTrusted(caPem)) throw new Error("CA is not trusted; picker mode not enabled");
-  console.log(isWindows || isLinux ? "✓ CA trusted (current user only)" : "✓ CA trusted (login keychain only)");
+  const cfg = readDesktopActivationState(file, home, caPem).config;
   const proxyUrl = proxyUrlFor(cfg.listen.port);
-  const r = applyAppProxy(proxyUrl);
+  console.log("Desktop picker mode adds your separately selected API models to the Code menu and preserves native Claude model choices.");
+  console.log("It installs a current-user CA and makes Claude Desktop depend on this local proxy. Only approved destinations are allowed; additional Desktop connections may need separate approval.");
+  console.log("Recovery: use the dashboard's default-connection switch or `clauderipple direct on`, then fully quit and reopen Claude Desktop.");
+  const r = await activateDesktopPicker({
+    target: { version: VERSION, node: installedRuntime.node, router: installedRuntime.router,
+      codeIdentity: captureRouterCodeIdentity(installedRuntime), listen: cfg.listen, upstream: cfg.upstream },
+    runtime: {
+      status: async signal => {
+        const response = await adminFetch(`http://127.0.0.1:${adminPort(cfg)}/api/status`, { signal }, home);
+        if (!response.ok) { await response.body?.cancel(); throw new Error("Secure router status was refused"); }
+        return response.json();
+      },
+      installationId: () => readInstallationId(home),
+      captureIdentity: () => captureRouterCodeIdentity(installedRuntime),
+      // Activation must not unexpectedly interrupt an existing Desktop session to update code.
+      restart: () => { throw new Error("The live router uses different code. Finish current work, restart this installation, then retry picker activation"); },
+    },
+    proxyUrl, caPem,
+    readState: () => readDesktopActivationState(file, home, caPem),
+    checkDesktop: () => checkAppProxyActivation(proxyUrl, home),
+    probe: () => probe({ host: cfg.listen.host, port: cfg.listen.port, caPem, upstream: cfg.upstream }),
+    trusted: () => caTrusted(caPem, { strict: true }),
+    trust: () => {
+      console.log(isWindows
+        ? "Windows will show the exact local CA fingerprint for your current-user certificate store. Review it before confirming; no administrator rights are needed."
+        : isLinux ? `Trusting the local CA in your user NSS database (${nssDb()}).`
+          : "macOS will ask to trust this local CA in your login keychain.");
+      trustCa(caPem);
+    },
+    untrust: () => untrustCa(caPem, { sweep: false }),
+    apply: state => commitDesktopPicker(file, state.config, () =>
+      applyAppProxy(proxyUrl, home, state.desktop, {}, state.desktopFingerprint)),
+  });
+  console.log("✓ current runtime, connection, configuration and CA verified");
   console.log(`✓ Claude Desktop config library entry applied (${r.id}${r.replaced ? `, previous entry ${r.replaced} remembered` : ""}): egressProxyUrl=${proxyUrl}`);
-  setPickerEnabled(true);
   console.log("✓ picker.enabled = true (the router picks it up live; no restart)");
-  console.log("\nStep 3/3 is yours: quit and reopen Claude Desktop. The app reads its proxy setting at start.");
+  console.log("\nQuit and reopen Claude Desktop. The app reads its proxy setting at start.");
   console.log("Then open the Code tab picker: entries from cli.extraModels should be there. `clauderipple status` shows the last injection.");
 }
 
@@ -223,7 +242,7 @@ async function install(): Promise<void> {
   const cfg = new ConfigStore(configPath()).get();
   const proxyUrl = proxyUrlFor(cfg.listen.port);
   const caPath = certPaths(home).caPem;
-  const maxCtx = opt("max-context-tokens");
+  const modelOptions = installModelOptions(cfg, opt("max-context-tokens"));
   // settings.json is written last, after the probe: from that write on, every new Claude Code
   // session sends everything to this router, so it must not point at one that never came up.
   // A foreign proxy is still refused here, before anything is registered.
@@ -292,12 +311,11 @@ async function install(): Promise<void> {
       },
       probe: () => probeWithRetry({ host: cfg.listen.host, port: cfg.listen.port, caPem: caPath, upstream: cfg.upstream }),
       onProbe: result => console.log(result.ok ? `✓ end-to-end probe passed (${result.detail}, ${result.ms}ms)` : `✗ probe failed: ${result.detail}`),
-      // The cap sits at Claude Code's per-model ceiling (CLI_WINDOW_MAX). No client state is
-      // changed until the live identity remains the same across the data-plane probe.
+      // Personal Desktop owns only its proxy keys: model defaults and global context caps stay
+      // unchanged. No client state changes before the identity survives the data-plane probe.
       apply: () => {
         applyingSettings = true;
-        return applyProxyEnv({ proxyUrl, caPath, force: flag("force"), maxContextTokens: maxCtx ? Number(maxCtx) : CLI_WINDOW_MAX,
-          models: cfg.cli.models ?? {}, respectDirect: true, home });
+        return applyProxyEnv({ proxyUrl, caPath, force: flag("force"), ...modelOptions, respectDirect: true, home });
       },
     });
   } catch (error) {

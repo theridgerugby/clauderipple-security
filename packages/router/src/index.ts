@@ -65,6 +65,7 @@ let tunnels: RemoteTunnels | null = null;
 /** The last config read's validation errors: the status and readiness report them (G-D14). */
 let configErrors: string[] = [];
 let reconcileProxyConfig: ((config: ReturnType<ConfigStore["get"]>) => void) | undefined;
+let stopCodexCache: (() => void) | undefined;
 /**
  * Every path that writes or removes a generated worker file goes through this: the config callback
  * below, the dashboard's account endpoints (`AdminDeps.agentsChanged`), and the periodic check that
@@ -82,12 +83,13 @@ const store = new ConfigStore(undefined, (c, errors) => {
   configErrors = [...errors];
   applyProcessPriority(c.processPriority, { log: line => (log ?? console).info(line) });
   reconcileProxyConfig?.(c);
+  if (personalMode(c)) { stopCodexCache?.(); stopCodexCache = undefined; }
   for (const e of errors) (log ?? console).warn(`config: ${e}`);
   for (const w of targetWarnings(c)) (log ?? console).warn(`config: ${w}`);
   log?.info(`config loaded: ${Object.keys(c.routes).length} routes, ${Object.keys(c.providers).length} providers, direct=${c.direct.map((d) => d.prefix).join(",") || "-"}`);
   // Keep the Codex app's model list in step with the models we serve (only while `codex on` is in effect).
   try {
-    if (codexEnabled()) writeCodexCatalog(ingressModels(c));
+    if (!personalMode(c) && codexEnabled()) writeCodexCatalog(ingressModels(c));
   } catch (e) {
     log?.warn(`codex catalog: ${(e as Error).message}`);
   }
@@ -96,8 +98,8 @@ const store = new ConfigStore(undefined, (c, errors) => {
   // idle when they change can miss the change; the second touch is for it (`RETOUCH_AFTER_MS`).
   // The stored accounts are part of the derivation (each gets a pinned worker per model), and the
   // regeneration notifies the tunnels, so a remote host gets the rewritten files too.
-  agentSync.regenerate(c);
-  try { syncContextWindows(c); }
+  if (!personalMode(c)) agentSync.regenerate(c);
+  try { if (!personalMode(c)) syncContextWindows(c); }
   catch (e) { (log ?? console).warn(`compact windows: ${(e as Error).message}`); }
   // A hand edit of `remote.hosts` takes effect; the agent files were already offered to the tunnels.
   tunnels?.reconcile(c.remote?.hosts ?? []);
@@ -163,7 +165,7 @@ const observedClaudeCodeAuth = new ObservedClaudeCodeAuth(path.join(home, "claud
 // Before any provider fetches: a reasoning model may stay silent past fetch's 300s default.
 allowLongSilences();
 const proxy = new Proxy({ config: () => store.get(), log, certs, health, home, requests, observedClaudeCodeAuth, hold });
-reconcileProxyConfig = config => proxy.reconcileConfig(config);
+reconcileProxyConfig = config => { proxy.resetDesktopSelection(); proxy.reconcileConfig(config); };
 const ingress = new OpenAiIngress({ config: () => store.get(), log, requests, home, observedClaudeCodeAuth, chatgpt: (name) => proxy.chatgptForCodex(name), claudeIdentity: (headers) => proxy.claudeIdentity.identifyWith(headers), hold });
 
 // Lid-closed awake and hotspot failover (macOS and Windows; no-ops elsewhere, off until configured).
@@ -213,7 +215,7 @@ let draining = false;
  * without a router restart or a config save. Never throws (the next check retries), and the tunnels
  * are notified by the sync itself.
  */
-const regenerateAgents = (): void => agentSync.regenerate();
+const regenerateAgents = (): void => { if (!personalMode(store.get())) agentSync.regenerate(); };
 
 /**
  * Stop accepting, let in-flight model calls finish, exit. Idempotent.
@@ -262,7 +264,7 @@ setInterval(() => {
 
 // The config callback above rewrites the Codex catalog when *our* models change; this covers
 // Codex's side (a new OpenAI model arriving in its cache).
-followCodexCache(() => ingressModels(store.get()), undefined, undefined, (e) => log!.warn(`codex catalog: ${e.message}`));
+if (!personalMode(cfg0)) stopCodexCache = followCodexCache(() => ingressModels(store.get()), undefined, undefined, (e) => log!.warn(`codex catalog: ${e.message}`));
 
 proxy
   .listen()
@@ -272,37 +274,32 @@ proxy
       `clauderipple router listening on ${c.listen.host}:${c.listen.port} upstream=${c.upstream} home=${home}` +
         ` (startup ${since(T_EXEC)}ms: node ${T_MODULE - T_EXEC}, config ${T_CONFIG - T_MODULE}, listen ${since(T_CONFIG)})`,
     );
-    const ingressPort = await ingress.listen();
-    log!.info(`clauderipple OpenAI ingress listening on 127.0.0.1:${ingressPort}`);
-    // Reverse tunnels to remote (SSH) hosts, after listen() so their far end has something to reach.
-    const assets = () => readLocalAssets({ home, agentDir: defaultAgentDir() });
-    tunnels = new RemoteTunnels({
-      log: log!,
-      proxyTarget: () => ({ host: proxyConnectHost(store.get().listen.host), port: store.get().listen.port }),
-      pidFile: path.join(home, "remote-tunnels.json"),
-      sync: (host) => syncRemoteAssets(spawnSsh, host, assets()),
-      fingerprint: () => {
-        try {
-          return assetsFingerprint(assets());
-        } catch {
-          return "";
-        }
-      },
-    });
-    tunnels.cleanupStale();
-    tunnels.reconcile(c.remote?.hosts ?? []);
-    // Quota only arrives on GPT response headers, so a quiet day left the status 11 hours stale
-    // (2026-09-20). Ask once now, after listen(), and never wait for the answer.
-    proxy.chatgptRefreshAll();
-    // The model catalogue is where a GPT model's real window comes from (6.1 Sol runs 500000 × 95%
-    // = 475000), and until now only an open dashboard asked for it. Read it now and every two hours;
-    // the adapter's own hour-long cache makes the interval the refresh, not a poll (§4, 2026-10-23).
-    const catalogEvery = 2 * 60 * 60_000;
-    proxy.chatgptRefreshCatalog();
-    setInterval(() => proxy.chatgptRefreshCatalog(), catalogEvery).unref();
+    // Personal Desktop only needs the forward proxy and authenticated settings UI. Do not
+    // bind an unrelated API listener, inspect remote processes, or probe other providers.
+    if (!personalMode(c)) {
+      const ingressPort = await ingress.listen();
+      log!.info(`clauderipple OpenAI ingress listening on 127.0.0.1:${ingressPort}`);
+      // Reverse tunnels to remote (SSH) hosts, after listen() so their far end has something to reach.
+      const assets = () => readLocalAssets({ home, agentDir: defaultAgentDir() });
+      tunnels = new RemoteTunnels({
+        log: log!,
+        proxyTarget: () => ({ host: proxyConnectHost(store.get().listen.host), port: store.get().listen.port }),
+        pidFile: path.join(home, "remote-tunnels.json"),
+        sync: (host) => syncRemoteAssets(spawnSsh, host, assets()),
+        fingerprint: () => {
+          try { return assetsFingerprint(assets()); } catch { return ""; }
+        },
+      });
+      tunnels.cleanupStale();
+      tunnels.reconcile(c.remote?.hosts ?? []);
+      // Generic mode keeps its existing catalogue/usage refreshes.
+      proxy.chatgptRefreshAll();
+      proxy.chatgptRefreshCatalog();
+      setInterval(() => { if (!personalMode(store.get())) proxy.chatgptRefreshCatalog(); }, 2 * 60 * 60_000).unref();
+    }
     // Also notices hand edits to global/model settings and catalogue/agent changes, without a restart.
     const syncCompact = () => {
-      if (draining) return;
+      if (draining || personalMode(store.get())) return;
       try { syncContextWindows(store.get()); }
       catch (e) { log!.warn(`compact windows: ${(e as Error).message}`); }
     };
@@ -311,11 +308,11 @@ proxy
     // costs three small file reads and moves only when a worker file would change, so this is the
     // cheapest place to notice. Same cadence as the compact-window sync above.
     const watchAccounts = () => {
-      if (draining || !agentSync.changed()) return;
+      if (draining || personalMode(store.get()) || !agentSync.changed()) return;
       log!.info("agent files: the stored accounts changed; regenerating the pinned workers");
       agentSync.regenerate();
     };
-    setInterval(() => { syncCompact(); watchAccounts(); }, 15_000).unref();
+    if (!personalMode(c)) setInterval(() => { syncCompact(); watchAccounts(); }, 15_000).unref();
     // Captured once, at start: this process's installation id and pid are what it reports and what
     // a control request is checked against, whatever the files say later (B01/D6).
     const instance = {
@@ -363,7 +360,7 @@ proxy
       credentials: () => proxy.credentialHealth(),
       clearCredentialCooldown: (provider, id) => proxy.clearCredentialCooldown(provider, id),
       claudeClearCooldown: (id) => proxy.claudeClearCooldown(id),
-      picker: () => ({ enabled: !!store.get().picker?.enabled, hosts: terminateHosts(store.get()).slice(1), last: proxy.lastPickerInjection }),
+      picker: () => ({ enabled: !!store.get().picker?.enabled, hosts: terminateHosts(store.get()).slice(1), last: proxy.lastPickerInjection, blockedOrigins: [...proxy.blockedDesktopOrigins] }),
       observedClaudeCodeAuth,
       claudeLocalAuthorization: (allow) => {
         proxy.setClaudeLocalAuthorization(allow);
@@ -379,16 +376,18 @@ proxy
       modelCatalog: () => loadModelCatalog(),
       shutdown: () => beginDrain("shutdown requested"),
       remote: {
-        status: () => tunnels!.status(),
+        status: () => tunnels?.status() ?? [],
         reload: () => {
-          tunnels!.reconcile(store.get().remote?.hosts ?? []);
-          return tunnels!.status();
+          if (personalMode(store.get())) return [];
+          tunnels?.reconcile(store.get().remote?.hosts ?? []);
+          return tunnels?.status() ?? [];
         },
       },
       power: {
         status: () => ({ platform: powerPlatform(process.platform), awake: awake.status(), tether: tether.status() }),
-        pin: (on) => tether.setPin(on),
+        pin: (on) => { if (!personalMode(store.get())) tether.setPin(on); },
         poke: async () => {
+          if (personalMode(store.get())) return;
           tether.kick();
           await awake.refresh();
         },
@@ -396,25 +395,30 @@ proxy
     };
     const admin = await startAdmin(adminDeps);
     log!.info(`clauderipple admin GUI on http://127.0.0.1:${admin.port}/`);
-    // The first awake tick is the reconcile: a bit a previous process set is kept or cleared now.
-    void awake.start().catch((e: Error) => log!.warn(`awake: ${e.message}`));
-    tether.start();
-    if (!draining) autoUpdater.start();
+    if (!personalMode(store.get())) {
+      // Generic mode's first awake tick reconciles its previous power state.
+      void awake.start().catch((e: Error) => log!.warn(`awake: ${e.message}`));
+      tether.start();
+      if (!draining) autoUpdater.start();
+    }
     setImmediate(premintLeaves);
     // A minute in, once start-up traffic has settled: first the catalogue's context windows are
     // written into models already saved without one (a one-shot pass), then a few one-token requests
     // per model whose effort nobody has measured yet, so effort works without the owner re-saving the
     // provider. The backfill runs first so its write lands before the measured jobs re-read the config.
-    setTimeout(() => {
+    if (!personalMode(c)) setTimeout(() => {
+      if (personalMode(store.get())) return;
       void backfillContextWindows(adminDeps)
         .catch((e: Error) => log!.warn(`context windows: ${e.message}`))
-        .finally(() => measureUnsettledModels(adminDeps));
+        .finally(() => { if (!personalMode(store.get())) return measureUnsettledModels(adminDeps); });
     }, 60_000).unref();
     // Claude releases reach the declared models without a ClaudeRipple release: checked a minute in,
     // then every six hours (the catalogue itself is cached for an hour).
-    const adopt = () => void adoptNewClaudeModels(adminDeps).catch((e: Error) => log!.warn(`claude models: ${e.message}`));
-    setTimeout(adopt, 60_000).unref();
-    setInterval(adopt, 6 * 60 * 60_000).unref();
+    const adopt = () => { if (!personalMode(store.get())) void adoptNewClaudeModels(adminDeps).catch((e: Error) => log!.warn(`claude models: ${e.message}`)); };
+    if (!personalMode(c)) {
+      setTimeout(adopt, 60_000).unref();
+      setInterval(adopt, 6 * 60 * 60_000).unref();
+    }
   })
   .catch((e) => {
     log!.error(`listen failed: ${(e as Error).message}`);

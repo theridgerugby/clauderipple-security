@@ -41,6 +41,7 @@ import type { Config, Provider, ProviderCredential, ProviderModel } from "./conf
 import { withFileLock, writeJsonAtomic, writeSecretJsonAtomic } from "./locked-file.ts";
 import { readPrivateFile } from "./private-file.ts";
 import { approvedOrigin, personalMode } from "./personal-policy.ts";
+import { personalDesktopProblems } from "./desktop-policy.ts";
 import type { RouterCodeIdentity } from "../../cli/src/install-runtime.ts";
 import { EgressPolicyError, egressFetch, guardEgressFetch, isEgressPolicyError } from "./egress.ts";
 import { adminPort, headerValueProblem, homeDir, normalizeConfig, searchProviderFor, ssidProblem, validate } from "./config.ts";
@@ -195,7 +196,7 @@ export type AdminDeps = {
   clearCredentialCooldown?: (provider: string, id: string) => void;
   claudeClearCooldown?: (id: string) => void;
   /** Optional: picker-mode state and the last bootstrap injection. */
-  picker?: () => { enabled: boolean; hosts: string[]; last: unknown };
+  picker?: () => { enabled: boolean; hosts: string[]; last: unknown; blockedOrigins?: string[] };
   /** Optional: observed CLI credentials held by the live proxy, never serialized directly. */
   observedClaudeCodeAuth?: ObservedClaudeCodeAuth;
   /** Invalidate every live current-login cache and in-flight refresh generation together. */
@@ -660,8 +661,13 @@ export function effortLevelsForModel(cfg: Config, modelId: string): string[] | u
   const base = modelId.split("@")[0]!;
   const target = resolve(base, {}, cfg) ?? resolve(cfg.aliases[base] ?? base, {}, cfg);
   if (!target) return undefined;
+  const provider = cfg.providers[target.provider];
+  const model = provider?.models?.find(m => m.id === target.model || m.id.replace(/-\d{8}$/, "") === target.model.replace(/-\d{8}$/, ""));
+  // Personal Google entries cannot inherit another Gemini model's effort ladder. The
+  // selection adapter enforces this same per-model evidence; no ladder means no effort menu.
+  if (personalMode(cfg) && provider?.type === "google") return model?.effortLevels ?? [];
   const own = effortLevels(cfg).providers[target.provider];
-  const id = cfg.providers[target.provider]?.models?.find(m => m.id === target.model || m.id.replace(/-\d{8}$/, "") === target.model.replace(/-\d{8}$/, ""))?.id ?? target.model;
+  const id = model?.id ?? target.model;
   return own?.models?.[id] ?? own?.default;
 }
 
@@ -1175,6 +1181,7 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
   if (env.HTTPS_PROXY !== wantProxy) problems.push("settings");
   if (deps.health() > 0) problems.push("upstream");
   if (picker.enabled) {
+    if (personalMode(cfg) && !cfg.security!.approvedOrigins.includes("https://claude.ai")) problems.push("picker-origin");
     const trust = pickerTrust();
     // null: the certificate has not been checked yet (the first check runs in the background); that
     // is not a problem to report.
@@ -3011,6 +3018,13 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; tlsPort: nu
           }
           const errors = validate(parsed);
           if (errors.length > 0) return { status: 400 as const, body: { errors } };
+          if (personalMode(current.config) || personalMode(parsed)) {
+            if ((parsed.picker?.enabled === true) !== (current.config.picker?.enabled === true)) {
+              return { status: 403 as const, body: { errors: ["Use the Desktop picker control to change activation; ordinary configuration saves do not change the app connection"] } };
+            }
+            const desktopErrors = personalDesktopProblems(parsed);
+            if (desktopErrors.length) return { status: 400 as const, body: { errors: desktopErrors } };
+          }
           writeConfigFileLocked(deps.configFile, parsed);
           return { status: 200 as const, parsed, configRevision: configSnapshot(deps).configRevision };
         });
@@ -3021,7 +3035,10 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; tlsPort: nu
         // `cli.models` cannot take effect through the router at all: Claude Code reads the slots
         // before a request exists. So a GUI save has to write them to settings.json itself;
         // otherwise the Clients screen shows a choice that only a later `install` would honour.
-        const slotWarning = syncModelSlotsForGui(parsed, deps.agentDir);
+        // Personal Desktop setup owns its connection only through explicit activation/recovery.
+        // Saving an API key or the additional-model checklist must never install a proxy, change
+        // native model slots, or rewrite the user's Claude settings as a hidden side effect.
+        const slotWarning = personalMode(parsed) ? null : syncModelSlotsForGui(parsed, deps.agentDir);
         const warnings = [...(slotWarning ? [slotWarning] : []), ...targetWarnings(parsed)];
         sendJson(res, 200, { ok: true, configRevision: saved.configRevision, ...(warnings.length ? { warning: warnings.join("\n") } : {}) });
         return;
@@ -3549,9 +3566,10 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; tlsPort: nu
           sendJson(res, 400, { error: "expected {enabled: boolean}" });
           return;
         }
-        const r = await runCli(["picker", enabled ? "on" : "off"]);
+        const r = await (deps.runCli ?? runCli)(["picker", enabled ? "on" : "off"]);
         deps.log.info(`admin: picker ${enabled ? "on" : "off"} via GUI -> ${r.ok ? "ok" : "failed"}`);
-        sendJson(res, r.ok ? 200 : 500, { ok: r.ok, output: r.output });
+        const output = redactErrorText(r.output, [], 8192);
+        sendJson(res, r.ok ? 200 : 500, { ok: r.ok, output, ...(r.ok ? {} : { error: output || "Desktop picker activation failed" }) });
         return;
       }
       if (pathname === "/api/update" && (method === "GET" || method === "POST")) {

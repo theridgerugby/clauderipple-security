@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { assertNativeAdminFetch, nativeDashboardWindow, nativeAdminBridge } from "./ui-native-fixture.ts";
+import { assertNativeAdminFetch, nativeDashboardWindow, nativeAdminBridge, desktopUiGuardSource } from "./ui-native-fixture.ts";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -131,6 +131,8 @@ test("domain editors copy, edit and remove only the selected set's rule; new mod
   };
   const cell = (_label: unknown, controls: Node | Node[], help: unknown) => el('cell', { help }, Array.isArray(controls) ? controls : [controls]);
   const build = new Function('el', 'cell', `
+    const currentConfig = {};
+    ${desktopUiGuardSource(source)}
     const t = key => key, clone = value => JSON.parse(JSON.stringify(value));
     const MOD_EFFORTS = ['low','medium','high','xhigh','max'];
     ${block('const MOD_CLAUDE_MODELS', '// `base` is the router')}
@@ -740,6 +742,8 @@ async function pickerWindowHarness(
   const h = { config, catalogWindows, windows, requests: [] as string[], box: new SaveNode('div'), card: new SaveNode('div'), rows: new SaveNode('div') };
   const ui = new Function('h', 'el', `
     let currentConfig, pickerContextWindows = {catalogWindows:{}}, clientsLoaded, status = {};
+    ${desktopUiGuardSource(dashboardSource)}
+    const applyDesktopUiProfile = () => {};
     let pickerModelsDrawnFor = { key: null }, modelSlotsDrawnFor = { key: null }, pickerSavesOpen = 0;
     const pickerWindowDrafts = new Map();
     const document = { activeElement: null };
@@ -954,6 +958,7 @@ function slotsSaveHarness(config: SavedConfig, rows: SlotItem[], put = async (_n
   const ui = new Function('h', `
     const clone = value => JSON.parse(JSON.stringify(value));
     let currentConfig = h.config, slotsLoaded = true;
+    ${desktopUiGuardSource(dashboardSource)}
     const $all = () => h.rows.map(item => ({_get: () => clone(item)}));
     const $ = () => ({classList:{toggle(){}},textContent:''}), t = key => key, updateSlotSummary = () => {};
     const clearTimeout = () => {}, setTimeout = () => 1, effortLevelsFor = () => ['low','high'];
@@ -1000,6 +1005,8 @@ test('a mode conflict retries only that mode, preserving another window\'s edit,
   const base = { modes: [{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }, { id: 'deleted', name: 'Delete' }] };
   const h = { state: { base, settings: { modes: [{ id: 'a', name: 'Local A' }, { id: 'b', name: 'B' }, { id: 'new', name: 'New' }] }, revision: 1 }, writes: [] as { settings: typeof base; revision: number }[] };
   await new Function('h', `
+    const currentConfig = {};
+    ${desktopUiGuardSource(dashboardSource)}
     const clone = value => JSON.parse(JSON.stringify(value));
     const modState = h.state, modNormalize = clone;
     let modSaving = false, modSaveAgain = false, modSaveTimer = null, modWrites = 0;

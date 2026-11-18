@@ -137,7 +137,16 @@ export function directOn(home: string, desktopService: DesktopServiceDeps = {}):
       const state: DirectState = { at: previous?.at ?? new Date().toISOString(), cli: { ...removedCli, ...(previous?.cli ?? {}) }, desktop: previous?.desktop ?? desktop };
       fs.mkdirSync(home, { recursive: true });
       writeJsonAtomic(directStatePath(home), state);
-      if (desktop) removeAppProxy(proxyUrl, home);
+      if (desktop) {
+        if (!removeAppProxy(proxyUrl, home)) throw new Error("Desktop proxy ownership changed during recovery; the restoration snapshot was retained");
+        // Removal can preserve native edits made while enabled in a fresh unowned entry.
+        // Remember the actual restoration target rather than the original, inactive entry.
+        const appliedAfter = currentAppProxy().appliedId ?? null;
+        if (state.desktop && state.desktop.appliedAfter !== appliedAfter) {
+          if (JSON.stringify(readState(home)) !== JSON.stringify(state)) throw new Error("Direct restoration snapshot changed during Desktop recovery; review it before resuming");
+          writeJsonAtomic(directStatePath(home), { ...state, desktop: { ...state.desktop, appliedAfter } });
+        }
+      }
     }
     return Object.keys(removedCli).length > 0;
   });
@@ -178,7 +187,7 @@ export async function directOff(deps: RecoveryDeps, opts: { force?: boolean } = 
   const ap = currentAppProxy();
   const desktopChanged = ap.appliedId !== (saved?.desktop?.appliedAfter ?? ap.appliedId);
   if (!opts.force && desktopUrl && ap.egressProxyUrl && ap.egressProxyUrl !== desktopUrl && (desktopChanged || !saved)) {
-    return fail(`Claude Desktop now uses another proxy (${ap.egressProxyUrl}); left everything as it is. Run \`clauderipple direct off --force\` to replace it.`);
+    return fail("Claude Desktop now uses another proxy; existing settings and recovery information were preserved. Review the connection conflict and keep the original connection until it is resolved.");
   }
 
   const notes: string[] = [];

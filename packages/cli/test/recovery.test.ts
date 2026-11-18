@@ -524,13 +524,21 @@ function meta(): Record<string, unknown> {
   return JSON.parse(fs.readFileSync(path.join(configLibraryDir(), "_meta.json"), "utf8"));
 }
 
-function directSetup() {
+function directSetup(options: { legacyCorporate?: boolean } = {}) {
   const ctx = scratch({ listen: { host: "127.0.0.1", port: 18791 }, picker: { enabled: true }, cli: { extraModels: [], models: { smallFast: "deepseek-v4.1-flash" } } });
-  // An entry the user had before picker mode, which our entry replaced and remembered.
+  // Construct an existing owned entry. Only the dedicated legacy test remembers a corporate
+  // proxy: new activation must never create that state by replacing someone else's connection.
   fs.mkdirSync(configLibraryDir(), { recursive: true });
-  fs.writeFileSync(path.join(configLibraryDir(), "prev.json"), JSON.stringify({ egressProxyUrl: "http://corp:3128" }));
-  fs.writeFileSync(path.join(configLibraryDir(), "_meta.json"), JSON.stringify({ appliedId: "prev", other: true }));
-  applyAppProxy(ctx.proxyUrl, ctx.home);
+  fs.writeFileSync(path.join(configLibraryDir(), "prev.json"), JSON.stringify({
+    theme: "system", mcpServers: { sentinel: { command: "fixture-only", args: ["keep"] } },
+    ...(options.legacyCorporate ? { egressProxyUrl: "http://corp:3128" } : {}),
+  }));
+  const ownedId = crypto.randomUUID();
+  fs.writeFileSync(path.join(configLibraryDir(), `${ownedId}.json`), JSON.stringify({ egressProxyUrl: ctx.proxyUrl }));
+  fs.writeFileSync(path.join(configLibraryDir(), "_meta.json"), JSON.stringify({
+    appliedId: ownedId, other: true,
+    clauderipple: { ourId: ownedId, previousAppliedId: "prev", installationHome: ctx.home },
+  }));
   // The state after `install`: the user's own model choice and unrelated keys, plus the values
   // install wrote (proxy, CA and the routed slot, which install now owns through its record).
   fs.writeFileSync(ctx.settings, JSON.stringify({
@@ -577,6 +585,54 @@ test("direct on then off: only our values leave, other keys stay, and everything
   assert.equal(fs.existsSync(directStatePath(ctx.home)), false);
 });
 
+test("legacy corporate Desktop recovery restores the original connection and refuses to replace it on resume", async () => {
+  const ctx = directSetup({ legacyCorporate: true });
+  const original = fs.readFileSync(path.join(configLibraryDir(), "prev.json"), "utf8");
+  assert.equal(directOn(ctx.home).ok, true);
+  assert.equal(currentAppProxy().egressProxyUrl, "http://corp:3128");
+  assert.equal(meta().appliedId, "prev");
+  assert.equal(fs.readFileSync(path.join(configLibraryDir(), "prev.json"), "utf8"), original);
+
+  const before = fs.readFileSync(ctx.settings, "utf8");
+  const saved = fs.readFileSync(directStatePath(ctx.home), "utf8");
+  const desktop = fs.readdirSync(configLibraryDir()).sort().map(name =>
+    [name, fs.readFileSync(path.join(configLibraryDir(), name), "utf8")]);
+  const { ops, calls } = fakeSupervisor({});
+  const deps = { home: ctx.home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), sleep: noSleep, remoteHostInstalled: () => false };
+  for (const force of [false, true]) {
+    await assert.rejects(directOff(deps, { force }), /separate proxy configuration/);
+    assert.equal(fs.readFileSync(ctx.settings, "utf8"), before);
+    assert.equal(fs.readFileSync(directStatePath(ctx.home), "utf8"), saved);
+    assert.deepEqual(fs.readdirSync(configLibraryDir()).sort().map(name =>
+      [name, fs.readFileSync(path.join(configLibraryDir(), name), "utf8")]), desktop);
+  }
+  assert.deepEqual(calls, [], "a verified answering router is not repaired on refused restoration");
+});
+
+test("direct recovery records the preserved native entry and retains edits across resume and repeated disconnect", async () => {
+  const ctx = directSetup();
+  const previousBytes = fs.readFileSync(path.join(configLibraryDir(), "prev.json"), "utf8");
+  const owned = currentAppProxy().appliedId!;
+  const edited = { egressProxyUrl: ctx.proxyUrl, theme: "dark", locale: "en-CA", mcpServers: { custom: { command: "synthetic-only" } } };
+  fs.writeFileSync(path.join(configLibraryDir(), `${owned}.json`), JSON.stringify(edited));
+  assert.equal(directOn(ctx.home).ok, true);
+  const nativeId = currentAppProxy().appliedId!;
+  assert.notEqual(nativeId, "prev");
+  assert.notEqual(nativeId, owned);
+  assert.deepEqual(JSON.parse(fs.readFileSync(directStatePath(ctx.home), "utf8")).desktop,
+    { egressProxyUrl: ctx.proxyUrl, appliedAfter: nativeId });
+  const { egressProxyUrl: _proxy, ...nativeSettings } = edited;
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(configLibraryDir(), `${nativeId}.json`), "utf8")), nativeSettings);
+  const { ops } = fakeSupervisor({});
+  const result = await directOff({ home: ctx.home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), sleep: noSleep, remoteHostInstalled: () => false });
+  assert.equal(result.ok, true, result.detail);
+  assert.equal(currentAppProxy().previousAppliedId, nativeId);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(configLibraryDir(), `${currentAppProxy().appliedId}.json`), "utf8")), edited);
+  assert.equal(directOn(ctx.home).ok, true);
+  assert.equal(currentAppProxy().appliedId, nativeId, "unchanged settings reuse the preserved native entry");
+  assert.equal(fs.readFileSync(path.join(configLibraryDir(), "prev.json"), "utf8"), previousBytes);
+});
+
 test("direct off restores the current configured port, not the saved port", async () => {
   const ctx = directSetup();
   directOn(ctx.home);
@@ -621,7 +677,7 @@ test("direct off refuses a Claude Desktop proxy entry applied in the meantime", 
   const { ops } = fakeSupervisor({});
   const r = await directOff({ home: ctx.home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), sleep: noSleep, remoteHostInstalled: () => false });
   assert.equal(r.ok, false);
-  assert.match(r.detail, /vpn:1080/);
+  assert.match(r.detail, /another proxy.*preserved/);
   assert.equal(meta().appliedId, "vpn");
 });
 

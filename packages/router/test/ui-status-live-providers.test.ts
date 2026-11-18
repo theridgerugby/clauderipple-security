@@ -80,6 +80,7 @@ function harness() {
   const make = new Function("$", "el", "api", "t", "hint", "cell", "offline", "APP", `
     let status = null;
     let currentConfig = null;
+    const applyDesktopUiProfile = () => {};
     let chatgptLoginMessage = "";
     let loadedUiRevision = null;
     let clientsLoaded = false;

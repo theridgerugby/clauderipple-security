@@ -374,6 +374,39 @@ let phoneSnapshot = null;
 let phoneQrGeneration = 0;
 let phoneBusy = false;
 
+// Until configuration has loaded, optional clients and native-model overrides stay unavailable.
+// This is a presentation guard; the router and native shell still enforce their own boundaries.
+function genericControlsAvailable(config = currentConfig) {
+  return Boolean(config) && config.security?.mode !== "personal";
+}
+const GENERIC_ONLY_VIEWS = new Set(["slots", "phone", "mac", "mod"]);
+let deferredGenericView = null;
+function desktopView(name) {
+  if (!GENERIC_ONLY_VIEWS.has(name) || genericControlsAvailable()) {
+    // A deliberate visit to a different page supersedes an earlier startup deep link.
+    deferredGenericView = null;
+    return name;
+  }
+  if (!currentConfig) deferredGenericView = name;
+  return "health";
+}
+function applyDesktopUiProfile() {
+  const generic = genericControlsAvailable();
+  for (const node of $all("[data-generic-only]")) node.hidden = !generic;
+  for (const node of $all("[data-personal-i18n]")) {
+    node.textContent = t(currentConfig && !generic ? node.dataset.personalI18n : node.dataset.i18n);
+  }
+  const add = $("#providers-add");
+  if (add) add.disabled = !currentConfig;
+  const active = $(".view.active");
+  if (!generic && active && GENERIC_ONLY_VIEWS.has(active.id.replace(/^view-/, ""))) showView("health");
+  if (currentConfig && deferredGenericView) {
+    const name = deferredGenericView;
+    deferredGenericView = null;
+    if (generic) showView(name);
+  }
+}
+
 function selectOption(value, text) { return el("option", { value }, [text]); }
 function badge(kind, text) { return el("span", { class: `badge ${kind} dot`, text }, []); }
 function hint(text) { return el("p", { class: "hint", text }, []); }
@@ -415,6 +448,7 @@ function svgIcon(viewBox, paths, cls) {
 function chevronIcon() { return svgIcon("0 0 8 13", ["M1.5 1.5l5 5-5 5"], "chevron"); }
 
 function showView(name) {
+  name = desktopView(name);
   if (name !== "phone") { phoneGeneration++; hidePhoneQr(); }
   for (const button of $all(".nav-btn")) {
     const active = button.dataset.view === name;
@@ -810,6 +844,7 @@ async function refreshHealth() {
   $("#health-requests").replaceChildren(el("div", { class: "stat-value", text: t("health.requestsFmt", Object.fromEntries(Object.entries(status.stats || {}).map(([key, value]) => [key, typeof value === "number" ? value.toLocaleString() : value]))) }));
   renderHealthProviders();
   if (providerNamesStale()) void refreshProviderConfig();
+  applyDesktopUiProfile();
   renderDiagnostics();
   if (clientsLoaded) renderClients();
   if (modState.settings) renderModNotice();
@@ -838,6 +873,7 @@ function readinessProblemText(code) {
   if (code === "upstream") return t("health.diagnosticUpstream");
   if (code === "picker-ca") return t("health.diagnosticPickerCa");
   if (code === "picker-proxy") return t("health.diagnosticPickerProxy");
+  if (code === "picker-origin") return t("health.diagnosticPickerOrigin");
   if (code === "config") return t("health.diagnosticConfig");
   if (String(code).startsWith("provider:")) return t("health.diagnosticProvider", { name: String(code).slice(9) });
   return String(code);
@@ -909,11 +945,13 @@ if (diagnosticsCopy) diagnosticsCopy.addEventListener("click", () => void copyDi
 let updateState = { busy: false, check: null };
 let autoUpdateSaving = false;
 function autoUpdateRow() {
+  if (!genericControlsAvailable()) return null;
   const control = modSwitch("auto-update", status.autoUpdate?.enabled === true, t("update.auto"), toggleAutoUpdate);
   control.querySelector("input").disabled = autoUpdateSaving || !status.autoUpdate;
   return cell(t("update.auto"), control, t("update.autoHelp"));
 }
 async function toggleAutoUpdate(enabled) {
+  if (!genericControlsAvailable()) return;
   if (autoUpdateSaving) return;
   autoUpdateSaving = true;
   const input = document.querySelector('[data-key="auto-update"]');
@@ -921,6 +959,7 @@ async function toggleAutoUpdate(enabled) {
   try {
     // Do not use latestConfig's stale fallback for an automatic-install preference.
     const next = await api("/api/config");
+    if (!genericControlsAvailable(next)) return;
     next.autoUpdate = enabled;
     const out = await configRequest(next);
     currentConfig = next;
@@ -943,6 +982,7 @@ async function toggleAutoUpdate(enabled) {
 const PRIORITY_LABEL = { "below-normal": "priority.belowNormal", normal: "priority.normal", "above-normal": "priority.aboveNormal", high: "priority.high", idle: "priority.idle", realtime: "priority.realtime" };
 let prioritySaving = false;
 function priorityRow() {
+  if (!genericControlsAvailable()) return null;
   const state = status.processPriority;
   // Older routers do not report it, and only Windows has these levels.
   if (!state || !state.supported) return null;
@@ -956,6 +996,7 @@ function priorityRow() {
   return cell(t("priority.label"), select, notes);
 }
 async function savePriority(value, select) {
+  if (!genericControlsAvailable()) return;
   const state = status.processPriority;
   if (prioritySaving || !state || value === state.setting) return;
   if (value === "high" && !confirm(t("priority.highConfirm"))) { select.value = state.setting; return; }
@@ -963,6 +1004,7 @@ async function savePriority(value, select) {
   select.disabled = true;
   try {
     const next = await api("/api/config");
+    if (!genericControlsAvailable(next)) return;
     next.processPriority = value;
     const out = await configRequest(next);
     currentConfig = next;
@@ -976,6 +1018,12 @@ async function savePriority(value, select) {
   }
 }
 function versionRow() {
+  if (!genericControlsAvailable()) {
+    const row = cell(`${t("health.version")} ${status.version}`, null,
+      t(currentConfig ? "desktop.personalUpdates" : "common.loading"));
+    row.id = "health-version-row";
+    return row;
+  }
   const check = updateState.check;
   // The version reads as the row's label; what the update check found sits under it, the action on the right.
   let note = null;
@@ -1007,6 +1055,7 @@ function renderVersionRow() {
   if (row) row.replaceWith(versionRow());
 }
 async function checkForUpdate() {
+  if (!genericControlsAvailable()) return;
   updateState = { busy: true, check: updateState.check };
   renderVersionRow();
   try { updateState = { busy: false, check: await api("/api/update") }; }
@@ -1014,6 +1063,7 @@ async function checkForUpdate() {
   renderVersionRow();
 }
 async function startUpdate() {
+  if (!genericControlsAvailable()) return;
   const check = updateState.check;
   if (check.kind === "packaged") { window.open("https://github.com/PBJ-2/clauderipple/releases/latest", "_blank", "noreferrer"); return; }
   if (!confirm(t("update.confirm", { latest: check.latest, current: check.current }))) return;
@@ -1473,7 +1523,7 @@ let providerConfigRead = null;
 /** Reads the config again for the names and labels Status shows; one read at a time, and the list redraws with it. */
 function refreshProviderConfig() {
   if (providerConfigRead) return providerConfigRead;
-  providerConfigRead = api("/api/config").then((config) => { currentConfig = config; }, () => { /* the live names stand */ })
+  providerConfigRead = api("/api/config").then((config) => { currentConfig = config; applyDesktopUiProfile(); }, () => { /* the live names stand */ })
     .finally(() => { providerConfigRead = null; if (status) renderHealthProviders(); });
   return providerConfigRead;
 }
@@ -1536,8 +1586,37 @@ function renderHealthProviders() {
 
 let statusModBusy = false;
 let codexBusy = false;
+function pickerBlockedOriginsNote(picker) {
+  if (!picker?.enabled || !Array.isArray(picker.blockedOrigins)) return null;
+  // Status carries origins, never URLs copied from exception text or credentials. Recheck that
+  // contract before displaying the bounded list and use textContent, never markup or links.
+  const origins = picker.blockedOrigins.slice(0, 16).filter(value => {
+    if (typeof value !== "string" || value.length > 2048) return false;
+    try {
+      const url = new URL(value);
+      return url.protocol === "https:" && url.origin === value;
+    } catch { return false; }
+  });
+  return origins.length ? el("div", { class: "cell-note warn-text" }, [
+    el("p", { text: t("picker.blockedOrigins") }),
+    ...origins.map(origin => el("div", { class: "cell-actions" }, [
+      el("code", { text: origin }),
+      el("button", { class: "btn secondary compact", type: "button", text: t("picker.reviewPermission"),
+        onclick: () => void openDestinationReview(origin) }),
+    ])),
+  ]) : null;
+}
+async function openDestinationReview(origin) {
+  if (currentConfig?.security?.mode !== "personal" || typeof origin !== "string") return;
+  try { const url = new URL(origin); if (url.protocol !== "https:" || url.origin !== origin) return; }
+  catch { return; }
+  const panel = el("div", {}, [el("p", { text: t("common.loading") })]);
+  showModal(panel);
+  await loadPersonalSecurityPanel({ target: panel, reviewOrigin: origin });
+}
 function renderClients() {
   if (!currentConfig || !status) return;
+  applyDesktopUiProfile();
   const picker = status.picker || { enabled: false, last: null };
   const last = picker.last || null;
   const names = status.pickerModels || [];
@@ -1550,6 +1629,8 @@ function renderClients() {
       el("div", { class: "cell-note", text: t("picker.models", { count: names.length, names: names.join(", ") || "—" }) }),
       el("div", { class: "cell-note", text: last && last.at ? t("picker.lastAt", { at: new Date(last.at).toLocaleString() }) : t("picker.never") }),
     );
+    const blocked = pickerBlockedOriginsNote(picker);
+    if (blocked) pickerGroup.appendChild(blocked);
   }
   const pickerSwitch = $("#client-picker-toggle");
   pickerSwitch.checked = Boolean(picker.enabled);
@@ -1562,6 +1643,7 @@ function renderClients() {
   };
   renderClientPickerModels(picker.enabled);
   renderClientPickerOrder(picker.enabled);
+  if (!genericControlsAvailable()) return;
   renderModelSlots();
   renderAutoClassifier();
   const modEnabled = Boolean(status.statusMod);
@@ -1792,6 +1874,7 @@ function parseWebSearchChoice(value) {
 }
 
 function renderModelSlots() {
+  if (!genericControlsAvailable()) return;
   const rows = $("#client-model-slots");
   if (!rows) return;
   const chosen = (currentConfig.cli && currentConfig.cli.models) || {};
@@ -1881,8 +1964,9 @@ function renderWebSearchSlot() {
 }
 
 async function saveWebSearch(value) {
-  if (!currentConfig) return;
+  if (!genericControlsAvailable()) return;
   const next = clone(await latestConfig());
+  if (!genericControlsAvailable(next)) return;
   const picked = parseWebSearchChoice(value);
   // `webSearch` is the only setting this row owns; an existing `maxResults` survives the change.
   const maxResults = (webSearchBackendOf(next) || {}).maxResults ?? (webSearchBackendOf(currentConfig) || {}).maxResults;
@@ -1897,8 +1981,9 @@ async function saveWebSearch(value) {
 }
 
 async function saveModelSlots() {
-  if (!currentConfig) return;
+  if (!genericControlsAvailable()) return;
   const next = clone(await latestConfig());
+  if (!genericControlsAvailable(next)) return;
   // Every slot is recorded, empty ones included. A select put back to "default (Claude)" has to
   // remove the env key, and the router tells "clear this" from "leave this alone" by whether the
   // slot is present at all — so dropping empty values here would make the choice a silent no-op.
@@ -2016,6 +2101,7 @@ function classifierRow(stage, saved, groups) {
 }
 
 function renderAutoClassifier() {
+  if (!genericControlsAvailable()) return;
   const box = $("#client-auto-classifier");
   if (!box || !currentConfig) return;
   const rows = classifierRowsShown();
@@ -2047,7 +2133,7 @@ function classifierRowsShown() {
   return classifierRowsOf(classifierPending ? classifierPending.setting : currentConfig.autoModeClassifier);
 }
 function saveAutoClassifier() {
-  if (!currentConfig) return classifierSaving;
+  if (!genericControlsAvailable()) return classifierSaving;
   const setting = classifierSettingOf(classifierRowValue("first"), classifierRowValue("rest"));
   classifierPending = { setting };
   const generation = ++classifierSaveGeneration;
@@ -2055,6 +2141,7 @@ function saveAutoClassifier() {
     if (generation !== classifierSaveGeneration) return;
     try {
       const next = clone(await latestConfig());
+      if (!genericControlsAvailable(next)) { classifierPending = null; return; }
       if (generation !== classifierSaveGeneration) return;
       if (setting) next.autoModeClassifier = setting;
       else delete next.autoModeClassifier;
@@ -2153,8 +2240,9 @@ function pickerModeOn() {
 // (the box was ticked, picker mode stayed off, and the picker never changed — seen on Windows, 2026-09-14).
 async function offerPickerOn(wanted) {
   if (!wanted || pickerModeOn()) return;
-  if (!confirm(t("providers.pickerOffPrompt"))) return;
-  await togglePicker(true, true);
+  // Every entry point uses the same certificate, app-wide proxy and recovery explanation.
+  // Saving a model selection never silently activates Desktop interception.
+  await togglePicker(true);
 }
 async function togglePicker(enabled, confirmed = false) {
   if (pickerBusy) return;
@@ -2174,6 +2262,7 @@ async function togglePicker(enabled, confirmed = false) {
   }
 }
 async function toggleStatusMod(enabled) {
+  if (!genericControlsAvailable()) return;
   if (statusModBusy) return;
   statusModBusy = true;
   try {
@@ -2187,8 +2276,9 @@ async function toggleStatusMod(enabled) {
   }
 }
 async function toggleWorkerTools(enabled) {
-  if (!currentConfig) return;
+  if (!genericControlsAvailable()) return;
   const next = clone(await latestConfig());
+  if (!genericControlsAvailable(next)) return;
   next.cli = { ...(next.cli || {}), limitWorkerTools: enabled };
   try {
     const out = await configRequest(next);
@@ -2198,10 +2288,12 @@ async function toggleWorkerTools(enabled) {
   renderClients();
 }
 async function renderCodexClient() {
+  if (!genericControlsAvailable()) return;
   const path = $("#client-codex-rows");
   const toggle = $("#client-codex-toggle");
   try {
     const codex = await api("/api/codex");
+    if (!genericControlsAvailable()) return;
     path.textContent = codex.configPath || "";
     path.classList.remove("bad-text");
     toggle.checked = Boolean(codex.enabled);
@@ -2214,6 +2306,7 @@ async function renderCodexClient() {
   }
 }
 async function toggleCodex(enabled) {
+  if (!genericControlsAvailable()) return;
   if (codexBusy) return;
   codexBusy = true;
   $("#client-codex-msg").textContent = t("picker.working");
@@ -2227,7 +2320,7 @@ setInterval(refreshHealth, 5000);
 // Status names providers by the names people know (the one the user typed, a preset's name), which only
 // the config carries; read it once here unless another page already has. refreshHealth reads it again when
 // the router's live provider list names other providers than it does.
-if (!offline()) void api("/api/config").then((config) => { if (!currentConfig) { currentConfig = config; if (status) renderHealthProviders(); } }, () => { /* the status names stand */ });
+if (!offline()) void api("/api/config").then((config) => { if (!currentConfig) { currentConfig = config; if (status) renderHealthProviders(); } applyDesktopUiProfile(); }, () => { /* the status names stand */ });
 // The open accounts tab follows the router (each refresher returns at once when its list is not shown).
 setInterval(() => {
   if (document.visibilityState !== "visible" || !$("#modal-backdrop").hidden || !selectedProviderName) return;
@@ -2243,11 +2336,13 @@ function hidePhoneQr() {
   const box = $("#phone-qr");
   if (box) box.replaceChildren();
 }
-function phoneActive() { return $("#view-phone").classList.contains("active"); }
+function phoneActive() { return genericControlsAvailable() && $("#view-phone").classList.contains("active"); }
 function phonePost(route, body) {
+  if (!genericControlsAvailable()) return Promise.reject(new Error(t("desktop.only")));
   return api(`/api/phone/${route}`, { method: "POST", headers: { "content-type": "application/json" }, ...(body ? { body: JSON.stringify(body) } : {}) });
 }
 async function showPhoneQr(button) {
+  if (!genericControlsAvailable()) return;
   if (phoneBusy) return;
   const generation = ++phoneQrGeneration;
   button.disabled = true;
@@ -2437,6 +2532,7 @@ async function refreshPhone(rebuild = false) {
   }
 }
 async function loadPhone() {
+  if (!genericControlsAvailable()) return;
   phoneGeneration++;
   hidePhoneQr();
   // Until a status has landed, the page holds bars where its tiles will be.
@@ -2468,8 +2564,8 @@ const macOpen = { awake: false, tether: false, setup: false };
 /** The OS the router reports. A router too old to name it had macOS-only power features. */
 function macPlatform() { return (macPower && macPower.platform) || "darwin"; }
 function macIsMac() { return macPlatform() === "darwin"; }
-function macActive() { return $("#view-mac").classList.contains("active"); }
-async function loadMac() { macGeneration++; macDrawn = ""; await refreshMac(true); }
+function macActive() { return genericControlsAvailable() && $("#view-mac").classList.contains("active"); }
+async function loadMac() { if (!genericControlsAvailable()) return; macGeneration++; macDrawn = ""; await refreshMac(true); }
 async function refreshMac(force) {
   if (!macActive() || offline()) return;
   const generation = macGeneration;
@@ -2500,6 +2596,7 @@ function macAdoptSetup(next) {
   }
 }
 async function macPollSetup() {
+  if (!genericControlsAvailable()) return;
   try { macAdoptSetup(await api("/api/power/setup")); } catch { return; }
   if (!macSetup.running) {
     // The router looks for the rule again when the run ends; read what it found.
@@ -2508,6 +2605,7 @@ async function macPollSetup() {
   if (macActive()) renderMac();
 }
 async function startMacSetup(ssid) {
+  if (!genericControlsAvailable()) return;
   if (macSetup.running) return;
   try {
     await api("/api/power/setup", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(ssid ? { ssid } : {}) });
@@ -2521,6 +2619,7 @@ async function startMacSetup(ssid) {
   renderMac();
 }
 async function macPut(change) {
+  if (!genericControlsAvailable()) return;
   if (macBusy) return;
   macBusy = true;
   try {
@@ -2925,10 +3024,12 @@ function slotRow(id, route) {
   return row;
 }
 async function loadSlots() {
+  if (!genericControlsAvailable()) return;
   slotsLoaded = true;
   try {
     await loadCatalogs();
     currentConfig = await api("/api/config");
+    if (!genericControlsAvailable()) { slotsLoaded = false; return; }
     const rows = $("#slots-list");
     rows.replaceChildren();
     const routes = currentConfig.routes || {};
@@ -2942,7 +3043,7 @@ async function loadSlots() {
   }
 }
 $("#slots-add").addEventListener("click", () => {
-  if (!currentConfig) return;
+  if (!genericControlsAvailable()) return;
   const row = slotRow(claudeModels[0].id, null);
   $("#slots-list").appendChild(row);
   updateSlotSummary();
@@ -3101,14 +3202,14 @@ function slotsStatus(text, isError) {
   box.classList.toggle("bad-text", Boolean(isError));
 }
 function scheduleSlotsSave() {
-  if (!currentConfig || !slotsLoaded) return;
+  if (!genericControlsAvailable() || !slotsLoaded) return;
   clearTimeout(slotsSaveTimer);
   slotsStatus(t("slots.saving"));
   if (slotsSaving) { slotsSaveAgain = true; return; }
   slotsSaveTimer = setTimeout(() => void saveSlots(), 500);
 }
 async function saveSlots() {
-  if (!currentConfig || !slotsBaseline) return;
+  if (!genericControlsAvailable() || !slotsBaseline) return;
   if (slotsSaving) { slotsSaveAgain = true; return; }
   clearTimeout(slotsSaveTimer);
   slotsSaveTimer = null;
@@ -3116,7 +3217,10 @@ async function saveSlots() {
   try {
     const sent = readSlotRoutes();
     const before = slotsBaseline;
-    const rebase = (fresh) => mergeSlotRoutes(fresh, before, sent);
+    const rebase = (fresh) => {
+      if (!genericControlsAvailable(fresh)) throw new Error(t("desktop.only"));
+      return mergeSlotRoutes(fresh, before, sent);
+    };
     // A failed read must not fall back to stale settings, including on legacy routers.
     const next = rebase(await api("/api/config"));
     const out = await configRequest(next, rebase);
@@ -4387,6 +4491,7 @@ async function loadClients() {
   try {
     await loadCatalogs();
     currentConfig = await api("/api/config");
+    applyDesktopUiProfile();
     pickerContextWindows = await api("/api/context-windows");
     if (!status) status = await api("/api/status");
     renderClients();
@@ -4406,17 +4511,19 @@ async function probeProviders(providers, onUpdate) {
     }
   }));
 }
-async function loadPersonalSecurityPanel() {
-  const panel = $("#personal-security-panel");
+async function loadPersonalSecurityPanel(options = {}) {
+  const panel = options.target || $("#personal-security-panel");
   if (!panel) return;
   try {
     const policy = await api("/api/security-policy");
     const origin = el("input", { type: "url", placeholder: "https://your-approved-api.example", "aria-label": "Exact HTTPS origin" });
+    if (options.reviewOrigin) origin.value = options.reviewOrigin;
     const consent = el("input", { type: "checkbox", "aria-label": "Approve credential and conversation sharing" });
     const save = el("button", { class: "btn", type: "button", text: "Approve destination" });
-    const explanation = el("p", { text: "Personal sensitive-data mode: HTTPS destinations require explicit approval. Conversation history, system prompts and tool results may be sent to the selected provider. Cross-provider fallback, remote access and request-body debug dumps are disabled." });
+    const explanation = el("p", { text: "Personal sensitive-data mode: an exact HTTPS destination approval applies to provider requests and Desktop connections through the proxy. Selected providers may receive credentials, conversation history, system prompts and tool results. Cross-provider fallback, remote access and request-body debug dumps are disabled." });
     const notice = el("p", { text: "Approve only a service you are permitted to use for your data. Origin approval does not change that provider's retention or training policies." });
-    const label = el("label", {}, [consent, el("span", { text: " I authorize sending credentials and conversation context to this exact HTTPS origin." })]);
+    const label = el("label", {}, [consent, el("span", { text: " I authorize this exact HTTPS destination for provider credentials and conversation context, and for Desktop connections." })]);
+    origin.addEventListener("input", () => { consent.checked = false; });
     const list = el("div");
     for (const value of policy.approvedOrigins || []) {
       const revoke = el("button", { class: "btn", type: "button", text: "Revoke" });
@@ -4433,10 +4540,12 @@ async function loadPersonalSecurityPanel() {
       save.disabled = true;
       try {
         await api("/api/security-policy", { method: "POST", body: JSON.stringify({ action: "approve", origin: origin.value.trim(), acknowledgeDataSharing: true }) });
+        if (options.reviewOrigin) { closeModal(); void refreshHealth(); }
         await loadPersonalSecurityPanel();
       } catch (error) { save.disabled = false; toast(error.message, true); }
     });
-    panel.replaceChildren(el("h2", { text: "Sensitive data destinations" }), explanation, notice, list, suggestions, origin, label, save);
+    panel.replaceChildren(el("h2", { id: options.reviewOrigin ? "modal-title" : undefined, text: "Sensitive data destinations" }), explanation, notice,
+      ...(options.reviewOrigin ? [] : [list, suggestions]), origin, label, save);
   } catch (error) { panel.replaceChildren(el("p", { text: "Security policy unavailable: " + error.message })); }
 }
 async function loadProviders() {
@@ -4450,6 +4559,7 @@ async function loadProviders() {
   try {
     await loadCatalogs();
     currentConfig = await api("/api/config");
+    applyDesktopUiProfile();
     // The Models tab says which models have no known window, and the live Codex catalogue's is not
     // in the config. A router too old to answer leaves the note off rather than breaking the screen.
     pickerContextWindows = await api("/api/context-windows").catch(() => pickerContextWindows);
@@ -4623,6 +4733,8 @@ async function openClaudeAccountSignIn(providerName, manual, replaceId) {
 // presets by the format they speak (the "paste a key" note is said once per group, not per row),
 // then the manual entry on its own.
 function openProviderChooser() {
+  if (!currentConfig) return;
+  if (!genericControlsAvailable()) { openGoogleProviderForm({ kind: "google" }); return; }
   const grid = el("div", { class: "chooser-grid" });
   function tile(title, help, options) {
     const button = el("button", { class: "chooser-tile", type: "button" }, [el("span", { class: "cell-text" }, [el("strong", { text: title }), help ? el("span", { text: help }) : null]), chevronIcon()]);
@@ -4954,13 +5066,15 @@ function openGrokProviderForm(options) {
 function openGoogleProviderForm(options) {
   let formActive = true;
   const existing = options.provider;
+  const personal = currentConfig?.security?.mode === "personal";
   const nameInput = el("input", { value: options.name ? providerFormName(options.name, existing) : t("providers.google"), maxlength: "60" });
   const keyInput = el("input", { type: "password", autocomplete: "off", placeholder: existing && existing.apiKey ? t("providers.keySaved") : t("providers.keyPlaceholder") });
   const showKey = el("button", { class: "eye-button", type: "button", text: t("common.show") });
   showKey.addEventListener("click", () => { const show = keyInput.type === "password"; keyInput.type = show ? "text" : "password"; showKey.textContent = show ? t("common.hide") : t("common.show"); });
   const keyField = el("div", { class: "form-field key-field" }, [el("span", { text: t("providers.apiKey") }), el("div", { class: "key-control" }, [keyInput, showKey]), el("small", { text: t("providers.googleKeyHelp") })]);
-  const auth = el("select", {}, [selectOption("api-key", t("providers.googleAuthApiKey")), selectOption("antigravity", t("providers.googleAntigravity"))]);
-  auth.value = (existing && existing.auth) || "api-key";
+  const auth = el("select", {}, [selectOption("api-key", t("providers.googleAuthApiKey")),
+    ...(personal ? [] : [selectOption("antigravity", t("providers.googleAntigravity"))])]);
+  auth.value = personal ? "api-key" : (existing && existing.auth) || "api-key";
   const authField = inputRow(t("providers.credentials"), auth, t("providers.googleAuthHelp"));
   const login = el("button", { class: "btn secondary", type: "button", text: t("providers.addGoogleAccount") });
   login.addEventListener("click", async () => {
@@ -5023,7 +5137,8 @@ function openGoogleProviderForm(options) {
   const pickerInput = el("input", { type: "checkbox", checked: Boolean(existing && modelsOf(existing).some((model) => ((currentConfig.cli && currentConfig.cli.extraModels) || []).some((extra) => extra.model === model.id))) });
   const form = el("div", { class: "provider-form" }, [
     el("h1", { id: "modal-title", text: existing ? t("providers.edit") : t("providers.addTitle") }),
-    inputRow(t("providers.name"), nameInput, t("providers.nameHelp")), authField, keyField, loginField, probeButton, result, modelArea,
+    inputRow(t("providers.name"), nameInput, t("providers.nameHelp")), personal ? null : authField,
+    keyField, personal ? null : loginField, probeButton, result, modelArea,
     el("label", { class: "check picker-check" }, [pickerInput, el("span", { text: t("providers.showInPicker") })]),
     pickerModeOn() ? null : hint(t("providers.pickerOffHint")),
     advanced,
@@ -5066,7 +5181,7 @@ function openGoogleProviderForm(options) {
   showModal(form, () => { formActive = false; });
   // An existing provider can already reach its catalogue (a stored key or a signed-in account), so
   // the full list is shown straight away.
-  if (existing && (existing.apiKey || existing.auth === "antigravity")) void runProbe();
+  if (existing && (existing.apiKey || (!personal && existing.auth === "antigravity"))) void runProbe();
 }
 function openProviderForm(options) {
   const existing = options.provider;
@@ -5605,6 +5720,7 @@ function modStatus(text, isError) {
   box.classList.toggle("bad-text", Boolean(isError));
 }
 function modPatch(change) {
+  if (!genericControlsAvailable()) return;
   modState.settings = { ...modState.settings, ...change };
   modRefresh();
   clearTimeout(modSaveTimer);
@@ -5613,6 +5729,7 @@ function modPatch(change) {
 }
 function modSetRule(domain, rule) { modPatch({ rules: { ...modState.settings.rules, [domain]: rule } }); }
 async function saveMod() {
+  if (!genericControlsAvailable()) return;
   if (modSaving) { modSaveAgain = true; return; }
   modSaving = true;
   try {
@@ -5658,6 +5775,7 @@ async function saveMod() {
  * session and this page always agree. It is not part of the mod's settings revision.
  */
 async function saveCompactAt(value) {
+  if (!genericControlsAvailable()) return;
   const previous = modState.compactAt;
   modState.compactAt = value;
   modRefresh();
@@ -5673,11 +5791,13 @@ async function saveCompactAt(value) {
   modRefresh();
 }
 async function loadMod() {
+  if (!genericControlsAvailable()) return;
   // A save on its way brings back the router's copy itself.
   if (modSaveTimer || modSaving) return;
   let retired = false;
   const writes = modWrites;
   const [settingsResult, optionsResult] = await Promise.allSettled([api("/api/mod-settings"), api("/api/mod-options")]);
+  if (!genericControlsAvailable()) return;
   if (settingsResult.status === "rejected") {
     if (!modState.settings) {
       $("#mod-content").replaceChildren(modSection(null, [el("div", { class: "cell-note bad-text", text: `${t("common.loadFailed")} ${settingsResult.reason.message}` })]));
@@ -5701,6 +5821,7 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible" && $("#view-mod").classList.contains("active")) void loadMod();
 });
 function modRefresh() {
+  if (!genericControlsAvailable()) return;
   if (!modState.settings) return;
   renderModNotice();
   modRedraw($("#mod-content"), [modEffortCard(), modWorkersCard(), modJudgeCard(), modCacheCard(), modCompactCard(), modLookCard()]);
