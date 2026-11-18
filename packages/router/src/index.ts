@@ -37,7 +37,12 @@ import { RemoteTunnels, proxyConnectHost } from "./remote-tunnel.ts";
 import { syncContextWindows } from "./context-windows.ts";
 import { applyProcessPriority } from "./process-priority.ts";
 import { configurePersonalEgressPolicy, personalMode } from "./personal-policy.ts";
+import { assertPersonalWindowsNodeEnv } from "./windows-node-env.ts";
 import { captureRouterCodeIdentity } from "../../cli/src/install-runtime.ts";
+
+// Windows is the sole reviewed platform for this personal fork. Refuse ambient TLS/proxy/code
+// injection controls before fingerprinting source, reading state or touching client integration.
+if (process.platform === "win32") assertPersonalWindowsNodeEnv();
 
 // Captured once, before listening. Reading the files again in /api/status could make an old
 // process incorrectly claim that it is executing newly installed code.

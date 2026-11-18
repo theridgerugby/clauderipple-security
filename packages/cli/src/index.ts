@@ -44,6 +44,7 @@ import { adminFetch, openAdminDashboard } from "./admin-client.ts";
 import { recordAdminRuntime } from "./admin-runtime.ts";
 import { captureRouterCodeIdentity, verifyAndApplyInstall } from "./install-runtime.ts";
 import { assertPersonalCliCommandAllowed, SECURITY_USAGE, updateApprovedOrigin } from "./security-config.ts";
+import { assertPersonalWindowsNodeEnv } from "../../router/src/windows-node-env.ts";
 
 async function pickerOn(): Promise<void> {
   const home = homeDir();
@@ -763,6 +764,13 @@ async function dispatchCommand(): Promise<void> {
     const policyStore = new ConfigStore(configPath());
     configurePersonalEgressPolicy(() => policyStore.get().security);
     assertPersonalCliCommandAllowed(policyStore.get(), args);
+    // The high-value operations below may launch a router, authenticate, approve an egress
+    // destination or send a prompt. Keep read-only diagnostics and safe rollback available.
+    if (isWindows && personalMode(policyStore.get()) &&
+        !["doctor", "direct", "stop", "uninstall", "help", "repair"].includes(cmd) &&
+        !(cmd === "security" && args[1] === "revoke-origin")) {
+      assertPersonalWindowsNodeEnv();
+    }
   }
   switch (cmd) {
     case "security": {

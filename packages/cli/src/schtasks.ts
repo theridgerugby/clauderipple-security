@@ -23,6 +23,7 @@ import { type RouterIdentity, routerIdentity } from "./router-state.ts";
 import { runtime } from "./runtime.ts";
 import { windowsPowerShellEnv } from "./windows-powershell.ts";
 import { assertGeneration, definitionGeneration, withServiceLock, writeServiceFile } from "./service-definition.ts";
+import { PERSONAL_WINDOWS_UNTRUSTED_ENV } from "../../router/src/windows-node-env.ts";
 
 export const TASK_NAME = "ClaudeRippleRouter";
 
@@ -171,6 +172,11 @@ export function renderLauncher(opts: { program: string; args: string[]; home: st
   const logDir = path.join(opts.home, "logs");
   const watchdog = opts.watchdog !== false;
   const env = { CLAUDERIPPLE_HOME: opts.home, ...(opts.env ?? {}) };
+  const untrusted = Object.keys(env).filter(name => PERSONAL_WINDOWS_UNTRUSTED_ENV.some(item => item.toLowerCase() === name.toLowerCase()));
+  if (untrusted.length) throw new Error(`The Windows task definition attempted to reintroduce unsafe runtime settings: ${untrusted.join(", ")}`);
+  if (Object.keys(env).some(name => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))) {
+    throw new Error("The Windows task definition contains an invalid environment variable name");
+  }
   const quoteArg = (arg: string): string => ps(`"${arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1')}"`);
   const cli = runtime().cli;
   const portReader = path.join(path.dirname(cli), `watchdog-port${path.extname(cli)}`);
@@ -178,6 +184,10 @@ export function renderLauncher(opts: { program: string; args: string[]; home: st
   // the loop and leave the router or host unsupervised; the loop retries instead.
   // Windows PowerShell 5.1 decodes -File as ANSI unless the UTF-8 BOM is present.
   return String.fromCharCode(0xFEFF) + [
+    // PowerShell starts before Node: clear environment-based code preloads, TLS bypasses, extra
+    // CAs, proxy selectors and debug/coverage sinks before launching even the watchdog helper.
+    // The router then independently refuses a direct launch with unsafe startup settings.
+    ...PERSONAL_WINDOWS_UNTRUSTED_ENV.map(name => `Remove-Item -LiteralPath 'Env:${name}' -ErrorAction SilentlyContinue`),
     ...Object.entries(env).map(([k, v]) => `$env:${k} = ${ps(v)}`),
     `$routerArgs = @(${opts.args.map(quoteArg).join(", ")})`,
     "$quickFailures = 0",

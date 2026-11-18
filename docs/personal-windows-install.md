@@ -20,6 +20,14 @@ read-only `npm audit --audit-level=low` gate enabled before installing a reviewe
 - Use your ordinary Windows account, not an elevated administrator shell. Have Git and a supported
   Node.js 24 installation available. Do not disable certificate validation, endpoint protection,
   Electron's sandbox, or Windows execution-policy protections to get past an error.
+- Use a fresh PowerShell window without Node preload flags, custom TLS trust stores or ambient
+  HTTP proxy settings. Node can disable HTTPS certificate validation with
+  `NODE_TLS_REJECT_UNAUTHORIZED=0`; `NODE_EXTRA_CA_CERTS`, `NODE_USE_SYSTEM_CA`, and
+  `NODE_USE_ENV_PROXY` can change upstream trust or routing. The personal CLI refuses unsafe
+  startup settings before installing or authenticating. Its Windows scheduled-task launcher
+  clears inherited Node/proxy/debug settings before starting the background router; the router
+  independently refuses unsafe direct starts. Inspect unexpected variables and resolve their
+  source before continuing. Do not solve a refusal by disabling a security check.
 - Save current work and fully quit Claude Desktop and existing Claude Code sessions.
 - If an older ClaudeRipple is installed, use its **known, original installation's own controls** to
   switch Claude to direct connection and uninstall its owned service first. Keep its data for now.
@@ -43,6 +51,20 @@ $PersonalSource = Join-Path $env:LOCALAPPDATA 'ClaudeRipplePersonalSource'
 $PersonalData = Join-Path $env:LOCALAPPDATA 'ClaudeRipplePersonalData'
 if ((Test-Path $PersonalSource) -or (Test-Path $PersonalData)) {
     throw 'One of the trial directories already exists. Inspect it before choosing a fresh directory.'
+}
+
+# Inspect the startup environment before running Node, without printing variable contents.
+$UnsafeSetVariables = @('NODE_OPTIONS','NODE_EXTRA_CA_CERTS','SSL_CERT_FILE','SSL_CERT_DIR',
+  'OPENSSL_CONF','SSLKEYLOGFILE','NODE_DEBUG','NODE_V8_COVERAGE',
+  'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY')
+foreach ($name in $UnsafeSetVariables) {
+  if ([Environment]::GetEnvironmentVariable($name, 'Process')) {
+    throw "Unsafe inherited Node/proxy setting: $name. Inspect and use a clean PowerShell environment."
+  }
+}
+if ($env:NODE_TLS_REJECT_UNAUTHORIZED -eq '0' -or
+    $env:NODE_USE_SYSTEM_CA -eq '1' -or $env:NODE_USE_ENV_PROXY -eq '1') {
+  throw 'Node TLS verification, CA selection or environment proxy settings are unsafe for this trial.'
 }
 
 $NodeMajor = & node -p "process.versions.node.split('.')[0]"

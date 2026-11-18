@@ -113,8 +113,9 @@ jobs:
       - name: Native Windows personal sensitive-data gates
         if: runner.os == 'Windows'
         # Synthetic secrets only: real CurrentUser DPAPI, cross-process reads, native-app
-        # config decoding, exact-origin refusal and verified installation/recovery identity.
-        run: node --test --test-reporter=tap packages/router/test/secret-storage.test.ts packages/app/test/config-secrets.test.ts packages/router/test/personal-policy.test.ts packages/router/test/personal-profile-smoke.test.ts packages/router/test/admin-personal-policy.test.ts packages/router/test/admin-credential-origin.test.ts packages/router/test/anthropic-local-auth.test.ts packages/cli/test/install-runtime.test.ts packages/cli/test/security-command.test.ts packages/cli/test/watchdog-port.test.ts packages/cli/test/personal-bootstrap.test.ts
+        # config decoding, exact-origin refusal, clean PowerShell/Node startup, and verified
+        # installation/recovery identity.
+        run: node --test --test-reporter=tap packages/router/test/secret-storage.test.ts packages/app/test/config-secrets.test.ts packages/router/test/personal-policy.test.ts packages/router/test/personal-profile-smoke.test.ts packages/router/test/admin-personal-policy.test.ts packages/router/test/admin-credential-origin.test.ts packages/router/test/anthropic-local-auth.test.ts packages/cli/test/install-runtime.test.ts packages/cli/test/security-command.test.ts packages/cli/test/watchdog-port.test.ts packages/cli/test/personal-bootstrap.test.ts packages/cli/test/personal-windows-node-env.test.ts
       - name: Hosted Windows scheduled-task installation and rollback boundary
         if: runner.os == 'Windows'
         env:
