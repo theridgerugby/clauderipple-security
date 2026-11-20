@@ -19,8 +19,8 @@ import { captureRouterCodeIdentity, sameRouterCodeIdentity, statusMatchesRuntime
 import { probe } from "../src/probe.ts";
 import { launcherProgram, writePaths } from "../src/registration.ts";
 import { runtime } from "../src/runtime.ts";
-import * as tasks from "../src/schtasks.ts";
-import { restartAgent, stopAgent } from "../src/supervisor.ts";
+import * as sourceTasks from "../src/schtasks.ts";
+import * as sourceSupervisor from "../src/supervisor.ts";
 import { normalizeConfig, validate } from "../../router/src/config.ts";
 import { readInstallationId } from "../../router/src/installation-id.ts";
 import { writePrivateFileAtomic, writeSecretJsonAtomic } from "../../router/src/locked-file.ts";
@@ -48,6 +48,19 @@ async function reservePorts(count: number): Promise<{ ports: number[]; release()
 test("hosted Windows installs, verifies, restarts and removes an isolated personal router task", {
   skip: !enabled, timeout: 9 * 60_000,
 }, async t => {
+  // Select the task renderer and lifecycle together with the runtime. A source renderer would
+  // otherwise launch the compiled router with a source-only watchdog helper, masking omissions
+  // in the filtered distribution. Keep these imports inside the enabled fixture.
+  const compiledAcceptance = process.env.CLAUDERIPPLE_ACCEPTANCE_COMPILED === "1";
+  const rt = compiledAcceptance
+    ? (await import(new URL("../../../dist/cli/src/runtime.js", import.meta.url).href)).runtime() as ReturnType<typeof runtime>
+    : runtime();
+  const tasks = compiledAcceptance
+    ? await import(new URL("../../../dist/cli/src/schtasks.js", import.meta.url).href) as typeof sourceTasks
+    : sourceTasks;
+  const { restartAgent, stopAgent } = compiledAcceptance
+    ? await import(new URL("../../../dist/cli/src/supervisor.js", import.meta.url).href) as typeof sourceSupervisor
+    : sourceSupervisor;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cr-native-personal-"));
   const home = path.join(root, "owner's 学生 data");
   const otherHome = path.join(root, "other installation");
@@ -101,7 +114,13 @@ test("hosted Windows installs, verifies, restarts and removes an isolated person
   const settingsBytes = Buffer.from('{"fixture":"client settings remain unchanged"}\n');
   writePrivateFileAtomic(settings, settingsBytes, false);
 
-  const rt = runtime();
+  // The filtered-build job uses exactly the compiled distribution described in the owner guide.
+  // This override is test-only and fixed to this checkout, never an arbitrary executable path.
+  if (compiledAcceptance) {
+    assert.ok(rt.cli.endsWith(`${path.sep}dist${path.sep}cli${path.sep}src${path.sep}index.js`));
+    assert.ok(rt.router.endsWith(`${path.sep}dist${path.sep}router${path.sep}src${path.sep}index.js`));
+    assert.ok(fs.existsSync(path.join(path.dirname(rt.cli), "watchdog-port.js")), "compiled watchdog helper must be present");
+  }
   writePaths(rt, home);
   recordAdminRuntime(home, rt);
   const expected: InstallRuntimeTarget = { version: VERSION, node: rt.node, router: rt.router,
@@ -111,7 +130,13 @@ test("hosted Windows installs, verifies, restarts and removes an isolated person
   const launcher = tasks.installAgent(launchOptions);
   registered = true;
   assert.equal(launcher, tasks.launcherScriptPath(home));
-  assert.deepEqual(launcherProgram(fs.readFileSync(launcher, "utf8")), [rt.node, rt.router]);
+  const launcherText = fs.readFileSync(launcher, "utf8");
+  assert.deepEqual(launcherProgram(launcherText), [rt.node, rt.router]);
+  const watchdogPath = path.join(path.dirname(rt.cli), `watchdog-port${path.extname(rt.cli)}`);
+  const watchdogLine = launcherText.split(/\r?\n/).find(line => line.trimStart().startsWith("$info.Arguments = "));
+  assert.equal(watchdogLine?.trim(), `$info.Arguments = '\"${watchdogPath.replace(/'/g, "''")}\"'`,
+    "the registered task must execute the selected runtime's exact watchdog helper");
+  if (compiledAcceptance) t.diagnostic("registered the filtered build's compiled router, watchdog and lifecycle modules");
   const definition = tasks.existingTaskDefinition(task) as { runLevel: number; logonType: number; arguments: string };
   assert.equal(definition.runLevel, 0, "task requests limited privileges");
   assert.equal(definition.logonType, 3, "task runs as the interactive user");

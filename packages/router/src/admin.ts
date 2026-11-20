@@ -1191,7 +1191,7 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
   for (const [name, p] of Object.entries(providers)) if (p.reachable === false) problems.push(`provider:${name}`);
   return {
     version: deps.version,
-    autoUpdate: deps.autoUpdater?.status() ?? { enabled: autoUpdateEnabled(cfg), running: false },
+    autoUpdate: personalMode(cfg) ? { enabled: false, running: false } : deps.autoUpdater?.status() ?? { enabled: autoUpdateEnabled(cfg), running: false },
     processPriority: deps.processPriority?.() ?? processPriorityState(cfg.processPriority),
     readiness: { ready: problems.length === 0, problems },
     // The errors themselves, so a reader can name the line to fix rather than only "config".
@@ -2349,13 +2349,15 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; tlsPort: nu
   const adminToken = ensureAdminToken(adminHome);
   const identity = ensureAdminTlsIdentity(adminHome);
   const instanceId = crypto.randomBytes(16).toString("hex");
-  // Standalone admin users share the same coordinator, but only the router entry starts scheduling.
-  const updater = deps.autoUpdater ?? new AutoUpdater({
-    home: homeDir(), version: deps.version, enabled: () => autoUpdateEnabled(deps.config()),
+  // Constructing a disabled coordinator can still reconcile and rewrite a legacy update journal.
+  // Personal Desktop never installs updates here, so do not create or read that coordinator.
+  const updater = personalMode(deps.config()) ? undefined : deps.autoUpdater ?? new AutoUpdater({
+    home: adminHome, version: deps.version, enabled: () => autoUpdateEnabled(deps.config()),
     activity: () => ({ inFlight: 0 }), log: deps.log,
     runCli: deps.runCli ?? runCli, startCliDetached: deps.startCliDetached ?? startCliDetached,
   });
-  deps = { ...deps, autoUpdater: updater };
+  if (updater) deps.autoUpdater = updater;
+  else delete deps.autoUpdater;
   // Every dataset the catalog loads or fetches also prices the requests from then on (prices.ts).
   const scores = new ModelScoreCatalog({ home: homeDir(), warn: message => deps.log.warn(message), onDataset: setAaPriceDataset, ...(deps.modelScoresFetch ? { fetch: deps.modelScoresFetch } : {}) });
   // The configured port stays liveness-only for older watchdogs. Privileged requests and the
@@ -2516,8 +2518,15 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; tlsPort: nu
         sendJson(res, 200, { ok: true, origin, action: request.action });
         return;
       }
-      if (personalMode(deps.config()) && /^\/api\/(?:remote(?:\/|-|$)|phone-|settings-jobs)/.test(pathname)) {
-        sendJson(res, 403, { error: "remote access is disabled in the personal sensitive-data profile" });
+      // The personal fork has one job: Desktop's model picker with explicitly configured API
+      // keys. Hiding legacy controls in the UI does not remove their authenticated capabilities.
+      // Refuse these families before parsing a body, discovering accounts, or invoking a CLI.
+      if (personalMode(deps.config()) && (
+        /^\/api\/(?:update|power|remote|phone|mod|codex|settings-jobs)(?:\/|-|$)/.test(pathname) ||
+        /^\/api\/(?:compact-pick|agent-title|status-mod)(?:\/|$)/.test(pathname) ||
+        /^\/api\/(?:claude|chatgpt|google)-(?:login|logout|oauth|accounts)(?:\/|$)/.test(pathname)
+      )) {
+        sendJson(res, 403, { error: "this capability is disabled in the personal Desktop profile" });
         return;
       }
       if (pathname === "/api/settings-jobs" || pathname === "/api/settings-jobs/claim" || pathname === "/api/settings-jobs/result") {
@@ -3585,10 +3594,14 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; tlsPort: nu
           sendJson(res, 502, { error: "could not check for updates", output: r.output.slice(-2000) });
           return;
         }
-        updater.observe(check);
-        const running = updater.running();
+        updater?.observe(check);
+        const running = updater?.running() ?? false;
         if (method === "GET") {
           sendJson(res, 200, { ...check, running });
+          return;
+        }
+        if (!updater) {
+          sendJson(res, 403, { error: "Executable updates are unavailable in this personal runtime" });
           return;
         }
         if (check.kind !== "script" && check.kind !== "npm") {

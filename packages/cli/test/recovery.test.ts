@@ -352,23 +352,19 @@ test("doctor authenticates over TLS using an existing recovery fixture home", as
   assert.deepEqual(calls, [], "a healthy TLS diagnostic must not repair or start a service");
 });
 
-test("doctor: a phone host whose Claude Code CLI has no login is named, with the fix (issue #71)", async () => {
+test("personal doctor does not scan a phone host or inspect a separate Claude Code login", async () => {
   const { home, proxyUrl, settings } = scratch({ listen: { host: "127.0.0.1", port: 18791 } });
   fs.writeFileSync(settings, JSON.stringify({ env: { HTTPS_PROXY: proxyUrl } }));
   const { ops } = fakeSupervisor({});
-  const noLogin = async () => ({ ok: false, where: "no Claude Code login" });
-  const d = await doctor({ home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), remoteHostInstalled: () => true, claudeLogin: noLogin });
-  const problem = d.problems.find((p) => p.code === "cli-not-logged-in");
-  assert.ok(problem, d.problems.map((p) => p.code).join());
-  assert.match(problem!.message, /\/login/);
-
-  // With a login of its own, nothing is said about one.
-  const loggedIn = await doctor({ home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), remoteHostInstalled: () => true, claudeLogin: async () => ({ ok: true, where: "the macOS keychain" }) });
-  assert.equal(loggedIn.problems.some((p) => p.code === "cli-not-logged-in"), false);
-
-  // Without the phone host, a missing CLI login is nobody's problem.
-  const noHost = await doctor({ home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"), remoteHostInstalled: () => false, claudeLogin: noLogin });
-  assert.equal(noHost.problems.some((p) => p.code === "cli-not-logged-in"), false);
+  let inspected = 0;
+  let loginReads = 0;
+  const d = await doctor({ home, version: "1.0.0", supervisor: ops, routerStatus: answering("1.0.0"),
+    remoteHostInstalled: () => { inspected++; return true; },
+    claudeLogin: async () => { loginReads++; return { ok: false, where: "no separate login" }; },
+  });
+  assert.equal(d.problems.some((p) => p.code === "cli-not-logged-in"), false);
+  assert.equal(inspected, 0);
+  assert.equal(loginReads, 0);
 });
 
 // ---- repair ------------------------------------------------------------------------------

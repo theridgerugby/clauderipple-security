@@ -22,6 +22,7 @@ import type { SupervisorOps, SupervisorView } from "./registration.ts";
 import { sameHome } from "./ownership.ts";
 import { captureRouterCodeIdentity, sameRouterCodeIdentity, statusMatchesRuntime, type InstallRuntimeTarget } from "./install-runtime.ts";
 import { runtime } from "./runtime.ts";
+import { personalMode } from "../../router/src/personal-policy.ts";
 
 export type Mode = "ripple" | "direct" | "mixed";
 export type ProxyState = "ripple" | "none" | "other";
@@ -209,7 +210,9 @@ async function snapshot(deps: RecoveryDeps): Promise<Snapshot> {
   if (mode === "mixed") add("mixed-mode", `Claude Code ${cli.proxy === "ripple" ? "goes" : "does not go"} through ClaudeRipple, Claude Desktop ${desktop.proxy === "ripple" ? "does" : "does not"}.`);
   // The phone host starts Claude Code through the Agent SDK and passes no credential of its own, so
   // without a login of the CLI's own every turn fails at once (issue #71).
-  if (await (deps.remoteHostInstalled ?? remoteHostInstalled)()) {
+  // Personal Desktop recovery needs neither a phone-host scan nor a separate Claude Code
+  // login/keychain inspection. The existing Desktop subscription stays owned by Desktop.
+  if (!personalMode(cfg) && await (deps.remoteHostInstalled ?? remoteHostInstalled)()) {
     const login = await (deps.claudeLogin ?? (() => claudeCodeLogin()))();
     if (!login.ok) add("cli-not-logged-in", `Claude Code has no login on this computer, so the phone host's sessions fail at once. ${claudeLoginHint(claudeBinary())}`);
   }

@@ -168,14 +168,15 @@ test("personal admin refuses Google subscription login and code submission befor
   for (const resource of ["/api/google-login", "/api/google-login/code"]) {
     const response = await server.post(resource, { code: "synthetic-unused-code" });
     assert.equal(response.status, 403);
-    assert.match(await response.text(), /Google subscription sign-in is disabled in personal mode/i);
+    assert.match(await response.text(), /disabled in the personal Desktop profile/i);
   }
-  const state = await (await adminFetch(`${server.origin}/api/google-login`)).json() as { running: boolean; url: string | null };
-  assert.equal(state.running, false);
-  assert.equal(state.url, null);
-  // Explicit cancellation remains available for cleanup; no session was created by either POST.
+  // The complete subscription-login surface stays unavailable; no OAuth session or browser
+  // launch was created by either POST, and status/cancel cannot reopen that integration.
+  const state = await adminFetch(`${server.origin}/api/google-login`);
+  assert.equal(state.status, 403);
+  assert.match(await state.text(), /disabled in the personal Desktop profile/i);
   const cancelled = await server.post("/api/google-login/cancel", {});
-  assert.equal(cancelled.status, 200);
+  assert.equal(cancelled.status, 403);
   await cancelled.arrayBuffer();
   assert.equal(browserCalls, 0);
   assert.equal(transportCalls, 0);

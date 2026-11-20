@@ -79,7 +79,7 @@ async function runtime(t: TestContext, personal = true) {
     get(): Config { return current; }
   }
   class SyntheticAgents {
-    constructor(_options: unknown) {}
+    constructor(_options: unknown) { record("agents.construct"); }
     regenerate(): void { write("agents.regenerate", files.worker); }
     changed(): boolean { record("agents.changed"); return true; }
   }
@@ -99,7 +99,7 @@ async function runtime(t: TestContext, personal = true) {
   class SyntheticIngress {
     stats = statistics();
     rows = {settled:async () => {}};
-    constructor(_options: unknown) {}
+    constructor(_options: unknown) { record("ingress.construct"); }
     async listen(): Promise<number> { record("ingress.listen"); return 18793; }
     async drain(): Promise<void> { record("ingress.drain"); }
   }
@@ -112,12 +112,12 @@ async function runtime(t: TestContext, personal = true) {
     status(): unknown[] { return []; }
   }
   class SyntheticUpdater {
-    constructor(_options: unknown) {}
+    constructor(_options: unknown) { record("updater.construct"); }
     start(): void { record("updater.start"); }
     stop(): void { record("updater.stop"); }
   }
   class SyntheticAwake {
-    constructor(_options: unknown) {}
+    constructor(_options: unknown) { record("awake.construct"); }
     async start(): Promise<void> { record("awake.start"); }
     stop(): void { record("awake.stop"); }
     beforeExit(): void { record("awake.beforeExit"); }
@@ -125,7 +125,7 @@ async function runtime(t: TestContext, personal = true) {
     status(): unknown { return {}; }
   }
   class SyntheticTether {
-    constructor(_options: unknown) {}
+    constructor(_options: unknown) { record("tether.construct"); }
     start(): void { record("tether.start"); }
     stop(): void { record("tether.stop"); }
     kick(): void { record("tether.kick"); }
@@ -208,6 +208,7 @@ async function runtime(t: TestContext, personal = true) {
 }
 
 const unrelatedWork = new Set([
+  "agents.construct","ingress.construct","updater.construct","awake.construct","tether.construct",
   "agents.regenerate","agents.changed","compact.sync","codex.enabled","codex.write","codex.follow",
   "ingress.listen","remote.construct","remote.cleanup","remote.reconcile","remote.assetsRead","remote.sync",
   "chatgpt.quota","chatgpt.catalogue","awake.start","awake.refresh","tether.start","tether.kick","tether.pin",
@@ -251,6 +252,19 @@ test("personal administrative power/remote callbacks do not start hidden service
   assert.deepEqual(run.snapshot(),run.before);
 });
 
+test("personal shutdown drains the proxy without constructing or running unrelated cleanup controllers", async t => {
+  const run = await runtime(t);
+  assert.equal(run.admin.power, undefined);
+  assert.equal(run.admin.autoUpdater, undefined);
+  run.admin.shutdown?.();
+  await flush();
+  assert.ok(run.calls.includes("proxy.drain"));
+  assert.deepEqual(run.calls.filter(call => unrelatedWork.has(call)), []);
+  for (const name of ["ingress.drain", "updater.stop", "awake.stop", "awake.beforeExit", "tether.stop"])
+    assert.equal(run.calls.includes(name), false, name);
+  assert.deepEqual(run.snapshot(), run.before);
+});
+
 test("an empty fail-closed personal configuration does not remove or rewrite existing client state", async t => {
   const run=await runtime(t);
   run.reload({...structuredClone(DEFAULTS),security:{mode:"personal",approvedOrigins:[]}},["synthetic config validation failure"]);
@@ -262,7 +276,8 @@ test("an empty fail-closed personal configuration does not remove or rewrite exi
 
 test("generic mode positive control retains integration writers, worker/context maintenance and optional services", async t => {
   const run=await runtime(t,false);
-  for (const call of ["agents.regenerate","compact.sync","codex.enabled","codex.write","codex.follow","ingress.listen",
+  for (const call of ["agents.construct","ingress.construct","updater.construct","awake.construct","tether.construct",
+    "agents.regenerate","compact.sync","codex.enabled","codex.write","codex.follow","ingress.listen",
     "remote.cleanup","chatgpt.quota","chatgpt.catalogue","awake.start","tether.start","updater.start"])
     assert.ok(run.calls.includes(call),call);
   assert.notDeepEqual(run.snapshot(),run.before,"the instrumented writers must actually change fixture bytes when invoked");

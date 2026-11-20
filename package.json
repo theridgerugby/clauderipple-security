@@ -19,8 +19,12 @@
     "relay:build": "node --disable-warning=ExperimentalWarning packages/remote/relay/build-web.ts",
     "relay:dev": "npm run relay:build && wrangler dev -c packages/remote/relay/wrangler.toml --ip 127.0.0.1 --port 8798",
     "relay:deploy": "npm run relay:build && wrangler deploy -c packages/remote/relay/wrangler.toml",
-    "test": "node --test packages/router/test/*.test.ts packages/cli/test/*.test.ts test/mod/*.test.ts packages/remote/test/*.test.ts packages/app/test/*.test.ts",
-    "test:ci": "node --test --test-reporter=tap packages/router/test/*.test.ts packages/cli/test/*.test.ts test/mod/*.test.ts packages/remote/test/*.test.ts packages/app/test/*.test.ts",
+    "test": "node --test packages/router/test/*.test.ts packages/cli/test/*.test.ts test/mod/*.test.ts packages/remote/test/*.test.ts packages/app/test/*.test.ts test/package/*.test.mjs",
+    "test:ci": "node --test --test-reporter=tap packages/router/test/*.test.ts packages/cli/test/*.test.ts test/mod/*.test.ts packages/remote/test/*.test.ts packages/app/test/*.test.ts test/package/*.test.mjs",
+    "test:package": "node --test test/package/*.test.mjs",
+    "check:personal": "node scripts/check-personal-install.mjs",
+    "build:personal": "node scripts/build-personal.mjs",
+    "smoke:personal": "node scripts/smoke-personal-install.mjs",
     "cli": "node packages/cli/src/index.ts",
     "prepack": "node scripts/build-npm.mjs",
     "build": "node scripts/build-npm.mjs"
@@ -83,12 +87,6 @@
     "url": "https://github.com/PBJ-2/clauderipple/issues"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "0.3.283",
-    "qrcode-generator": "2.0.4",
-    "tweetnacl": "1.0.3",
-    "web-push": "3.6.7",
-    "ws": "8.21.3",
-    "zod": "4.6.7",
     "proper-lockfile": "^4.1.2",
     "undici": "7.30.2"
   }

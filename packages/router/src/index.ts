@@ -28,7 +28,7 @@ import { Proxy } from "./proxy.ts";
 import { adoptNewClaudeModels, backfillContextWindows, measureUnsettledModels, startAdmin, type AdminDeps } from "./admin.ts";
 import { loadModelCatalog } from "./catalog.ts";
 import { openRequestLog } from "./requestlog.ts";
-import { OpenAiIngress } from "./ingress/server.ts";
+import { OpenAiIngress, type IngressStats } from "./ingress/server.ts";
 import { ObservedClaudeCodeAuth } from "./providers/anthropic-observed.ts";
 import { VERSION } from "./version.ts";
 import { allowLongSilences } from "./providers/retry.ts";
@@ -72,7 +72,8 @@ let stopCodexCache: (() => void) | undefined;
  * catches a terminal `login`/`logout` the router was never told about. It notifies the tunnels
  * itself, so a remote host never keeps workers after any of them.
  */
-const agentSync = new PinnedAgentSync({
+let agentSync: PinnedAgentSync | undefined;
+const genericAgentSync = (): PinnedAgentSync => agentSync ??= new PinnedAgentSync({
   config: () => store.get(),
   home,
   dir: defaultAgentDir(),
@@ -98,7 +99,7 @@ const store = new ConfigStore(undefined, (c, errors) => {
   // idle when they change can miss the change; the second touch is for it (`RETOUCH_AFTER_MS`).
   // The stored accounts are part of the derivation (each gets a pinned worker per model), and the
   // regeneration notifies the tunnels, so a remote host gets the rewritten files too.
-  if (!personalMode(c)) agentSync.regenerate(c);
+  if (!personalMode(c)) genericAgentSync().regenerate(c);
   try { if (!personalMode(c)) syncContextWindows(c); }
   catch (e) { (log ?? console).warn(`compact windows: ${(e as Error).message}`); }
   // A hand edit of `remote.hosts` takes effect; the agent files were already offered to the tunnels.
@@ -151,7 +152,7 @@ const health = new UpstreamHealth(
     hold.close();
     // The self-exit writes the rows still waiting for a login's email first (each waits at most 500 ms).
     setTimeout(() => {
-      void Promise.all([proxy.rows.settled(), ingress.rows.settled()]).finally(() => process.exit(EXIT_UPSTREAM_UNREACHABLE));
+      void Promise.all([proxy.rows.settled(), ingress?.rows.settled()]).finally(() => process.exit(EXIT_UPSTREAM_UNREACHABLE));
     }, 100);
   },
   {
@@ -166,13 +167,18 @@ const observedClaudeCodeAuth = new ObservedClaudeCodeAuth(path.join(home, "claud
 allowLongSilences();
 const proxy = new Proxy({ config: () => store.get(), log, certs, health, home, requests, observedClaudeCodeAuth, hold });
 reconcileProxyConfig = config => { proxy.resetDesktopSelection(); proxy.reconcileConfig(config); };
-const ingress = new OpenAiIngress({ config: () => store.get(), log, requests, home, observedClaudeCodeAuth, chatgpt: (name) => proxy.chatgptForCodex(name), claudeIdentity: (headers) => proxy.claudeIdentity.identifyWith(headers), hold });
+// Personal Desktop only uses the proxy. Constructing these optional integrations can still
+// read old account/power/update state even when their listeners and timers are never started.
+const genericRuntime = !personalMode(cfg0);
+const ingress = genericRuntime ? new OpenAiIngress({ config: () => store.get(), log, requests, home, observedClaudeCodeAuth, chatgpt: (name) => proxy.chatgptForCodex(name), claudeIdentity: (headers) => proxy.claudeIdentity.identifyWith(headers), hold }) : undefined;
+const inactiveIngressStats: Readonly<IngressStats> = Object.freeze({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 });
+const ingressStats = (): Readonly<IngressStats> => ingress?.stats ?? inactiveIngressStats;
 
 // Lid-closed awake and hotspot failover (macOS and Windows; no-ops elsewhere, off until configured).
 // They read Claude's activity from the two servers' counters. Started after listen(), below.
 const activity = (): Activity => {
   const p = proxy.stats;
-  const i = ingress.stats;
+  const i = ingressStats();
   const latest = (a?: number, b?: number): number | undefined => (a === undefined ? b : b === undefined ? a : Math.max(a, b));
   const lastStartedAt = latest(p.lastMessageStartedAt, i.lastMessageStartedAt);
   const lastEndedAt = latest(p.lastMessageEndedAt, i.lastMessageEndedAt);
@@ -182,19 +188,19 @@ const activity = (): Activity => {
     ...(lastEndedAt !== undefined ? { lastEndedAt } : {}),
   };
 };
-const autoUpdater = new AutoUpdater({
+const autoUpdater = genericRuntime ? new AutoUpdater({
   home, version: VERSION, enabled: () => autoUpdateEnabled(store.get()),
   activity, log, runCli, startCliDetached,
-});
-const awake = new AwakeController({
+}) : undefined;
+const awake = genericRuntime ? new AwakeController({
   platform: process.platform,
   run: powerRunner,
   settings: () => awakeSettings(store.get()),
   activity,
   journalFile: path.join(home, "awake.json"),
   log: { info: (m) => log!.info(m), warn: (m) => log!.warn(m) },
-});
-const tether = new TetherController({
+}) : undefined;
+const tether = genericRuntime ? new TetherController({
   platform: process.platform,
   run: powerRunner,
   settings: () => tetherSettings(store.get()),
@@ -202,7 +208,7 @@ const tether = new TetherController({
   log: { info: (m) => log!.info(m), warn: (m) => log!.warn(m) },
   hold,
   stateFile: path.join(home, "tether.json"),
-});
+}) : undefined;
 
 process.on("uncaughtException", (e) => log!.error(`uncaught ${(e as Error).stack ?? e}`));
 process.on("unhandledRejection", (e) => log!.error(`unhandled ${(e as Error)?.stack ?? e}`));
@@ -215,7 +221,7 @@ let draining = false;
  * without a router restart or a config save. Never throws (the next check retries), and the tunnels
  * are notified by the sync itself.
  */
-const regenerateAgents = (): void => { if (!personalMode(store.get())) agentSync.regenerate(); };
+const regenerateAgents = (): void => { if (!personalMode(store.get())) genericAgentSync().regenerate(); };
 
 /**
  * Stop accepting, let in-flight model calls finish, exit. Idempotent.
@@ -228,23 +234,23 @@ const regenerateAgents = (): void => { if (!personalMode(store.get())) agentSync
 function beginDrain(reason: string): void {
   if (draining) return;
   draining = true;
-  autoUpdater.stop();
-  log!.info(`${reason}: draining, proxy=${proxy.stats.messagesInFlight} ingress=${ingress.stats.messagesInFlight} model calls`);
+  autoUpdater?.stop();
+  log!.info(`${reason}: draining, proxy=${proxy.stats.messagesInFlight} ingress=${ingressStats().messagesInFlight} model calls`);
   let lastReported = -1;
   // Each drain() closes the shared hold gate first (hold.ts): a call held for a network switch is
   // let go, refused with the retryable 503 like any new call, and waited for.
   void Promise.all([
     proxy.drain(DRAIN_MS, () => {}),
-    ingress.drain(DRAIN_MS, () => {}),
+    ingress?.drain(DRAIN_MS, () => {}),
   ])
     .then(() => {
-      const left = proxy.stats.messagesInFlight + ingress.stats.messagesInFlight;
+      const left = proxy.stats.messagesInFlight + ingressStats().messagesInFlight;
       if (left !== lastReported) log!.info(`drain complete, exiting (model calls still open: ${left})`);
       // The sleep bit is left as it is (awake.ts header): the successor reconciles it within one
       // tick, and the journal carries the working window across the restart.
-      tether.stop();
-      awake.stop();
-      awake.beforeExit();
+      tether?.stop();
+      awake?.stop();
+      awake?.beforeExit();
       setTimeout(() => process.exit(0), 200).unref();
     });
 }
@@ -258,7 +264,7 @@ process.on("exit", () => tunnels?.stopAll());
 const statsEvery = 5 * 60 * 1000;
 setInterval(() => {
   const s = proxy.stats;
-  const oi = ingress.stats;
+  const oi = ingressStats();
   log!.info(`stats proxy=${s.started}/${s.completed}/${s.failed} inFlight=${s.inFlight} ingress=${oi.started}/${oi.completed}/${oi.failed} inFlight=${oi.inFlight} consecutiveUpstreamFailures=${health.consecutiveFailures}`);
 }, statsEvery).unref();
 
@@ -277,7 +283,7 @@ proxy
     // Personal Desktop only needs the forward proxy and authenticated settings UI. Do not
     // bind an unrelated API listener, inspect remote processes, or probe other providers.
     if (!personalMode(c)) {
-      const ingressPort = await ingress.listen();
+      const ingressPort = await ingress?.listen();
       log!.info(`clauderipple OpenAI ingress listening on 127.0.0.1:${ingressPort}`);
       // Reverse tunnels to remote (SSH) hosts, after listen() so their far end has something to reach.
       const assets = () => readLocalAssets({ home, agentDir: defaultAgentDir() });
@@ -308,9 +314,9 @@ proxy
     // costs three small file reads and moves only when a worker file would change, so this is the
     // cheapest place to notice. Same cadence as the compact-window sync above.
     const watchAccounts = () => {
-      if (draining || personalMode(store.get()) || !agentSync.changed()) return;
+      if (draining || personalMode(store.get()) || !genericAgentSync().changed()) return;
       log!.info("agent files: the stored accounts changed; regenerating the pinned workers");
-      agentSync.regenerate();
+      genericAgentSync().regenerate();
     };
     if (!personalMode(c)) setInterval(() => { syncCompact(); watchAccounts(); }, 15_000).unref();
     // Captured once, at start: this process's installation id and pid are what it reports and what
@@ -326,7 +332,7 @@ proxy
       pid: process.pid,
     };
     const adminDeps: AdminDeps = {
-      autoUpdater,
+      ...(autoUpdater ? { autoUpdater } : {}),
       instance,
       agentsChanged: regenerateAgents,
       config: () => store.get(),
@@ -364,7 +370,7 @@ proxy
       observedClaudeCodeAuth,
       claudeLocalAuthorization: (allow) => {
         proxy.setClaudeLocalAuthorization(allow);
-        ingress.setClaudeLocalAuthorization(allow);
+        ingress?.setClaudeLocalAuthorization(allow);
       },
       claudeUsage: () => proxy.claudeUsage.snapshot(),
       claudeModels: () => proxy.claudeModels.list(),
@@ -383,7 +389,7 @@ proxy
           return tunnels?.status() ?? [];
         },
       },
-      power: {
+      ...(awake && tether ? { power: {
         status: () => ({ platform: powerPlatform(process.platform), awake: awake.status(), tether: tether.status() }),
         pin: (on) => { if (!personalMode(store.get())) tether.setPin(on); },
         poke: async () => {
@@ -391,15 +397,15 @@ proxy
           tether.kick();
           await awake.refresh();
         },
-      },
+      } } : {}),
     };
     const admin = await startAdmin(adminDeps);
     log!.info(`clauderipple admin GUI on http://127.0.0.1:${admin.port}/`);
     if (!personalMode(store.get())) {
       // Generic mode's first awake tick reconciles its previous power state.
-      void awake.start().catch((e: Error) => log!.warn(`awake: ${e.message}`));
-      tether.start();
-      if (!draining) autoUpdater.start();
+      void awake?.start().catch((e: Error) => log!.warn(`awake: ${e.message}`));
+      tether?.start();
+      if (!draining) autoUpdater?.start();
     }
     setImmediate(premintLeaves);
     // A minute in, once start-up traffic has settled: first the catalogue's context windows are

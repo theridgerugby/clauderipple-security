@@ -153,6 +153,43 @@ test("valid current and future API routes retain methods without granting an arb
   assert.ok(requests.every(request => request.path === "/api/future-endpoint?cursor=a%2Fb" && request.body === undefined));
 });
 
+test("personal Desktop IPC refuses unrelated account, update and client operations before credential reads or transport", async () => {
+  let lookups = 0, sends = 0;
+  const handle = createAdminRequestHandler({ ownedContents: () => owner,
+    admin: () => { lookups++; throw new Error("must not read transport configuration"); }, home: "/unused",
+    transport: () => { sends++; throw new Error("must not send"); } });
+  const paths = [
+    "/api/update", "/api/update?force=1", "/api/power", "/api/power/setup",
+    "/api/remote", "/api/remote/reload", "/api/phone/status", "/api/phone/pairing", "/api/phone-inbox/claim",
+    "/api/mod/approval", "/api/mod-settings", "/api/mod-options", "/api/settings-jobs/result",
+    "/api/codex", "/api/shutdown", "/api/compact-pick", "/api/agent-title", "/api/status-mod",
+    ...["claude", "chatgpt", "google"].flatMap(provider => [
+      `/api/${provider}-login`, `/api/${provider}-logout`, `/api/${provider}-oauth`,
+      `/api/${provider}-oauth/code`, `/api/${provider}-accounts`, `/api/${provider}-accounts/current`,
+    ]),
+  ];
+  for (const path of paths) for (const method of ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]) {
+    const response = await handle(event, { path, method });
+    assert.equal(response.status, 403, `${method} ${path}`);
+    assert.match(text(response), /personal Desktop dashboard/);
+  }
+  assert.equal(lookups, 0);
+  assert.equal(sends, 0);
+});
+
+test("personal Desktop status, provider keys, native picker and privacy approvals retain their IPC routes", async () => {
+  const requests: string[] = [];
+  const handle = fixture(async (_base, path) => { requests.push(path); return new Response(null, { status: 204 }); });
+  const paths = [
+    "/api/status", "/api/limits", "/api/config", "/api/presets", "/api/claude-models",
+    "/api/context-windows", "/api/effort-levels", "/api/providers/probe", "/api/providers/measure",
+    "/api/credentials/clear-cooldown", "/api/picker", "/api/security-policy",
+    "/api/requests", "/api/requests/summary", "/api/logs",
+  ];
+  for (const path of paths) assert.equal((await handle(event, { path, method: "POST" })).status, 204, path);
+  assert.deepEqual(requests, paths);
+});
+
 test("request strings are bounded by UTF-8 bytes before transport, including the exact boundary", async () => {
   let calls = 0;
   const handle = fixture(async () => { calls++; return new Response(null, { status: 204 }); });

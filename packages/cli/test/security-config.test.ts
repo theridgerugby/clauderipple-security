@@ -76,7 +76,16 @@ test("personal command gate blocks activation and executable updates, retaining 
   for (const argv of [["remote"], ["remote", "install"], ["remote", "add", "host"], ["remote", "pair"], ["remote", "refresh"], ["update"], ["update", "--force"], ["google-login"], ["google-login", "--manual"]]) {
     assert.throws(() => assertPersonalCliCommandAllowed(config, argv), /disabled in personal mode/);
   }
+  for (const argv of [["login"], ["claude-login"], ["claude-login", "--setup-token"],
+    ["codex", "on"], ["mod", "on"], ["agent-title", "on"],
+    ["tray", "--login", "on"], ["tray", "-login", "on"], ["tray", "-login", "init"], ["tray", "--login=init"]]) {
+    assert.throws(() => assertPersonalCliCommandAllowed(config, argv), /disabled in personal mode/);
+  }
   for (const argv of [["remote", "status"], ["remote", "hosts"], ["remote", "uninstall"], ["remote", "remove", "host"], ["update", "--check"], ["uninstall"], ["google-logout"], ["security", "revoke-origin", "https://example.test"]]) {
+    assert.doesNotThrow(() => assertPersonalCliCommandAllowed(config, argv));
+  }
+  for (const argv of [["ui"], ["tray"], ["doctor", "--json"], ["repair"], ["direct", "on"],
+    ["codex", "off"], ["mod", "off"], ["agent-title", "off"], ["claude-logout"], ["logout"], ["tray", "--login", "off"]]) {
     assert.doesNotThrow(() => assertPersonalCliCommandAllowed(config, argv));
   }
 });

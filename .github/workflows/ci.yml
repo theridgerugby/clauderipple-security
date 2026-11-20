@@ -66,8 +66,43 @@ jobs:
       # the native PowerShell ACL/DPAPI startup deadline under hosted runner contention.
       # Every file still runs on one of four independent shards; within-file tests still
       # exercise genuine eight-process credential races and fail-closed deadlines.
-      - run: node --test --test-reporter=tap --test-concurrency=1 --test-shard=${{ matrix.shard }}/4 packages/router/test/*.test.ts packages/cli/test/*.test.ts test/mod/*.test.ts packages/remote/test/*.test.ts packages/app/test/*.test.ts
+      - run: node --test --test-reporter=tap --test-concurrency=1 --test-shard=${{ matrix.shard }}/4 packages/router/test/*.test.ts packages/cli/test/*.test.ts test/mod/*.test.ts packages/remote/test/*.test.ts packages/app/test/*.test.ts test/package/*.test.mjs
       - run: npm run build
+
+  # A full developer install could hide an accidental runtime dependency. Exercise the exact
+  # filtered owner install in a separate clean checkout, including the compiled Windows service.
+  personal-install:
+    name: personal install (Windows, compiled runtime)
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install only the personal root and native setup workspace
+        run: npm ci --workspace @clauderipple/app --include-workspace-root --ignore-scripts
+      - name: Verify the exact personal dependency inventory
+        run: node scripts/check-personal-install.mjs
+      - name: Build the precompiled personal runtime
+        run: npm run build:personal
+      - name: Check package isolation and staged build safety
+        run: node --test --test-reporter=tap test/package/*.test.mjs
+      - name: Exercise the compiled recovery entrypoint without private state
+        run: node dist/cli/src/index.js --help
+      - name: Smoke the compiled runtime with empty disposable state
+        run: npm run smoke:personal
+      - name: Hosted Windows compiled installation and rollback boundary
+        env:
+          CLAUDERIPPLE_WINDOWS_SERVICE_ACCEPTANCE: "1"
+          CLAUDERIPPLE_ACCEPTANCE_COMPILED: "1"
+        # Synthetic local data, an exact disposable task and no trust-store/account edits.
+        run: node --test --test-reporter=tap packages/cli/test/windows-personal-install.test.ts
 
   # Collect real desktop-boundary evidence even while a platform's full suite is
   # still running or has failed. Both job matrices remain mandatory release gates.
@@ -129,3 +164,5 @@ jobs:
         # runtime, not a real Claude Desktop account or the owner's current graphical build.
         # Every case also runs in the full four-shard suite.
         run: node --test --test-reporter=tap --test-concurrency=1 packages/cli/test/desktop-activation.test.ts packages/cli/test/desktop-config-preservation.test.ts packages/cli/test/desktop-install-settings.test.ts packages/router/test/desktop-policy.test.ts packages/router/test/desktop-runtime.test.ts packages/router/test/desktop-selection.test.ts packages/router/test/personal-google-desktop.test.ts packages/router/test/picker.test.ts packages/router/test/proxy-bootstrap.test.ts packages/router/test/proxy-desktop-transport.test.ts packages/router/test/ui-desktop-profile.test.ts
+      - name: Native Windows on-demand setup and subscription-surface isolation
+        run: node --test --test-reporter=tap --test-concurrency=1 packages/app/test/on-demand-lifecycle.test.ts packages/app/test/admin-ipc.test.ts packages/cli/test/personal-dashboard-launch.test.ts packages/cli/test/security-config.test.ts packages/router/test/admin-personal-policy.test.ts packages/cli/test/settings.test.ts

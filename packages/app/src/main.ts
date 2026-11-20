@@ -1,5 +1,5 @@
-// ClaudeRipple menu-bar app. The router owns the logic and the admin API on 127.0.0.1; this shell
-// adds a tray icon with live health, the dashboard window, and shortcuts for restart / logs / login.
+// Personal setup/recovery dashboard. The router owns day-to-day Desktop model routing; this
+// process runs only while its window is open and never registers itself to start at login.
 //
 // The window draws the dashboard from the app's own copy of packages/ui (protocol.ts) and only asks
 // the router for data, so it opens with the router dead — which is when it is needed: on
@@ -14,6 +14,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { fetchAdmin, readPrivateConfigPorts } from "./admin-auth";
+import { execBounded } from "./bounded-exec";
 import { ADMIN_IPC_CHANNEL, createAdminRequestHandler } from "./admin-ipc";
 import { adminViewFromArgs, adminUserDataPath, prepareAdminUserDataPath } from "./admin-window";
 import { configurePermissions, trustedIpcSender } from "./security";
@@ -920,7 +921,6 @@ function uiLang(): keyof typeof STRINGS {
 }
 
 async function poll(): Promise<void> {
-  const before = answered;
   try {
     const res = await fetchAdmin(adminUrl(), "/api/status", home, { signal: AbortSignal.timeout(3000) });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -929,28 +929,13 @@ async function poll(): Promise<void> {
     downSince = null;
     downNotified = false;
     answered = true;
-    void handleRouterUpdate(last).catch((error: unknown) => console.error(`update notification: ${error}`));
-    void reconcileRouter(last);
-    power = await readPower();
   } catch (e) {
     last = null;
     power = null;
     lastError = (e as Error).message;
     answered = false;
     downSince ??= Date.now();
-    // An update or one of the window's own actions restarts the router on purpose; that is not
-    // the outage the notification is for. Neither is the direct mode, where the router being off
-    // is the point — so doctor is asked first, and once per outage. With the window on screen the
-    // user is already looking at the same news.
-    if (shouldNotifyDown({ downForMs: Date.now() - downSince, graceMs: DOWN_NOTIFY_AFTER_MS, alreadyNotified: downNotified, updating: updating || Date.now() < routerUpdateUntil, busy: !!rec.busy || windowVisible(), mode: rec.doctor?.mode ?? null })) {
-      downNotified = true;
-      void refreshDoctor().then(() => {
-        if (!last && rec.doctor?.mode !== "direct") notifyDown();
-      });
-    }
   }
-  // Up or down changed: what doctor said about the rest (direct, mixed) may have changed with it.
-  if (before !== null && before !== answered && !rec.busy) void refreshDoctor();
   // Claude quit or reopened by hand has applied the change as surely as the button would.
   if (rec.restartClaude && !rec.busy && Date.now() - restartCheckedAt >= RESTART_CHECK_MS) {
     restartCheckedAt = Date.now();
@@ -1214,15 +1199,31 @@ let restartCheckedAt = 0;
 /** How often a pending "reopen Claude" step asks whether Claude was reopened some other way. */
 const RESTART_CHECK_MS = 15_000;
 let doctorRun: Promise<void> | null = null;
+let doctorAbort: AbortController | null = null;
 
 /** One `doctor` at a time; callers that arrive while one runs share it. */
 function refreshDoctor(): Promise<void> {
-  doctorRun ??= (async () => {
-    const r = await runCliResult(["doctor", "--json"], DOCTOR_TIMEOUT_MS);
-    const d = parseJsonOutput<Doctor>(r.stdout);
+  if (doctorRun) return doctorRun;
+  const abort = new AbortController();
+  doctorAbort = abort;
+  doctorRun = (async () => {
+    const { node, env, cli } = cliPaths();
+    // This read-only diagnostic owns a process tree. Closing setup or reaching its deadline
+    // must also end any outstanding supervisor probe, without touching repair/direct workers.
+    const stdout = await execBounded(node, [cli, "doctor", "--json"], {
+      env: { ...process.env, ...env, CLAUDERIPPLE_HOME: home },
+      timeoutMs: DOCTOR_TIMEOUT_MS, windowsHide: true, maxBuffer: 1024 * 1024, signal: abort.signal,
+    });
+    const d = parseJsonOutput<Doctor>(stdout);
     rec.doctor = d;
     rec.doctorFailed = !d;
-  })().finally(() => {
+  })().catch(() => {
+    // Missing/broken CLI state must leave the offline recovery window usable. No raw config,
+    // subprocess command line, or credential-bearing error belongs in a background log.
+    rec.doctor = null;
+    rec.doctorFailed = true;
+  }).finally(() => {
+    if (doctorAbort === abort) doctorAbort = null;
     doctorRun = null;
     render();
   });
@@ -1257,7 +1258,9 @@ function bridgeState(): AppState {
     busy: rec.busy,
     result: rec.result,
     restartClaude: rec.restartClaude,
-    loginItem: loginItemOn(),
+    // null means this on-demand window has no login-item feature. A missing configuration
+    // cannot accidentally opt the app into background residency or offer to enable it.
+    loginItem: null,
     appVersion: trayVersion(),
     platform: process.platform,
   };
@@ -1289,8 +1292,8 @@ function showWindow(view?: string): void {
   );
 }
 
-type BridgeAction = Action | "refresh" | "login-item" | "logs";
-const BRIDGE_ACTIONS = new Set<string>(["repair", "direct-on", "direct-off", "restart-claude", "refresh", "login-item", "logs"]);
+type BridgeAction = Action | "refresh" | "logs";
+const BRIDGE_ACTIONS = new Set<string>(["repair", "direct-on", "direct-off", "restart-claude", "refresh", "logs"]);
 
 /** Only our own page may drive the bridge, never something it navigated to. */
 function fromOurPage(event: Electron.IpcMainInvokeEvent): boolean {
@@ -1328,10 +1331,6 @@ async function act(id: BridgeAction): Promise<void> {
       render();
       await Promise.all([poll(), refreshDoctor()]);
       rec.busy = null;
-      render();
-      return;
-    case "login-item":
-      await setLoginItem(true);
       render();
       return;
   }
@@ -1846,16 +1845,14 @@ function uiRoot(): string {
 app.enableSandbox();
 registerScheme();
 
-// One tray. `clauderipple tray` run while one is up started a second icon (Windows VM,
-// 2026-10-10); the newcomer now leaves at once with code 0, which the CLI reads as "already running".
+// One setup window per installation. Opening it again brings the existing window forward.
 // The override is a profile base, not a shared lock: every installation still gets its own home hash.
 const profileDirectory = prepareAdminUserDataPath(adminUserDataPath(process.env.CLAUDERIPPLE_APP_USER_DATA ?? app.getPath("appData"), home));
 app.setPath("userData", profileDirectory);
 app.setPath("sessionData", profileDirectory);
 if (!app.requestSingleInstanceLock()) app.exit(0);
 
-// Opening the app again (Finder, Start menu, `clauderipple tray`) while it already runs in the
-// tray is someone looking for it: bring the window forward rather than nothing.
+// Opening the app again (Finder, Start menu, `clauderipple tray`) brings its window forward.
 app.on("second-instance", (_event, argv) => {
   if (app.isReady()) showWindow(adminViewFromArgs(argv) ?? (last ? undefined : "health"));
 });
@@ -1867,41 +1864,38 @@ app.on("activate", () => {
 });
 
 app.whenReady().then(async () => {
+  // A marked legacy background launch has no work. Do not unregister anything here: old
+  // login entries can belong to another installation, and ownership requires explicit review.
+  // Some old Windows entries have no marker; they open this ordinary, closeable window once.
+  const requestedAdminView = adminViewFromArgs(process.argv);
+  if (process.argv.includes("--at-login") && process.env.CLAUDERIPPLE_APP_SHOW !== "1" && !requestedAdminView) {
+    app.quit();
+    return;
+  }
   L = STRINGS[uiLang()];
   configurePermissions(session.defaultSession, () => mainWindow()?.webContents ?? null);
   handleScheme(uiRoot());
   wireBridge();
-  // Without this, Windows attributes our notifications to "Electron" instead of ClaudeRipple.
+  // Give the taskbar window its own application identity.
   if (process.platform === "win32") app.setAppUserModelId("com.clauderipple.app");
   // macOS keeps its application menu (it owns Cmd-Q and the edit shortcuts); elsewhere it is noise.
   if (!isMac) Menu.setApplicationMenu(null);
   if (isMac) app.dock?.hide();
-  tray = new Tray(icon("down"));
-  tray.on("click", () => tray?.popUpContextMenu());
-  render();
-  // First-run default and migration from bare Electron both use the npm tray's LaunchAgent. It runs
-  // the CLI, so the icon is drawn first and the menu's checkbox follows when it answers.
-  void initializeLoginItem().then(render, (error: unknown) => console.error(`ClaudeRipple login item initialization failed: ${error}`));
-  // Opened from its icon (the CLI sets this; a login launch does not): show the window, not just a
-  // tray icon the person may never notice. Taken out so an update's relaunch does not inherit it.
-  const requestedAdminView = adminViewFromArgs(process.argv);
-  if (process.env.CLAUDERIPPLE_APP_SHOW === "1" || requestedAdminView) {
-    delete process.env.CLAUDERIPPLE_APP_SHOW;
-    showWindow(requestedAdminView ?? "health");
-  }
+  delete process.env.CLAUDERIPPLE_APP_SHOW;
+  // Lifecycle is intentionally unconditional. Missing, encrypted or invalid configuration
+  // still opens recovery without a config read deciding whether to run a background app.
+  showWindow(requestedAdminView ?? "health");
   void poll();
-  setInterval(() => void poll(), POLL_MS);
-  // What the health poll cannot see (the direct mode, a supervisor gone missing) comes from doctor.
-  setTimeout(() => void refreshDoctor(), 3_000);
-  setInterval(() => void (!rec.busy && refreshDoctor()), DOCTOR_EVERY_MS);
-  setInterval(() => void (windowVisible() && !rec.busy && refreshDoctor()), DOCTOR_WHILE_OPEN_MS);
-  if (needsSetup()) void promptForSetup();
-  // Not at the very start: a tray opened at login shares the first minute with everything else.
-  setTimeout(() => void checkForUpdate(), 60_000);
-  setInterval(() => void checkForUpdate(), UPDATE_CHECK_MS);
 });
 
-// A tray-only app owns no windows; without this Electron would quit the moment a dialog closes.
+// Closing setup ends Electron only. The independently supervised router and Claude Desktop
+// continue untouched; no stop, direct-switch, proxy edit or account action runs here.
+app.on("before-quit", () => {
+  // This signal belongs only to the read-only doctor child started by this window. Leaving
+  // its timeout behind when Electron exits could otherwise orphan a stalled diagnostic.
+  // Explicit repair/direct workers, the router, and user processes are never targeted.
+  doctorAbort?.abort();
+});
 app.on("window-all-closed", () => {
-  /* keep running in the tray */
+  app.quit();
 });

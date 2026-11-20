@@ -9,7 +9,7 @@ import { ConfigStore, DEFAULTS, type Config } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
 import { RequestLog } from "../src/requestlog.ts";
 
-test("personal update checks remain read-only and both automatic and manual executable updates are refused", async (t) => {
+test("personal update routes refuse registry discovery and executable updates without changing configuration", async (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-auto-api-"));
   const oldHome = process.env.CLAUDERIPPLE_HOME;
   const oldSettings = process.env.CLAUDE_SETTINGS_PATH;
@@ -25,12 +25,15 @@ test("personal update checks remain read-only and both automatic and manual exec
   const store = new ConfigStore(configFile);
   const log = new Logger(null, 1_000_000, 1, false);
   const check = { current: "1.0.0", latest: "1.1.0", newer: true, kind: "npm" };
-  let launches = 0;
-  const runCli = async () => ({ ok: true, output: JSON.stringify(check) });
+  let launches = 0, discoveries = 0, coordinatorCalls = 0;
+  const runCli = async () => { discoveries++; return { ok: true, output: JSON.stringify(check) }; };
   const updater = new AutoUpdater({ home, version: "1.0.0", enabled: () => autoUpdateEnabled(store.get()),
     activity: () => ({ inFlight: 0 }), log, runCli,
     startCliDetached: () => { launches++; }, alive: () => false,
   });
+  for (const method of ["observe", "running", "install", "status"] as const) {
+    t.mock.method(updater, method, () => { coordinatorCalls++; throw new Error("personal admin must not consult an updater"); });
+  }
   const admin = await startAdmin({ config: () => store.get(), configFile, log,
     stats: () => ({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 }),
     health: () => 0, version: "1.0.0", requests: new RequestLog(path.join(home, "requests.jsonl")), runCli, autoUpdater: updater,
@@ -45,12 +48,18 @@ test("personal update checks remain read-only and both automatic and manual exec
     const updatedConfig = (await (await fetch(`${url}/api/config`)).json()) as Config;
     const put = await fetch(`${url}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...updatedConfig, autoUpdate: false }) });
     assert.equal(put.status, 200); assert.equal((await status()).enabled, false);
-    await fetch(`${url}/api/update`);
-    assert.equal((await status()).available, "1.1.0");
-    // No admin path may replace the reviewed fork with an upstream executable.
-    const requests = await Promise.all([fetch(`${url}/api/update`, { method: "POST" }), fetch(`${url}/api/update`, { method: "POST" })]);
-    assert.deepEqual(requests.map((r) => r.status).sort(), [403, 403]);
-    assert.equal(launches, 0); assert.equal((await status()).running, false);
+    const beforeUpdateRequests = fs.readFileSync(configFile);
+    // The complete update surface is unavailable, including read-only registry discovery.
+    const requests = await Promise.all([fetch(`${url}/api/update`), fetch(`${url}/api/update`, { method: "POST" }), fetch(`${url}/api/update`, { method: "POST" })]);
+    assert.deepEqual(requests.map((r) => r.status), [403, 403, 403]);
+    for (const response of requests) assert.match(await response.text(), /disabled in the personal Desktop profile/i);
+    assert.equal(discoveries, 0);
+    assert.equal(launches, 0);
+    assert.equal(coordinatorCalls, 0);
+    assert.deepEqual(fs.readFileSync(configFile), beforeUpdateRequests);
+    assert.equal(fs.existsSync(path.join(home, "auto-update.json")), false);
+    assert.equal((await status()).available, undefined);
+    assert.equal((await status()).running, false);
     assert.equal((await status()).lastUpdatedFrom, undefined, "intent is not a completion notice");
     const successor = new AutoUpdater({ home, version: "1.1.0", enabled: () => false, activity: () => ({ inFlight: 0 }), log, runCli, startCliDetached: () => assert.fail("must not launch") });
     assert.equal(successor.status().lastUpdatedFrom, undefined);

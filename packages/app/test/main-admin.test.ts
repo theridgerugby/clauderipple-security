@@ -16,7 +16,7 @@ const functions = ts.transpileModule(selected.map(statement => statement.getText
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
 }).outputText;
 
-test("real tray status, power, and update actions all use the main-process credential", async t => {
+test("dashboard status and isolated legacy helpers use the main-process credential", async t => {
   const requests: { path?: string; method?: string; token?: string | string[] }[] = [];
   const { home, token, base } = await adminTlsFixture(t, (req, res) => {
     requests.push({ path: req.url, method: req.method, token: req.headers[ADMIN_TOKEN_HEADER] });
@@ -32,10 +32,14 @@ test("real tray status, power, and update actions all use the main-process crede
     const refreshDoctor = async () => {}, Notification = { isSupported: () => false };
     const showFailure = async () => { throw new Error('unexpected failure dialog'); };
     ${functions}
-    return { poll, changePower, installUpdate, status: () => last };
+    return { poll, readPower, changePower, installUpdate, status: () => last };
   `);
   const tray = create({ fetchAdmin, home, base });
   await tray.poll();
+  assert.deepEqual(requests.map(({ path: route, method }) => [route, method]), [["/api/status", "GET"]], "personal status refresh must not perform power/update/reconciliation work");
+  // Legacy helpers are tested only in isolation; the production personal dashboard never
+  // wires them into boot, timers, tray menus or renderer actions.
+  await tray.readPower();
   await tray.changePower({ tether: { enabled: false } });
   await tray.installUpdate("fixture-version");
   assert.deepEqual(requests.map(({ path: route, method }) => [route, method]), [

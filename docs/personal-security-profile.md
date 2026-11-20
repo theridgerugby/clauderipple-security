@@ -3,8 +3,10 @@
 This fork targets one person's Windows Claude Desktop, installed from a fixed reviewed source
 commit. Its use case is a separate Google AI Studio API model in the Code tab's model menu,
 alongside the unchanged native Claude subscription choices. It adds no separate chat interface.
-The source-only install omits the Electron distribution packager and its unpatched
-`picomatch` ReDoS dependency chain. Signed and unsigned release commands refuse to run.
+The filtered source install omits Remote/Agent SDK/relay dependencies and the Electron distribution
+packager with its unpatched `picomatch` ReDoS dependency chain. It precompiles the personal runtime;
+the setup window is on demand and exits when closed. Signed and unsigned release commands refuse
+to run. See [the footprint measurements and their limits](personal-footprint.md).
 Use [the source installation guide](personal-windows-install.md), including its native acceptance
 checks. The full commit and observed hosted test results are recorded in
 [the Windows personal fork PR](https://github.com/theridgerugby/clauderipple-security/pull/2). A matching package
@@ -22,11 +24,13 @@ version alone does not identify this fork.
 | Prompt text or old worker settings override the selected extra | Personal Desktop routing ignores prompt markers and legacy classifier, web-reader, compaction and worker-ladder overrides. A selected extra uses its explicit primary; saved route fallbacks cannot silently choose another model. | `desktop-policy.test.ts`, personal Google local-TLS regressions |
 | An ordinary setup action silently rewrites Claude defaults | Personal installation adds only owned proxy environment keys, leaving native model slots and context limits unchanged. Ordinary API-key/checklist saves never synchronize client settings, and cannot toggle picker activation. The personal UI gates unrelated configuration pages and their mutation handlers. | `desktop-install-settings.test.ts`, `admin-personal-policy.test.ts`, personal UI tests |
 | Disconnecting loses unrelated settings edited while connected | Removal preserves current non-proxy settings in a clean native entry when necessary, without overwriting the previous native document. The direct-connection snapshot records the actual restored entry; concurrent edits cause a conservative refusal. | `desktop-config-preservation.test.ts`, `recovery.test.ts` |
-| Hidden features keep running after the UI is simplified | Personal startup omits remote tunnels, an OpenAI-compatible listener, executable-update checks, power/network controllers, model/effort probes and Claude/Codex setting maintenance. | `desktop-runtime.test.ts` executes the entry body with synthetic external boundaries |
+| Hidden features keep running after the UI is simplified | Personal router startup omits unused integration construction and maintenance loops. The native setup app creates no tray, login item or recurring main-process poll/update tasks, and exits when its last window closes without stopping the router. | `desktop-runtime.test.ts`, `on-demand-lifecycle.test.ts`, native Electron lifecycle harness |
+| Hidden setup endpoints alter account state or launch unrelated work | The native IPC bridge and authenticated personal admin API refuse account/OAuth, updater, Remote/phone, mod, Codex and power routes. Production CLI subscription sign-in and unrelated integration activation are refused; explicit owned cleanup stays available. | `admin-ipc.test.ts`, `admin-personal-policy.test.ts`, `security-config.test.ts`, native app harness |
 | Claude cookies or custom client headers copied to a model vendor | Personal routed requests carry only a small allowlist of non-secret protocol headers. Configured provider credentials are added separately. Proxy hop-by-hop and response session-setting headers are removed. | `personal-profile-smoke.test.ts`, `proxy-headers.test.ts` |
 | Provider secrets or interception CA signing keys copied off disk | Windows-owned provider/config secrets and interception CA/leaf private keys use CurrentUser DPAPI after owner/ACL/descriptor validation. No plaintext master key or migration backup. | `secret-storage.test.ts`, `config-secrets.test.ts`, `certificate-storage.test.ts`, native Windows runs |
 | Extra borrowed Claude token retention | Observed client credentials remain in bounded process memory. Durable consent generations stop stale refreshes from restoring a locally revoked login. | `anthropic-observed.test.ts`, `anthropic-local-auth.test.ts`, `claude-oauth.test.ts` |
-| Research reflected into diagnostic logs | Personal request history and diagnostics remain in bounded RAM, with no echo or new disk history/dump. Windows Task Scheduler and the tray launcher no longer redirect child stdout/stderr to files. | `personal-policy.test.ts`, reflected-error TLS smoke, `schtasks-definition.test.ts`, native scheduled-task check |
+| Research reflected into diagnostic logs | Personal request history and diagnostics remain in bounded RAM, with no echo or new disk history/dump. Windows Task Scheduler and the actual Electron launcher do not redirect raw child stdout/stderr to files; inherited Electron logging and SSL-key-log sinks are removed from the child environment. | `personal-policy.test.ts`, reflected-error TLS smoke, `schtasks-definition.test.ts`, `personal-dashboard-launch.test.ts`, native scheduled-task check |
+| Rapid setup/recovery overwrites an earlier backup | Each changed settings write creates an exclusive, unique backup; a failure preserves restoration evidence and leaves the client unchanged. Backups are never silently pruned. | `settings.test.ts`, `direct-ownership.test.ts` |
 | Ambient Node settings weaken upstream TLS or redirect traffic | The Windows task launcher removes Node preloads, additional trust stores, insecure TLS overrides, proxy variables and debug sinks before any Node child. The router refuses unsafe direct starts; sensitive CLI commands refuse unsafe startup environments without showing their values. | `personal-windows-node-env.test.ts`, hosted Windows task run |
 | Local port takeover | Native administration uses the installation's exact TLS identity and generation plus its private capability. Unknown responders and stale instances do not receive authenticated traffic. | Existing native Electron and admin transport harnesses |
 | Old process mistaken for reviewed code | Startup captures a runtime source fingerprint. Install/recovery and picker activation verify the runtime before changing client proxy settings. | `install-runtime.test.ts`, `install-runtime-tls.test.ts`, recovery and picker activation tests |
@@ -40,6 +44,12 @@ Remote/SSH/phone activation, Grok CLI credential reuse, Google Antigravity subsc
 and request-body debug dumps are disabled. The personal Google form accepts an AI Studio API key
 without offering subscription sign-in. Related low-level legacy libraries
 retain isolated regression tests; those tests do not create a production bypass.
+
+The setup window does one bounded diagnostic when opened. It does not inspect an unrelated phone
+host or a separate Claude Code login. Closing it cancels only its owned read-only diagnostic;
+explicit repair/direct actions and the independently supervised router are not process-kill targets.
+Older unmarked setup-app startup entries are not automatically removed. Review the precise old
+entry before disabling it, as described in the installation guide.
 
 Desktop picker activation also trusts the interception CA for the current Windows user and
 applies an app-wide proxy setting. Both steps require explicit activation; adding a provider

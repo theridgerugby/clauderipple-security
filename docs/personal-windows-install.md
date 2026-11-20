@@ -18,6 +18,8 @@ read-only `npm audit --audit-level=low` gate enabled before installing a reviewe
 The intended everyday interface is **Claude Desktop's Code tab**. Add a distinct Google model
 entry to that menu and keep the existing Claude choices on their normal subscription path.
 The local dashboard is for setup, privacy approvals and recovery; it is not a second chat app.
+It opens on demand and exits when its last window closes. The independent local router and
+its Windows watchdog remain available for Desktop; closing setup does not disconnect either model.
 This guide does not require terminal Claude Code use, a university gateway, or replacing native
 Opus/Sonnet/Haiku choices. First installation still uses PowerShell to run the reviewed source.
 
@@ -54,6 +56,11 @@ its signature and the official application remain unchanged.
   A stopped but still registered task owned by another home is not a free slot for this installation.
   Do not kill an unknown process, delete an unidentified scheduled task, or add `--force` to resolve
   an ownership error.
+- Earlier setup apps could have registered themselves as Windows startup apps. This version
+  creates no setup-app startup entry and does not delete old entries automatically. Review the
+  exact executable and arguments in Windows Startup Apps or the old installation's controls;
+  disable only the confirmed old setup entry. Keep the independently owned router task enabled.
+  An old unmarked entry can otherwise open the new setup window at login; closing it exits.
 - Do this before running the new CLI against an old data home. On Windows, reading an existing
   configuration can migrate its secret storage to DPAPI, which older builds cannot read.
 - The instructions below use a fresh data home and source directory under your account. They do
@@ -107,28 +114,47 @@ Keep this shell open. In a later shell, set the same `CLAUDERIPPLE_HOME` and ret
 source directory before using the commands below. Always call the checkout's explicit CLI path;
 a globally installed `clauderipple` command may belong to a different build.
 
-## 2. Build the native dashboard without installing a service yet
+## 2. Build the small precompiled personal runtime without installing a service yet
 
 ```powershell
-npm.cmd ci --ignore-scripts
+npm.cmd ci --workspace @clauderipple/app --include-workspace-root --ignore-scripts
 if ($LASTEXITCODE -ne 0) { throw 'Locked dependency installation failed.' }
+
+node scripts/check-personal-install.mjs
+if ($LASTEXITCODE -ne 0) { throw 'Personal dependency inventory failed verification.' }
+
+npm.cmd audit --audit-level=low
+if ($LASTEXITCODE -ne 0) { throw 'Dependency audit failed. Review the advisory before installing.' }
 
 # Explicitly download the locked Electron runtime. This is the reviewed package's downloader,
 # not an upstream ClaudeRipple installer. A skipped or blocked download must be resolved first.
 node node_modules/electron/install.js
 if ($LASTEXITCODE -ne 0) { throw 'Electron runtime download failed.' }
 
-npm.cmd run build
+npm.cmd run build:personal
 if ($LASTEXITCODE -ne 0) { throw 'Build failed. Do not install a partially built checkout.' }
 
-node packages/cli/src/index.ts --help
+node dist/cli/src/index.js --help
 if ($LASTEXITCODE -ne 0) { throw 'The checkout CLI could not run.' }
+
+npm.cmd run smoke:personal
+if ($LASTEXITCODE -ne 0) { throw 'Compiled runtime smoke checks failed. Do not install this checkout.' }
 ```
 
-The first two commands fetch dependencies and Electron, so they require internet access. A
+The dependency install and explicit Electron download require internet access. A
 corporate registry, custom Electron mirror, or download-blocking policy needs its own review.
 Do not respond to download or TLS errors by turning verification off. Keep the checkout in place:
 the scheduled task and dashboard launcher will reference these files.
+
+Use the workspace filter exactly as shown. The unfiltered developer install also brings in
+Remote-host and Cloudflare tooling that this Desktop-only install never uses. The inventory
+check refuses those extra packages, missing dependencies and lock-version mismatches. The
+personal build compiles only the router/recovery dependency closure and the native setup app;
+it omits the Remote host/web, full mod and installer bundles. It verifies staged output before
+replacing a recognized generated `dist` directory. Do not rebuild or replace a live installation:
+restore direct connection and stop its owned service first, or use a fresh reviewed checkout.
+The locked Electron runtime still occupies disk space, but is not kept running after setup closes.
+See [the measured footprint](personal-footprint.md) for the precise scope of size/memory numbers.
 
 ## 3. Approve the destinations you actually intend to use
 
@@ -139,7 +165,7 @@ Approval does not grant an API subscription or waive the provider's data-use ter
 To retain normal Claude/Opus traffic and allow the installer's credential-free connection probe:
 
 ```powershell
-node packages/cli/src/index.ts security approve-origin https://api.anthropic.com --acknowledge-data-sharing
+node dist/cli/src/index.js security approve-origin https://api.anthropic.com --acknowledge-data-sharing
 if ($LASTEXITCODE -ne 0) { throw 'Native Claude destination approval failed.' }
 ```
 
@@ -147,14 +173,14 @@ The Desktop picker also needs its native application origin. Approve it explicit
 turning on picker mode:
 
 ```powershell
-node packages/cli/src/index.ts security approve-origin https://claude.ai --acknowledge-data-sharing
+node dist/cli/src/index.js security approve-origin https://claude.ai --acknowledge-data-sharing
 if ($LASTEXITCODE -ne 0) { throw 'Claude Desktop destination approval failed.' }
 ```
 
 For your Google AI Studio API key, approve Google's API origin separately:
 
 ```powershell
-node packages/cli/src/index.ts security approve-origin https://generativelanguage.googleapis.com --acknowledge-data-sharing
+node dist/cli/src/index.js security approve-origin https://generativelanguage.googleapis.com --acknowledge-data-sharing
 if ($LASTEXITCODE -ne 0) { throw 'Google API destination approval failed.' }
 ```
 
@@ -168,13 +194,13 @@ Do not broadly approve domains in response to a failed login.
 ## 4. Install and open the native dashboard
 
 ```powershell
-node packages/cli/src/index.ts install
+node dist/cli/src/index.js install
 if ($LASTEXITCODE -ne 0) { throw 'Installation is incomplete. Read the refusal before retrying.' }
 
-node packages/cli/src/index.ts doctor --json
+node dist/cli/src/index.js doctor --json
 if ($LASTEXITCODE -ne 0) { throw 'The diagnostic command failed.' }
 
-node packages/cli/src/index.ts ui
+node dist/cli/src/index.js ui
 if ($LASTEXITCODE -ne 0) { throw 'The native dashboard could not open.' }
 ```
 
@@ -195,11 +221,11 @@ Before picker activation, the setup changes are:
 | Area | Change |
 | --- | --- |
 | Personal data directory | Owner-private local keys/state; DPAPI-protected provider-credential/config storage, bound to this Windows user |
-| Diagnostics | Bounded RAM history while the router runs; headless task and tray subprocesses do not write their stdout/stderr to durable log files |
+| Diagnostics | Bounded RAM history while the router runs; headless task and setup subprocesses do not write raw stdout/stderr to durable log files |
 | Task Scheduler | An owned `ClaudeRippleRouter` logon task, using the interactive user with limited privileges |
 | Claude Code settings | Owned `HTTPS_PROXY` and `NODE_EXTRA_CA_CERTS` entries, with a backup and ownership record; native model defaults and global context limits are left unchanged |
-| Local listeners | Loopback proxy plus authenticated, certificate-pinned local admin TLS; no privileged browser dashboard |
-| App launcher | Per-user shortcuts that open this source build's native dashboard |
+| Local listeners | Loopback proxy, authenticated certificate-pinned admin TLS, and a separate liveness-only HTTP listener for the watchdog; no privileged browser dashboard |
+| App launcher | Per-user shortcuts that open this build's on-demand native setup window; no new setup-app login item or tray residency |
 
 The task uses a child PowerShell invocation with a process-specific execution-policy argument;
 it does not require changing the system's permanent execution policy. The dedicated admin CA is
@@ -224,6 +250,9 @@ user's** root store only when you explicitly enable the Desktop picker in the ne
 5. Fully quit Claude Desktop, including its tray process, and reopen it. Open a new **Code**
    session and inspect the model menu. The expected result is unchanged native Claude entries
    plus the selected Gemini entry. Chat and Cowork menus are not targets for added models.
+6. Close the setup window. It should disappear from running apps while the router task remains
+   running. Send one harmless native turn, one Google turn, then select native Claude again.
+   Reopen setup only to change a key/model, review an approval, inspect status or recover.
 
 The picker adapter edits only recognised Code surfaces in the native model catalogue. If a
 Desktop update changes that catalogue to an unknown format, it leaves the response unchanged.
@@ -253,7 +282,7 @@ check. The adapter does not store session cookies or fabricate a Google account 
 For source-command activation, use the same reviewed checkout and data home:
 
 ```powershell
-node packages/cli/src/index.ts picker on
+node dist/cli/src/index.js picker on
 if ($LASTEXITCODE -ne 0) { throw 'Desktop picker activation failed. Read the refusal before retrying.' }
 ```
 
@@ -315,7 +344,7 @@ Production request/diagnostic history is RAM-only in this mode; do not expect it
 To leave the proxy path even if the router is down:
 
 ```powershell
-node packages/cli/src/index.ts direct on
+node dist/cli/src/index.js direct on
 ```
 
 Read its result, then fully quit/reopen Claude Desktop and start new Code sessions. This removes

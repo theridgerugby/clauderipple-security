@@ -7,6 +7,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { homeDir } from "../../router/src/config.ts";
 import { withFileLock, writeJsonAtomic } from "../../router/src/locked-file.ts";
 import { type HomeClaims, type OwnerStore, type SlotClaims, claimedElsewhere, claimsOf, ownersPath, readOwners, setClaims } from "./owners.ts";
@@ -43,8 +44,10 @@ function readSettings(file: string): Record<string, unknown> {
 function backup(file: string): string | null {
   if (!fs.existsSync(file)) return null;
   const ts = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15);
-  const b = `${file}.bak-clauderipple-${ts}`;
-  fs.copyFileSync(file, b);
+  // Two explicit setup/recovery actions in the same second must retain both pre-write copies.
+  // Never overwrite an earlier backup (or follow a pre-existing destination symlink).
+  const b = `${file}.bak-clauderipple-${ts}-${randomUUID()}`;
+  fs.copyFileSync(file, b, fs.constants.COPYFILE_EXCL);
   return b;
 }
 

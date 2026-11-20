@@ -4,6 +4,7 @@ import type { IpcMainInvokeEvent, WebContents } from "electron";
 import { fetchAdmin } from "./admin-auth.ts";
 import { validateAdminPath } from "./admin-transport-client.ts";
 import { trustedIpcSender } from "./security.ts";
+import { personalDesktopAdminRequestAllowed } from "./personal-admin-policy.ts";
 
 export const ADMIN_IPC_CHANNEL = "ripple-app:admin-request";
 export const ADMIN_IPC_REQUEST_LIMIT = 2 * 1024 * 1024;
@@ -88,6 +89,7 @@ export function createAdminRequestHandler(options: Options): (event: Sender, val
     let request: ReturnType<typeof validate>;
     try { request = validate(value); }
     catch (error) { return error instanceof RangeError ? failure(413, "admin request body too large") : failure(400, "invalid admin request"); }
+    if (!personalDesktopAdminRequestAllowed(request.path)) return failure(403, "This operation is unavailable in the personal Desktop dashboard");
     if (active >= ADMIN_IPC_CONCURRENCY) return failure(429, "too many admin requests");
     active++;
     const abort = new AbortController();

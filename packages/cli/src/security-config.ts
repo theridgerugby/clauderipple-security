@@ -45,6 +45,17 @@ export function updateApprovedOrigin(options: {
 /** Cleanup stays available. Data-sharing activation and replacement executable downloads do not. */
 export function assertPersonalCliCommandAllowed(config: Pick<Config, "security">, argv: string[]): void {
   if (!personalMode(config)) return;
+  if (argv[0] === "login" || argv[0] === "claude-login") {
+    throw new Error("Separate subscription sign-in is disabled in personal mode; keep the existing Claude Desktop login and configure a Google AI Studio API key in Providers");
+  }
+  if (["codex", "mod", "agent-title"].includes(argv[0] ?? "") && argv[1] === "on") {
+    throw new Error("Non-Desktop integration activation is disabled in personal mode; explicit cleanup remains available");
+  }
+  if (argv[0] === "tray" && argv.some((arg, index) =>
+    arg === "--login=on" || arg === "--login=init" ||
+    ((arg === "--login" || arg === "-login") && (argv[index + 1] === "on" || argv[index + 1] === "init")))) {
+    throw new Error("Setup-window autostart is disabled in personal mode; open it on demand");
+  }
   if (argv[0] === "google-login") {
     throw new Error("Google subscription sign-in is disabled in personal mode; use a Google API-key provider or your approved university API endpoint");
   }

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ConfigStore, normalizeConfig } from "../src/config.ts";
-import { writeSecretJsonAtomic } from "../src/locked-file.ts";
+import { writeJsonAtomic, writeSecretJsonAtomic } from "../src/locked-file.ts";
 import { readPrivateFile } from "../src/private-file.ts";
 import { configurePersonalEgressPolicy } from "../src/personal-policy.ts";
 import { egressFetch } from "../src/egress.ts";
@@ -16,7 +16,7 @@ import type { AdminDeps } from "../src/admin.ts";
 const ORIGIN = "https://school.example.test";
 const SECRET = "SYNTHETIC-KEY-ADMIN-PERSONAL-NOT-REAL";
 
-async function fixture(t: TestContext, controls: Pick<AdminDeps, "runCli" | "picker"> = {}) {
+async function fixture(t: TestContext, controls: Pick<AdminDeps, "runCli" | "picker" | "startCliDetached" | "claudeCodeCredentialReaders" | "claudeIdentity" | "chatgpt" | "google" | "power" | "remote" | "agentsChanged"> = {}, beforeStart?: (home: string) => void) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-personal-admin-"));
   const previous = { home: process.env.CLAUDERIPPLE_HOME, settings: process.env.CLAUDE_SETTINGS_PATH };
   process.env.CLAUDERIPPLE_HOME = home;
@@ -35,6 +35,7 @@ async function fixture(t: TestContext, controls: Pick<AdminDeps, "runCli" | "pic
     if (previous.settings === undefined) delete process.env.CLAUDE_SETTINGS_PATH; else process.env.CLAUDE_SETTINGS_PATH = previous.settings;
     fs.rmSync(home, { recursive: true, force: true });
   });
+  beforeStart?.(home);
   server = await startAdmin({
     config: () => store.get(), configFile: file, agentDir: path.join(home, "agents"),
     log: new Logger(null, 1_000_000, 1, false, true),
@@ -50,6 +51,71 @@ async function fixture(t: TestContext, controls: Pick<AdminDeps, "runCli" | "pic
   });
   return { base, file, store, send, settings: process.env.CLAUDE_SETTINGS_PATH! };
 }
+
+test("personal admin leaves legacy update state untouched and reports the coordinator disabled", async t => {
+  let journal = "", original = Buffer.alloc(0);
+  const f = await fixture(t, {}, home => {
+    journal = path.join(home, "auto-update.json");
+    // The old constructor reconciles a completed version immediately, even without start().
+    writeJsonAtomic(journal, { failures: {}, pending: { from: "0.0.1", to: "synthetic-personal-policy", at: 1 } });
+    original = fs.readFileSync(journal);
+  });
+  const response = await adminFetch(f.base + "/api/status");
+  assert.equal(response.status, 200);
+  const status = await response.json() as { autoUpdate: { enabled: boolean; running: boolean } };
+  assert.deepEqual(status.autoUpdate, { enabled: false, running: false });
+  assert.deepEqual(fs.readFileSync(journal), original);
+});
+
+test("personal admin refuses hidden account, updater and integration capabilities before side effects", async t => {
+  const calls: string[] = [];
+  const forbidden = (label: string): never => { calls.push(label); throw new Error(`forbidden fixture capability: ${label}`); };
+  const f = await fixture(t, {
+    runCli: async () => forbidden("cli"), startCliDetached: () => forbidden("spawn"),
+    claudeCodeCredentialReaders: { keychain: () => forbidden("keychain"), credentialsFile: () => forbidden("credentialsFile") },
+    claudeIdentity: async () => forbidden("claudeIdentity"),
+    chatgpt: () => forbidden("chatgptAccounts"), google: () => forbidden("googleAccounts"),
+    agentsChanged: () => forbidden("agents"),
+    power: { status: () => forbidden("power.status"), pin: () => forbidden("power.pin"), poke: async () => forbidden("power.poke") },
+    remote: { status: () => forbidden("remote.status"), reload: () => forbidden("remote.reload") },
+  });
+  const home = path.dirname(f.file);
+  const beforeNames = fs.readdirSync(home).sort();
+  const beforeConfig = fs.readFileSync(f.file);
+  const cases: [string, string][] = [
+    ["/api/update", "GET"], ["/api/update", "POST"], ["/api/power", "GET"], ["/api/power", "PUT"], ["/api/power/setup", "POST"],
+    ["/api/remote", "GET"], ["/api/remote/reload", "POST"], ["/api/phone-inbox", "GET"], ["/api/phone/settings", "POST"],
+    ["/api/mod-options", "GET"], ["/api/mod-settings", "PUT"], ["/api/mod/approval", "POST"],
+    ["/api/codex", "GET"], ["/api/codex", "POST"], ["/api/settings-jobs", "GET"], ["/api/settings-jobs/result", "POST"],
+    ["/api/compact-pick", "POST"], ["/api/agent-title", "POST"], ["/api/status-mod", "POST"],
+    ...["claude", "chatgpt", "google"].flatMap(name => [
+      [`/api/${name}-accounts`, "GET"], [`/api/${name}-accounts`, "PUT"],
+      [`/api/${name}-accounts/synthetic`, "PATCH"], [`/api/${name}-accounts/synthetic`, "DELETE"],
+      [`/api/${name}-login`, "GET"], [`/api/${name}-login`, "POST"], [`/api/${name}-logout`, "POST"],
+      [`/api/${name}-oauth`, "GET"], [`/api/${name}-oauth/code`, "POST"],
+    ] as [string, string][]),
+  ];
+  for (const [resource, method] of cases) {
+    const response = await adminFetch(f.base + resource, {
+      method,
+      ...(method === "GET" ? {} : { headers: { "content-type": "application/json" }, body: "{deliberately-invalid-json" }),
+    });
+    assert.equal(response.status, 403, `${method} ${resource}`);
+    assert.match(await response.text(), /disabled in the personal Desktop profile/);
+  }
+  assert.deepEqual(calls, []);
+  assert.deepEqual(fs.readdirSync(home).sort(), beforeNames, "no account, worker, updater or remote state created");
+  assert.deepEqual(fs.readFileSync(f.file), beforeConfig);
+  assert.equal(fs.existsSync(f.settings), false);
+
+  // Necessary key management and native-picker catalogue surfaces remain authenticated and live.
+  for (const resource of ["/api/security-policy", "/api/config", "/api/claude-models", "/api/presets"]) {
+    const response = await adminFetch(f.base + resource);
+    assert.equal(response.status, 200, resource);
+    await response.text();
+  }
+  assert.deepEqual(calls, []);
+});
 
 test("native admin approval is explicit, exact, credential-preserving and immediately revocable", async t => {
   const f = await fixture(t);

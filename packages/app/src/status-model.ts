@@ -34,7 +34,8 @@ export type AppState = {
   result: ActionResult | null;
   /** A switch was made and Claude Desktop has not been reopened since. */
   restartClaude: boolean;
-  loginItem: boolean;
+  /** null: the personal setup window is on-demand and has no login-item feature. */
+  loginItem: boolean | null;
   appVersion: string;
   platform: string;
 };

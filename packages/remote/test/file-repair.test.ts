@@ -18,17 +18,36 @@ const inline = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4]);
 const SID = "2b2b2c2d-2222-4333-8444-955566667777", OTHER = "2b2b2c2d-2222-4333-8444-000000000000";
 const blocked = (name: string): SessionFile => ({ id: `id-${name}`, name, mediaType: "application/octet-stream", bytes: 0, status: "blocked" });
 
+// Parallel tests share Claude's temp parent but own distinct per-process child slugs.
+// Never recursively remove the shared parent, including when this fixture created it.
+function sharedTempRoot(root: string): () => void {
+  let created = false;
+  try { fs.mkdirSync(root, { mode: 0o700 }); created = true; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  const original = fs.lstatSync(root, { bigint: true });
+  assert.ok(original.isDirectory() && !original.isSymbolicLink(), "shared Claude temp fixture root must be a real directory");
+  return () => {
+    if (!created) return;
+    try {
+      const current = fs.lstatSync(root, { bigint: true });
+      if (current.dev === original.dev && current.ino === original.ino && current.birthtimeNs === original.birthtimeNs && !current.isSymbolicLink()) fs.rmdirSync(root);
+    } catch (error) {
+      if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+    }
+  };
+}
+
 // A log written before the spare-folder fix: the SendUserFile screenshot and an image a tool result
 // referenced were refused. The transcript still names both, and the files are on disk. `fill` events
 // follow them in the log (a long conversation after the pictures were sent).
 function fixture(t: TestContext, fill = 0) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-repair-"));
   const base = path.join(fs.existsSync("/private/tmp") ? "/private/tmp" : "/tmp", `claude-${process.getuid!()}`);
-  if (!fs.existsSync(base)) { fs.mkdirSync(base, { mode: 0o700 }); t.after(() => fs.rmSync(base, { recursive: true, force: true })); }
+  const removeEmptyRoot = sharedTempRoot(base);
   const spare = path.join(base, `-ripple-repair-spare-${process.pid}-${fill}`);
   const cwd = path.join(root, "project");
   const projects = path.join(root, "projects");
-  t.after(() => { fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(spare, { recursive: true, force: true }); });
+  t.after(() => { fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(spare, { recursive: true, force: true }); removeEmptyRoot(); });
   const ok = path.join(spare, SID, "scratchpad", "01-side.png");
   const shot = path.join(spare, SID, "scratchpad", "02-shot.png");
   const foreign = path.join(spare, OTHER, "scratchpad", "x.png");
@@ -291,9 +310,9 @@ test("an event without a transcript line id is found again by its call's id", { 
 // when its log was written, and is there now.
 test("a session's attach starts the repair and returns; the fixed event reaches the phone later, as a live event", { skip: process.platform === "win32" }, async t => {
   const base = path.join(fs.existsSync("/private/tmp") ? "/private/tmp" : "/tmp", `claude-${process.getuid!()}`);
-  if (!fs.existsSync(base)) { fs.mkdirSync(base, { mode: 0o700 }); t.after(() => fs.rmSync(base, { recursive: true, force: true })); }
+  const removeEmptyRoot = sharedTempRoot(base);
   const spare = path.join(base, `-ripple-repair-host-${process.pid}`);
-  t.after(() => fs.rmSync(spare, { recursive: true, force: true }));
+  t.after(() => { fs.rmSync(spare, { recursive: true, force: true }); removeEmptyRoot(); });
   const shot = path.join(spare, bridgeId, "scratchpad", "late.png");
   const seen: SessionEvent[] = [];
   const f = bridgeFixture(t, { onEvent: (_id, event) => { if (event) seen.push(event); } });

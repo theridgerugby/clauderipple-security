@@ -124,7 +124,7 @@ test("direct rejects corrupt snapshots without modifying their raw text or clien
   assert.equal(fs.readFileSync(c.settings, "utf8"), before);
 });
 
-test("snapshot save failure changes no client and settings save failure retains restoration evidence", () => {
+test("snapshot save failure changes no client and settings save failure retains restoration evidence", t => {
   const c = setup();
   c.apply(c.a);
   const before = fs.readFileSync(c.settings, "utf8");
@@ -132,13 +132,18 @@ test("snapshot save failure changes no client and settings save failure retains 
   assert.throws(() => directOn(c.a));
   assert.equal(fs.readFileSync(c.settings, "utf8"), before);
   fs.rmdirSync(directStatePath(c.a));
-  // Backup creation fails after the write-ahead snapshot, before settings replacement. The backup is
-  // named by the second, so this second's name and the next two are taken: one name alone missed
-  // when the second turned over before directOn made its backup (Windows CI, 2026-10-29).
-  const stampAt = (ms: number) => new Date(ms).toISOString().replace(/[-:]/g, "").slice(0, 15);
-  const now = Date.now();
-  for (const ms of [now, now + 1_000, now + 2_000]) fs.mkdirSync(`${c.settings}.bak-clauderipple-${stampAt(ms)}`);
-  assert.throws(() => directOn(c.a));
+  // Backups now have collision-free names. Inject the precise filesystem failure instead of
+  // pre-creating guessed names, retaining the write-ahead/unchanged-client guarantee.
+  const copy = fs.copyFileSync;
+  t.mock.method(fs, "copyFileSync", (...args: Parameters<typeof fs.copyFileSync>) => {
+    const [source, destination, flags] = args;
+    if (source === c.settings && String(destination).startsWith(`${c.settings}.bak-clauderipple-`)) {
+      assert.equal(flags, fs.constants.COPYFILE_EXCL);
+      throw new Error("synthetic backup creation failure");
+    }
+    return copy(...args);
+  });
+  assert.throws(() => directOn(c.a), /synthetic backup creation failure/);
   assert.equal(fs.readFileSync(c.settings, "utf8"), before);
   assert.equal(JSON.parse(fs.readFileSync(directStatePath(c.a), "utf8")).cli.HTTPS_PROXY, c.proxyUrl);
 });

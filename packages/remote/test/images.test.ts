@@ -28,6 +28,38 @@ function fixture(t: TestContext) {
   return { cwd, dir, log, sink };
 }
 
+// Other test processes and Claude itself share this parent. Each fixture owns only its child
+// slug, so cleanup may remove the parent only if this fixture created it and it is now empty.
+function sharedTempRoot(root: string): () => void {
+  let created = false;
+  try { fs.mkdirSync(root, { mode: 0o700 }); created = true; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  const original = fs.lstatSync(root, { bigint: true });
+  assert.ok(original.isDirectory() && !original.isSymbolicLink(), "shared Claude temp fixture root must be a real directory");
+  return () => {
+    if (!created) return;
+    try {
+      const current = fs.lstatSync(root, { bigint: true });
+      if (current.dev === original.dev && current.ino === original.ino && current.birthtimeNs === original.birthtimeNs && !current.isSymbolicLink()) fs.rmdirSync(root);
+    } catch (error) {
+      if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+    }
+  };
+}
+
+test("shared temp fixture cleanup preserves another process's child and removes only an empty owned parent", t => {
+  const root = path.join(directory(t), "shared");
+  const removeEmptyRoot = sharedTempRoot(root);
+  const other = path.join(root, "another-process");
+  fs.mkdirSync(other);
+  fs.writeFileSync(path.join(other, "keep"), "other fixture data");
+  removeEmptyRoot();
+  assert.equal(fs.readFileSync(path.join(other, "keep"), "utf8"), "other fixture data");
+  fs.rmSync(other, { recursive: true });
+  removeEmptyRoot();
+  assert.equal(fs.existsSync(root), false);
+});
+
 test("desktop image-only user, assistant and tool results become blob-backed image parts", t => {
   const { cwd, log, sink } = fixture(t);
   for (const type of ["user", "assistant"]) {
@@ -92,10 +124,10 @@ test("a pasted image and a scratchpad file in the session's own Claude temp fold
   const { cwd, sink } = fixture(t);
   const root = process.platform === "win32" ? path.join(os.tmpdir(), "claude")
     : path.join(fs.existsSync("/private/tmp") ? "/private/tmp" : "/tmp", `claude-${process.getuid!()}`);
-  if (!fs.existsSync(root)) { fs.mkdirSync(root, { mode: 0o700 }); t.after(() => fs.rmSync(root, { recursive: true, force: true })); }
+  const removeEmptyRoot = sharedTempRoot(root);
   const id = "0f0e0d0c-1111-4222-8333-944455556666", other = "0f0e0d0c-1111-4222-8333-999999999999";
   const slug = path.join(root, cwd.replace(/[^A-Za-z0-9]/g, "-"));
-  t.after(() => fs.rmSync(slug, { recursive: true, force: true }));
+  t.after(() => { fs.rmSync(slug, { recursive: true, force: true }); removeEmptyRoot(); });
   for (const [session, folder] of [[id, "images"], [id, "scratchpad"], [other, "images"]] as const) {
     fs.mkdirSync(path.join(slug, session, folder), { recursive: true });
     fs.writeFileSync(path.join(slug, session, folder, "1.png"), png);
@@ -404,10 +436,10 @@ test("summarize names a SendUserFile's files and caption without a caption, and 
 test("a SendUserFile from the engine's own temp folder under another project slug reaches the phone, and nothing else does", { skip: process.platform === "win32" }, t => {
   const { cwd, log, sink } = fixture(t);
   const root = path.join(fs.existsSync("/private/tmp") ? "/private/tmp" : "/tmp", `claude-${process.getuid!()}`);
-  if (!fs.existsSync(root)) { fs.mkdirSync(root, { mode: 0o700 }); t.after(() => fs.rmSync(root, { recursive: true, force: true })); }
+  const removeEmptyRoot = sharedTempRoot(root);
   const id = "1a1b1c1d-1111-4222-8333-944455556666", other = "1a1b1c1d-1111-4222-8333-999999999999";
   const spare = path.join(root, `-ripple-test-spare-${process.pid}`);
-  t.after(() => fs.rmSync(spare, { recursive: true, force: true }));
+  t.after(() => { fs.rmSync(spare, { recursive: true, force: true }); removeEmptyRoot(); });
   const files = [path.join(spare, id, "scratchpad", "out", "16-side.png"), path.join(spare, id, "scratchpad", "out", "1-side.png")];
   const foreign = path.join(spare, other, "scratchpad", "x.png");
   for (const file of [...files, foreign]) { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, png); }

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -81,8 +81,9 @@ test("Windows discovers the new Desktop data root and refuses ambiguous profiles
   });
 });
 
-test("claude-login invokes PATH claude setup-token and saves only a 0600 credential file", () => {
+test("personal CLI refuses separate sign-in; isolated legacy token helper and owned cleanup remain tested", t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cr-claude-login-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const bin = path.join(root, "bin");
   const home = path.join(root, "home");
   fs.mkdirSync(bin);
@@ -96,12 +97,16 @@ test("claude-login invokes PATH claude setup-token and saves only a 0600 credent
   // The Desktop cache roots point into the scratch dir too. Where the fake is not a launcher (an
   // extensionless file on Windows), the lookup falls back to the Desktop-cached CLI, and a real one
   // would run its interactive `setup-token` and wait for a pasted code that never comes.
-  const output = execFileSync(process.execPath, [cli, "claude-login", "--setup-token"], {
+  const refused = spawnSync(process.execPath, [cli, "claude-login", "--setup-token"], {
     encoding: "utf8",
     env: { ...process.env, PATH: bin, CLAUDERIPPLE_HOME: home, CLAUDERIPPLE_ASSUME_TTY: "1", APPDATA: root, LOCALAPPDATA: root, XDG_CONFIG_HOME: root },
   });
-  assert.match(output, /Claude subscription connected/);
-  assert.doesNotMatch(output, new RegExp(token));
+  assert.notEqual(refused.status, 0);
+  assert.match(refused.stderr, /Separate subscription sign-in is disabled in personal mode/);
+  assert.doesNotMatch(refused.stdout + refused.stderr, new RegExp(token));
+  assert.equal(fs.existsSync(claudeAuthPath(home)), false, "production refusal must not acquire a separate native credential");
+  // Keep direct library regression evidence without adding a production-mode escape hatch.
+  claudeLogin(home, { binary: process.platform === "win32" ? path.join(bin, "claude.cmd") : fake, interactive: true });
   assert.deepEqual(readClaudeAuthFile(home), { token, createdAt: readClaudeAuthFile(home)!.createdAt, source: "setup-token" });
   if (posixModes) assert.equal(fs.statSync(claudeAuthPath(home)).mode & 0o777, 0o600);
   saveClaudeOAuthAccount(home, { accessToken: "access", refreshToken: "refresh", expiresAt: Date.now() + 60_000, accountId: "second" });
