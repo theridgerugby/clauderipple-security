@@ -12,7 +12,8 @@
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { providerFor, type Config } from "./config.ts";
 import { isNativeDesktopModel } from "./desktop-policy.ts";
-import { isDesktopCodeSurface, personalPickerModelProblem, type DesktopCodeSurface } from "./picker.ts";
+import { chatPickerModels, DESKTOP_PICKER_ROW_LIMIT as ROW_LIMIT, isDesktopCodeSurface, isDesktopPickerModelId as modelId,
+  personalPickerModelProblem, personalSurfaceExtraModels, type DesktopCodeSurface } from "./picker.ts";
 import { personalMode } from "./personal-policy.ts";
 import { resolve } from "./routing.ts";
 import { effortLevels } from "./targets.ts";
@@ -27,18 +28,19 @@ declare const selectionTokenBrand: unique symbol;
 export type DesktopSelectionToken = Readonly<{ [selectionTokenBrand]: true }>;
 
 type Thinking = { type: "effort"; effort: string };
-type SelectorState = {
+type SelectorState = Record<string, unknown> & {
   id: DesktopCodeSurface;
   model: string;
   thinking?: Thinking;
-  thinking_by_model?: { id: string; thinking: Thinking }[];
+  thinking_by_model?: (Record<string, unknown> & { id: string; thinking: Record<string, unknown> })[];
 };
 type Choice = { model: string; thinking?: Thinking; fingerprint: string };
-type Slot = { native: SelectorState; serialized: string; version: number; touched: number; choice?: Choice };
+type Slot = { native: SelectorState; serialized: string; preference: string; selectableExtras: Set<string>; version: number; touched: number; choice?: Choice };
 type Pending = { key: string; version: number; expires: number; choice?: Choice };
 const EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
-const MODEL_LIMIT = 256;
-const ROW_LIMIT = 128;
+// Optional native metadata stays intact, but cannot multiply the bootstrap's 8 MiB bound
+// across every retained account/surface. This cap covers serialized bytes per native slot.
+const SELECTOR_STATE_LIMIT = 64 * 1024;
 const ORG_SEGMENT = "([A-Za-z0-9][A-Za-z0-9_-]{0,127})";
 const BOOTSTRAP = new RegExp(`^/(?:edge-api|api)/bootstrap/${ORG_SEGMENT}/app_start$`);
 const SELECTION = new RegExp(`^/api/organizations/${ORG_SEGMENT}/model_selector_state/(code|ccd)$`);
@@ -49,25 +51,45 @@ function record(value: unknown): value is Record<string, unknown> {
 function onlyKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   return Object.keys(value).every(key => keys.includes(key));
 }
-function modelId(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= MODEL_LIMIT && !/[\s\x00-\x1f\x7f]/.test(value);
-}
 function thinking(value: unknown): value is Thinking {
-  return record(value) && onlyKeys(value, ["type", "effort"]) && value.type === "effort"
+  return record(value) && onlyKeys(value, ["type", "effort"]) && nativeThinking(value);
+}
+function nativeThinking(value: unknown): value is Thinking {
+  return record(value) && value.type === "effort"
     && typeof value.effort === "string" && EFFORTS.has(value.effort);
 }
-function selectorState(value: unknown): value is SelectorState {
-  if (!record(value) || !onlyKeys(value, ["id", "model", "thinking", "thinking_by_model"])
-    || !isDesktopCodeSurface(value.id) || !modelId(value.model)) return false;
-  if (Object.hasOwn(value, "thinking") && !thinking(value.thinking)) return false;
+function selectorState(value: unknown, maximumPreferenceRows = ROW_LIMIT): value is SelectorState {
+  // Unknown optional metadata is copied, not interpreted. Only the fields used for choosing
+  // a model need a known contract; a new Desktop version alone is not incompatibility.
+  if (!record(value) || !isDesktopCodeSurface(value.id) || !modelId(value.model)) return false;
+  if (Object.hasOwn(value, "thinking") && !nativeThinking(value.thinking)) return false;
   if (!Object.hasOwn(value, "thinking_by_model")) return true;
-  if (!Array.isArray(value.thinking_by_model) || value.thinking_by_model.length > ROW_LIMIT) return false;
+  if (!Array.isArray(value.thinking_by_model) || value.thinking_by_model.length > maximumPreferenceRows) return false;
   const ids = new Set<string>();
   for (const row of value.thinking_by_model) {
-    if (!record(row) || !onlyKeys(row, ["id", "thinking"]) || !modelId(row.id) || !thinking(row.thinking) || ids.has(row.id)) return false;
+    // Other native models may acquire new thinking modes. Their preference rows are never
+    // interpreted or changed when an extra is selected, so retain their metadata as supplied.
+    if (!record(row) || !modelId(row.id) || !record(row.thinking) || ids.has(row.id)) return false;
     ids.add(row.id);
   }
+  const active = value.thinking_by_model.find(row => row.id === value.model);
+  if (active && (!nativeThinking(active.thinking)
+    || Object.hasOwn(value, "thinking") && (value.thinking as Thinking).effort !== active.thinking.effort)) return false;
   return true;
+}
+function nativePreference(value: SelectorState): string {
+  const active = value.thinking ?? value.thinking_by_model?.find(row => row.id === value.model)?.thinking;
+  return JSON.stringify([value.id, value.model, active?.type ?? null, active?.effort ?? null]);
+}
+function nativeSnapshot(value: unknown): { native: SelectorState; serialized: string; preference: string } | null {
+  try {
+    if (!selectorState(value)) return null;
+    const serialized = JSON.stringify(value);
+    if (Buffer.byteLength(serialized, "utf8") > SELECTOR_STATE_LIMIT) return null;
+    // Native JSON may be deeply nested despite a small byte count. Neither serialization
+    // nor cloning failure may turn an optional picker edit into a failed native response.
+    return { native: structuredClone(value), serialized, preference: nativePreference(value) };
+  } catch { return null; }
 }
 function surfaceModels(json: Record<string, unknown>, surface: DesktopCodeSurface): Record<string, unknown>[] | null {
   const config = json.model_selector_config;
@@ -112,8 +134,10 @@ function stateReply(native: SelectorState, choice: Choice): SelectorState {
     if (existing) existing.thinking = structuredClone(choice.thinking);
     else rows.push({ id: choice.model, thinking: structuredClone(choice.thinking) });
   }
-  return { id: native.id, model: choice.model, thinking_by_model: rows,
-    ...(choice.thinking ? { thinking: structuredClone(choice.thinking) } : {}) };
+  const reply = { ...structuredClone(native), model: choice.model, thinking_by_model: rows };
+  if (choice.thinking) reply.thinking = structuredClone(choice.thinking);
+  else delete reply.thinking;
+  return reply;
 }
 function modelNotSelectable(value: unknown): boolean {
   return record(value) && record(value.error) && record(value.error.details) && value.error.details.error_code === "model_not_selectable";
@@ -203,34 +227,41 @@ export class DesktopSelectionCache {
     return version;
   }
 
-  /** Call only for a successful parsed native bootstrap, BEFORE adding picker models. */
-  observeBootstrap(ctx: DesktopSelectionContext, json: Record<string, unknown>, cfg: Config): void {
-    if (!this.#active(cfg)) return;
+  /** Call BEFORE injection. Returned surfaces alone have a scoped, supported native selector. */
+  observeBootstrap(ctx: DesktopSelectionContext, json: Record<string, unknown>, cfg: Config): DesktopCodeSurface[] {
+    if (!this.#active(cfg)) return [];
     this.#prune();
     const scope = this.#scope(ctx, "bootstrap");
-    if (!scope) return;
+    if (!scope) return [];
     const states = json.model_selector_state;
+    const compatible: DesktopCodeSurface[] = [];
+    const extra = chatPickerModels(cfg);
     for (const surface of ["code", "ccd"] as const) {
       const key = `${scope.key}:${surface}`;
       const matches = Array.isArray(states) && states.length <= ROW_LIMIT ? states.filter(state => record(state) && state.id === surface) : [];
-      const native = matches[0];
+      const snapshot = matches.length === 1 ? nativeSnapshot(matches[0]) : null;
       const models = surfaceModels(json, surface);
-      if (matches.length !== 1 || !selectorState(native) || !isNativeDesktopModel(native.model)
+      if (!snapshot || !isNativeDesktopModel(snapshot.native.model)
         || !models?.some(model => typeof model.id === "string" && isNativeDesktopModel(model.id))) {
         if (this.#slots.has(key)) this.#advanceScope(key, true);
         this.#slots.delete(key);
         continue;
       }
-      const serialized = JSON.stringify(native);
+      const { native, serialized, preference } = snapshot;
+      const selectableExtras = new Set(personalSurfaceExtraModels(models, extra).map(entry => entry.model));
       const previous = this.#slots.get(key);
-      if (previous && previous.serialized !== serialized) this.#advanceScope(key, true);
-      const choice = previous?.serialized === serialized && previous.choice && this.#choiceValid(cfg, previous.choice) ? previous.choice : undefined;
+      const lostAvailability = previous && [...previous.selectableExtras].some(model => !selectableExtras.has(model));
+      if (previous && previous.preference !== preference) this.#advanceScope(key, true);
+      const choice = previous?.preference === preference && previous.choice && selectableExtras.has(previous.choice.model)
+        && this.#choiceValid(cfg, previous.choice) ? previous.choice : undefined;
       this.#slots.delete(key);
-      this.#slots.set(key, { native: structuredClone(native), serialized,
-        version: previous?.serialized === serialized ? previous.version : ++this.#version,
+      this.#slots.set(key, { native, serialized, preference, selectableExtras,
+        version: previous?.preference === preference && !lostAvailability ? previous.version : ++this.#version,
         touched: this.#now(), ...(choice ? { choice } : {}) });
+      if (selectableExtras.size > 0) compatible.push(surface);
     }
     this.#trim(this.#slots, this.#maxSlots);
+    return compatible;
   }
 
   /** Call AFTER adding picker models. Returns how many known state rows were changed. */
@@ -245,10 +276,10 @@ export class DesktopSelectionCache {
       if (!selectorState(state) || states.filter(row => record(row) && row.id === state.id).length !== 1) continue;
       const slot = this.#slots.get(`${scope.key}:${state.id}`);
       if (!slot?.choice) continue;
-      if (!this.#choiceValid(cfg, slot.choice)) { delete slot.choice; continue; }
+      if (!slot.selectableExtras.has(slot.choice.model) || !this.#choiceValid(cfg, slot.choice)) { delete slot.choice; continue; }
       if (JSON.stringify(state) !== slot.serialized || !surfaceModels(json, state.id)?.some(model => model.id === slot.choice!.model)) continue;
       const reply = stateReply(state, slot.choice);
-      if (!selectorState(reply)) { delete slot.choice; continue; }
+      if (!selectorState(reply, ROW_LIMIT + 1)) { delete slot.choice; continue; }
       states[index] = reply;
       slot.touched = this.#now();
       changed++;
@@ -268,7 +299,7 @@ export class DesktopSelectionCache {
     const version = this.#advanceScope(key, false);
     slot.touched = this.#now();
     let choice: Choice | undefined;
-    if (record(body) && onlyKeys(body, ["model", "thinking"]) && modelId(body.model)) {
+    if (record(body) && onlyKeys(body, ["model", "thinking"]) && modelId(body.model) && slot.selectableExtras.has(body.model)) {
       const fingerprint = routeFingerprint(cfg, body.model);
       if (fingerprint && (!Object.hasOwn(body, "thinking") || thinking(body.thinking) && supportedThinking(cfg, body.model, body.thinking))) {
         choice = { model: body.model, fingerprint, ...(thinking(body.thinking) ? { thinking: structuredClone(body.thinking) } : {}) };
@@ -296,16 +327,18 @@ export class DesktopSelectionCache {
     if (!slot || slot.version !== pending.version) return null;
     if (status >= 200 && status < 300) {
       this.#advanceScope(pending.key, true);
-      if (selectorState(body) && body.id === slot.native.id && isNativeDesktopModel(body.model)) {
-        slot.native = structuredClone(body);
-        slot.serialized = JSON.stringify(body);
+      const snapshot = nativeSnapshot(body);
+      if (snapshot && snapshot.native.id === slot.native.id && isNativeDesktopModel(snapshot.native.model)) {
+        slot.native = snapshot.native;
+        slot.serialized = snapshot.serialized;
+        slot.preference = snapshot.preference;
         slot.touched = this.#now();
       } else this.#slots.delete(pending.key);
       return null;
     }
-    if (status !== 400 || !modelNotSelectable(body) || !pending.choice || !this.#choiceValid(cfg, pending.choice)) return null;
+    if (status !== 400 || !modelNotSelectable(body) || !pending.choice || !slot.selectableExtras.has(pending.choice.model) || !this.#choiceValid(cfg, pending.choice)) return null;
     const reply = stateReply(slot.native, pending.choice);
-    if (!selectorState(reply)) return null;
+    if (!selectorState(reply, ROW_LIMIT + 1)) return null;
     slot.choice = pending.choice;
     slot.touched = this.#now();
     return reply;

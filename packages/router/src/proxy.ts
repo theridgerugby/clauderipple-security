@@ -70,10 +70,10 @@ export const BOOTSTRAP_BUFFER_LIMIT = 2 * 1024 * 1024;
 export const BOOTSTRAP_DECODE_LIMIT = 8 * 1024 * 1024;
 type BootstrapEncoding = "identity" | "gzip" | "deflate" | "br" | "zstd" | "unsupported";
 type BootstrapOutcome = "injected" | "unchanged" | "upstream-status" | "unsupported-encoding" | "encoded-limit" |
-  "decoded-limit" | "decode-failed" | "invalid-json" | "unsupported-schema" | "no-extra-models" | "injection-failed" | "stream-failed" | "integrity-protected" | "upstream-error";
+  "decoded-limit" | "decode-failed" | "invalid-json" | "unsupported-schema" | "unsupported-selection" | "no-extra-models" | "injection-failed" | "stream-failed" | "integrity-protected" | "upstream-error";
 type JsonShape = "absent" | "null" | "array" | "object" | "string" | "number" | "boolean";
 type PickerSchemaFacts = { config: JsonShape; state: JsonShape; surfaces: number; codeSurfaces: number; models: number };
-export type PickerObservation = { status: number; outcome: BootstrapOutcome; encoding: BootstrapEncoding; schema: PickerSchemaFacts; eligibleExtras: number };
+export type PickerObservation = { status: number; outcome: BootstrapOutcome; encoding: BootstrapEncoding; schema: PickerSchemaFacts; eligibleExtras: number; compatibleCodeSurfaces: number };
 
 function bootstrapEncoding(value: unknown): BootstrapEncoding {
   if (value === undefined || value === "" || value === "identity") return "identity";
@@ -448,6 +448,7 @@ export class Proxy {
   /** Each MiniMax plan provider's usage windows, for the status bar's limits row (never a key). */
   private readonly minimaxUsage: MiniMaxUsage;
   private readonly deps: ProxyDeps;
+  private lastPersonalMode: boolean | undefined;
   /**
    * Cooldowns, quarantines and conversation stickiness for provider credentials. In memory: a
    * cooldown that outlived a restart would make restarting worse, and a rejected credential earns
@@ -751,6 +752,13 @@ export class Proxy {
 
   /** ConfigStore calls this on reload; requests also reconcile injected/mutable configs. */
   reconcileConfig(cfg: Config): void {
+    const personal = personalMode(cfg);
+    if (personal && this.lastPersonalMode !== true) {
+      this.deps.observedClaudeCodeAuth?.discard();
+      // Reconciliation also runs before these optional helpers are constructed at startup.
+      this.claudeIdentity?.discard();
+    }
+    this.lastPersonalMode = personal;
     for (let i = this.blockedDesktopOrigins.length - 1; i >= 0; i--) {
       if (Array.isArray(cfg.security?.approvedOrigins) && cfg.security.approvedOrigins.includes(this.blockedDesktopOrigins[i]!)) this.blockedDesktopOrigins.splice(i, 1);
     }
@@ -806,6 +814,7 @@ export class Proxy {
     });
     this.claudeIdentity = new ClaudeCurrentIdentity(this.claudeAccounts, {
       upstream: () => this.deps.config().upstream,
+      enabled: () => !personalMode(this.deps.config()),
       ...(deps.claudeProfileFetch ? { fetch: deps.claudeProfileFetch } : {}),
       warn: (message) => deps.log.warn(message),
     });
@@ -1476,7 +1485,7 @@ export class Proxy {
       if (using.ownerId !== "current") {
         loginWatch = undefined;
         loginWatchFor = undefined;
-      } else if (loginWatchFor !== using.id) {
+      } else if (!personalMode(this.deps.config()) && loginWatchFor !== using.id) {
         loginWatch = new LoginEmailWatch(() => this.claudeIdentity.identifyWith(using.headers));
         loginWatchFor = using.id;
       }
@@ -1726,7 +1735,7 @@ export class Proxy {
       // but routed traffic while it was being used through the pool (issue #123, 2026-11-05). The
       // observation also follows a token refresh or an account switch on the app's next request.
       // Do not inspect it elsewhere: it must never enter logs, RequestLog, picker diagnostics, or admin data.
-      if (isApiHost && pathname === "/v1/messages") this.deps.observedClaudeCodeAuth?.observe(req.rawHeaders);
+      if (!personalMode(this.deps.config()) && isApiHost && pathname === "/v1/messages") this.deps.observedClaudeCodeAuth?.observe(req.rawHeaders);
 
       // A `WebSearch` side request routed to a provider that cannot run the server tool must not be
       // sent. The tool is dropped on every translated path, which leaves "you are an assistant for
@@ -2094,7 +2103,7 @@ export class Proxy {
               target = { protocol: "https:", host: cfg.upstream, port: this.deps.upstreamPort ?? 443, agent: this.deps.upstreamAgent ?? this.agentFor(route.provider, "https:"), extraHeaders: {} };
               ownLogin = true;
               setRecordAccount("current");
-              loginWatch = new LoginEmailWatch(() => this.claudeIdentity.identifyWith(loginHeaders(req.headers)));
+              if (!personalMode(this.deps.config())) loginWatch = new LoginEmailWatch(() => this.claudeIdentity.identifyWith(loginHeaders(req.headers)));
               loginWatchFor = undefined;
               const routeEffort = effortOf(json);
               if (routeEffort) record.effort = routeEffort;
@@ -2218,7 +2227,7 @@ export class Proxy {
           tag = `PASS ${ownKey ? "caller-key " : ""}${typeof model === "string" ? model : "-"}`;
           // An un-routed native Messages turn goes out on the app's own sign-in, and its answer is the
           // only statement of that login's unified limits when the usage endpoint refuses (2026-11-05).
-          ownLogin = isMessages && typeof req.headers.authorization === "string";
+          ownLogin = !personalMode(this.deps.config()) && isMessages && typeof req.headers.authorization === "string";
           if (ownLogin) {
             setRecordAccount("current");
             loginWatch = new LoginEmailWatch(() => this.claudeIdentity.identifyWith(loginHeaders(req.headers)));
@@ -2389,7 +2398,7 @@ export class Proxy {
         if (isPickerBootstrap) {
           this.desktopSelection.clear();
           this.lastPickerInjection = { at: new Date().toISOString(), injected: 0, surfaces: [], observation: {
-            status: 0, outcome: "upstream-error", encoding: "identity", schema: pickerSchemaFacts(), eligibleExtras: 0,
+            status: 0, outcome: "upstream-error", encoding: "identity", schema: pickerSchemaFacts(), eligibleExtras: 0, compatibleCodeSurfaces: 0,
           } };
           log.info("PICKER status=0 outcome=upstream-error");
         }
@@ -2431,8 +2440,12 @@ export class Proxy {
         // 402 and 429 are read ahead as well: a definite billing/quota exhaustion must be answered
         // with `x-should-retry: false` before the headers go out, and only its body says whether a
         // 429 is exhausted or an ordinary rate limit (#89). A bootstrap response is never a model
-        // turn and is forwarded as it arrives.
-        if (override?.purpose === "compaction" && (status < 200 || status >= 300) || (!isBootstrap && !isDesktopSelection && (status === 403 || status === 400 || status === 402 || status === 429))) {
+        // turn and is forwarded as it arrives. Personal Desktop's native responses also keep their
+        // complete representation and upstream retry policy: provider-pool refusal handling must
+        // not truncate a subscription error or change how the unmodified Desktop retries it.
+        // The streaming path below observes only a bounded diagnostic head after forwarding bytes.
+        const preserveNativeResponse = desktopOnly && !route && !override && (isApiHost || reqHost === "claude.ai");
+        if (override?.purpose === "compaction" && (status < 200 || status >= 300) || (!preserveNativeResponse && !isBootstrap && !isDesktopSelection && (status === 403 || status === 400 || status === 402 || status === 429))) {
           bufferBody(upRes, ERROR_HEAD_MAX).then((whole) => onUpstreamJudged(upRes, status, whole)).catch((e: Error) => {
             log.warn(`upstream ${status}: could not read the body: ${e.message}`);
             finish(String(status), 0, `upstream ${status}: body read failed`);
@@ -2582,11 +2595,15 @@ export class Proxy {
           let ended = false;
           let schema = pickerSchemaFacts();
           let eligibleExtras = 0;
+          let compatibleCodeSurfaces = 0;
           const encoding = bootstrapEncoding(upRes.headers["content-encoding"]);
           const observe = (outcome: BootstrapOutcome, result: InjectResult = { injected: 0, surfaces: [] }): void => {
             if (!isPickerBootstrap) return;
-            if (!["injected", "unchanged", "no-extra-models"].includes(outcome)) this.desktopSelection.clear();
-            const observation: PickerObservation = { status, outcome, encoding, schema, eligibleExtras };
+            // Unsupported selection contracts are already invalidated per authenticated
+            // scope by observeBootstrap. An unrelated/unscoped response must not erase a
+            // valid selection in another account or organization.
+            if (!["injected", "unchanged", "no-extra-models", "unsupported-selection"].includes(outcome)) this.desktopSelection.clear();
+            const observation: PickerObservation = { status, outcome, encoding, schema, eligibleExtras, compatibleCodeSurfaces };
             this.lastPickerInjection = { at: new Date().toISOString(), injected: Math.min(result.injected, 10_000),
               surfaces: boundedPickerCatalogue(result.surfaces, personalMode(cfg), [...errorSecrets]), observation };
             log.info(`PICKER status=${status} outcome=${outcome} encoding=${encoding} surfaces=${schema.surfaces} codeSurfaces=${schema.codeSurfaces} models=${schema.models} injected=${Math.min(result.injected, 10_000)}`);
@@ -2668,16 +2685,18 @@ export class Proxy {
                   try {
                     // Observe only a successfully parsed native reply, before adding extras.
                     const currentConfig = this.deps.config();
-                    this.desktopSelection.observeBootstrap(selectionContext, j, currentConfig);
+                    const compatibleSurfaces = this.desktopSelection.observeBootstrap(selectionContext, j, currentConfig);
+                    compatibleCodeSurfaces = compatibleSurfaces.length;
                     const extra = currentConfig.picker?.enabled ? chatPickerModels(currentConfig) : [];
                     eligibleExtras = Math.min(extra.length, 10_000);
-                    const result = injectPickerModels(j, extra, currentConfig.cli.autoCompactWindow, model => effortLevelsForModel(currentConfig, model), { codeOnly: personalMode(currentConfig) });
+                    const result = injectPickerModels(j, extra, currentConfig.cli.autoCompactWindow, model => effortLevelsForModel(currentConfig, model), { codeOnly: personalMode(currentConfig), compatibleCodeSurfaces: compatibleSurfaces });
                     const selectedStates = this.desktopSelection.overlayBootstrap(selectionContext, j, currentConfig);
                     if (result.injected > 0 || selectedStates > 0) {
                       const edited = Buffer.from(JSON.stringify(j));
                       if (edited.length <= BOOTSTRAP_DECODE_LIMIT) { output = edited; observe("injected", result); }
                       else observe("decoded-limit");
                     } else if (!Array.isArray(j.model_selector_config) || (personalMode(cfg) && schema.codeSurfaces === 0)) observe("unsupported-schema");
+                    else if (personalMode(currentConfig) && extra.length > 0 && compatibleCodeSurfaces === 0) observe("unsupported-selection", result);
                     else observe(extra.length === 0 ? "no-extra-models" : "unchanged", result);
                   } catch { observe("injection-failed"); }
                 }
@@ -3186,6 +3205,7 @@ export class Proxy {
     const cfg = this.deps.config();
     const out: Record<string, ReturnType<CredentialPool["report"]>> = {};
     for (const [name, provider] of Object.entries(cfg.providers)) {
+      if (personalMode(cfg) && provider.type === "anthropic" && provider.auth === "claude-code") continue;
       const creds = provider.type === "anthropic" && provider.accountPool
         ? this.claudeAccounts.peekCredentials()
         : this.credentialsOf(name, provider, true);

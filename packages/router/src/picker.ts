@@ -38,16 +38,40 @@ const CLI_SURFACES = new Set(["code", "ccd", "ccr", "cowork"]);
 const CODE_SURFACES = new Set(["code", "ccd"]);
 
 export type DesktopCodeSurface = "code" | "ccd";
+export const DESKTOP_PICKER_ROW_LIMIT = 128;
+const DESKTOP_PICKER_MODEL_ID_LIMIT = 256;
 export function isDesktopCodeSurface(value: unknown): value is DesktopCodeSurface {
   return value === "code" || value === "ccd";
+}
+export function isDesktopPickerModelId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= DESKTOP_PICKER_MODEL_ID_LIMIT && !/[\s\x00-\x1f\x7f]/.test(value);
 }
 
 function isClaudeEntry(m: ModelEntry): boolean {
   return typeof m.id === "string" && m.id.startsWith("claude-");
 }
 
-function pickTemplate(models: ModelEntry[]): ModelEntry | null {
+function pickTemplate(models: readonly ModelEntry[]): ModelEntry | null {
   return models.find((m) => isClaudeEntry(m) && !m.disabled && m.section !== "deprecated" && m.section !== "legacy") ?? models.find(isClaudeEntry) ?? null;
+}
+
+/** The exact personal extras displayable within the bounded native menu, in configured order. */
+export function personalSurfaceExtraModels(models: readonly ModelEntry[], extras: readonly CliModel[]): CliModel[] {
+  if (models.length > DESKTOP_PICKER_ROW_LIMIT) return [];
+  const existing = new Set(models.map(model => model.id));
+  const selected = new Set<string>();
+  const result: CliModel[] = [];
+  let remaining = pickTemplate(models) ? DESKTOP_PICKER_ROW_LIMIT - models.length : 0;
+  for (const extra of extras) {
+    if (!isDesktopPickerModelId(extra.model) || isJudgeOnlyModel(extra.model) || selected.has(extra.model)) continue;
+    if (!existing.has(extra.model)) {
+      if (remaining === 0) continue;
+      remaining--;
+    }
+    selected.add(extra.model);
+    result.push(extra);
+  }
+  return result;
 }
 
 /**
@@ -186,7 +210,7 @@ export type InjectResult = { injected: number; surfaces: { id: string; models: s
  * Mutates `json` in place; returns what was done for logging. `effortFor` names the levels a model
  * takes (by its id without an `@effort` suffix); undefined leaves the template's menu as it is.
  */
-export function injectPickerModels(json: Record<string, unknown>, extra: CliModel[], contextWindow?: number, effortFor?: (model: string) => string[] | undefined, options: { codeOnly?: boolean } = {}): InjectResult {
+export function injectPickerModels(json: Record<string, unknown>, extra: CliModel[], contextWindow?: number, effortFor?: (model: string) => string[] | undefined, options: { codeOnly?: boolean; compatibleCodeSurfaces?: readonly DesktopCodeSurface[] } = {}): InjectResult {
   const result: InjectResult = { injected: 0, surfaces: [] };
   extra = extra.filter(e => !isJudgeOnlyModel(e.model));
   const msc = json.model_selector_config;
@@ -202,11 +226,14 @@ export function injectPickerModels(json: Record<string, unknown>, extra: CliMode
       injected: [],
     });
     if (!(options.codeOnly ? CODE_SURFACES : CLI_SURFACES).has(id)) continue;
+    // Personal mode needs the native selection contract as well as a recognizable menu.
+    // An updated/ambiguous selector must not expose an extra the local overlay cannot select.
+    if (options.codeOnly && !options.compatibleCodeSurfaces?.some(surface => surface === id)) continue;
     const template = pickTemplate(surface.models);
     if (!template) continue;
     const existing = new Set(surface.models.map((m) => m.id));
     const added: CliModel[] = [];
-    for (const e of extra) {
+    for (const e of options.codeOnly ? personalSurfaceExtraModels(surface.models, extra) : extra) {
       if (existing.has(e.model)) continue;
       const entry: ModelEntry = { ...structuredClone(template), id: e.model, name: e.name };
       const w = e.contextWindow ?? contextWindow;

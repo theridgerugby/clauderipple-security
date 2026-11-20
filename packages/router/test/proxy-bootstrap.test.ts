@@ -17,6 +17,7 @@ import { UpstreamHealth } from "../src/health.ts";
 import { Logger } from "../src/log.ts";
 import { BOOTSTRAP_BUFFER_LIMIT, BOOTSTRAP_DECODE_LIMIT, Proxy } from "../src/proxy.ts";
 import { RequestLog } from "../src/requestlog.ts";
+import { DESKTOP_PICKER_ROW_LIMIT } from "../src/picker.ts";
 import { createCa, createLeaf } from "../src/x509.ts";
 
 const GOOGLE_MODEL = "gemini-bootstrap-fixture";
@@ -92,7 +93,7 @@ async function rig(t: TestContext, host = "claude.ai") {
     log.close();
     fs.rmSync(home, { recursive: true, force: true });
   });
-  const send = async (requestPath = `/api/bootstrap?private=${QUERY_SECRET}`, onData?: (chunk: Buffer) => void, options: SendOptions = {}): Promise<Reply> => {
+  const send = async (requestPath = `/api/bootstrap/synthetic-fixture-org/app_start?private=${QUERY_SECRET}`, onData?: (chunk: Buffer) => void, options: SendOptions = {}): Promise<Reply> => {
     const socket = net.connect({ host: "127.0.0.1", port: proxyPort });
     sockets.add(socket); socket.on("error", () => {});
     await once(socket, "connect");
@@ -164,6 +165,7 @@ for (const encoding of ["identity", "gzip", "deflate", "br", "zstd"] as const) {
     assert.deepEqual(parsed.model_selector_config[1].models.map((model: { id: string }) => model.id), ["claude-opus-5-5", GOOGLE_MODEL]);
     assert.equal(r.proxy.lastPickerInjection?.injected, 1);
     assert.equal(r.proxy.lastPickerInjection?.observation.outcome, "injected");
+    assert.equal(r.proxy.lastPickerInjection?.observation.compatibleCodeSurfaces, 1);
     assert.deepEqual(r.proxy.lastPickerInjection?.observation.schema, { config: "array", state: "array", surfaces: 2, codeSurfaces: 1, models: 1 });
     assert.deepEqual(r.proxy.lastPickerInjection?.surfaces.map(surface => surface.id), ["code"]);
     assertNoSensitiveDiagnostics(r);
@@ -437,14 +439,206 @@ test("Desktop state scoping rejects another cookie or organization and keeps ori
   assertStatePrivacy(r);
 });
 
-test("unknown native state shape does not get synthetic acceptance even when the extra appears in the menu", { timeout: 15_000 }, async t => {
+test("additive Desktop updates keep the extra usable and retain new native metadata", { timeout: 15_000 }, async t => {
   const r = await rig(t);
-  const j = { ...fixture(), model_selector_state: [{ ...nativeState(), future_native_field: true }] };
-  r.reply(Buffer.from(JSON.stringify(j)));
+  const j = { ...fixture(), schema_version: "synthetic-next-version", future_bootstrap_metadata: { native: true },
+    model_selector_state: [{ ...nativeState(), future_native_field: { preserve: true }, revision: 1 }] };
+  j.model_selector_config[1]!.models.push({ id: "future-native-model", name: "New native model", context_window: 200_000 });
+  r.setHandler((req, res) => {
+    if (req.method === "PATCH") res.writeHead(400, { ...nativeHeaders, "content-length": STATE_REFUSAL.length }).end(STATE_REFUSAL);
+    else res.writeHead(200, nativeHeaders).end(JSON.stringify(j));
+  });
   const boot = await r.send(STATE_BOOTSTRAP);
-  assert.deepEqual(JSON.parse(boot.body.toString("utf8")).model_selector_state, j.model_selector_state);
+  const parsed = JSON.parse(boot.body.toString("utf8"));
+  assert.deepEqual(parsed.model_selector_state, j.model_selector_state);
+  assert.deepEqual(parsed.model_selector_config[1].models.slice(0, 2), j.model_selector_config[1]!.models);
+  assert.equal(parsed.model_selector_config[1].models.at(-1).id, GOOGLE_MODEL);
+  assert.equal(parsed.schema_version, j.schema_version);
+  assert.equal(r.proxy.lastPickerInjection?.observation.compatibleCodeSurfaces, 1);
+  const selected = await stateWrite(r);
+  assert.equal(selected.status, 200);
+  assert.deepEqual(JSON.parse(selected.body.toString("utf8")), { ...j.model_selector_state[0], model: GOOGLE_MODEL, thinking_by_model: [] });
+  j.model_selector_state[0]!.revision = 2;
+  const refreshed = JSON.parse((await r.send(STATE_BOOTSTRAP)).body.toString("utf8"));
+  assert.deepEqual(refreshed.model_selector_state, [{ ...j.model_selector_state[0], model: GOOGLE_MODEL, thinking_by_model: [] }]);
+  assert.deepEqual(refreshed.future_bootstrap_metadata, j.future_bootstrap_metadata);
+  assertStatePrivacy(r);
+});
+
+test("an incompatible selector update hides unusable extras, preserves native bytes and recovers on the next compatible bootstrap", { timeout: 15_000 }, async t => {
+  const r = await rig(t); await r.send(STATE_BOOTSTRAP);
+  r.reply(STATE_REFUSAL, {}, 400);
+  assert.equal((await stateWrite(r)).status, 200);
+  const j = { ...fixture(), model_selector_state: [{ ...nativeState(), thinking: { type: "future-thinking", effort: "high" } }] };
+  const raw = zlib.gzipSync(Buffer.from(JSON.stringify(j, null, 3)));
+  r.reply(raw, { "content-encoding": "gzip" });
+  assertNative(await r.send(STATE_BOOTSTRAP), raw, "gzip");
+  assert.equal(r.proxy.lastPickerInjection?.injected, 0);
+  assert.equal(r.proxy.lastPickerInjection?.observation.outcome, "unsupported-selection");
+  assert.equal(r.proxy.lastPickerInjection?.observation.compatibleCodeSurfaces, 0);
   r.reply(STATE_REFUSAL, {}, 400);
   assertNative(await stateWrite(r), STATE_REFUSAL, undefined, 400);
+  r.reply(Buffer.from(JSON.stringify(fixture())));
+  const restored = await r.send(STATE_BOOTSTRAP);
+  assert.equal(selectedModel(restored), "claude-opus-5-5", "an unsupported shape cannot resurrect a stale extra choice");
+  assert.equal(r.proxy.lastPickerInjection?.injected, 1);
+  r.reply(STATE_REFUSAL, {}, 400);
+  assert.equal((await stateWrite(r)).status, 200, "a new explicit extra selection succeeds after recovery");
+  assertStatePrivacy(r);
+});
+
+test("mixed updated Code surfaces expose extras only where the selection contract is supported", { timeout: 15_000 }, async t => {
+  const r = await rig(t);
+  const j: Record<string, unknown> = { ...fixture(), model_selector_state: [nativeState(), { id: "ccd", model: { native: "changed-layout" } }] };
+  const surfaces = j.model_selector_config as { id: string; models: { id: string; name: string }[] }[];
+  surfaces.push({ id: "ccd", models: [{ id: "claude-opus-5-5", name: "Native desktop menu" }] });
+  surfaces.push({ id: "future-code", models: [{ id: "claude-opus-5-5", name: "Native future surface" }] });
+  r.reply(Buffer.from(JSON.stringify(j)));
+  const parsed = JSON.parse((await r.send(STATE_BOOTSTRAP)).body.toString("utf8"));
+  assert.equal(parsed.model_selector_config[1].models.at(-1).id, GOOGLE_MODEL);
+  assert.deepEqual(parsed.model_selector_config[2], surfaces[2]);
+  assert.deepEqual(parsed.model_selector_config[3], surfaces[3]);
+  assert.deepEqual(parsed.model_selector_state, j.model_selector_state);
+  assert.equal(r.proxy.lastPickerInjection?.injected, 1);
+  assert.equal(r.proxy.lastPickerInjection?.observation.compatibleCodeSurfaces, 1);
+  r.reply(STATE_REFUSAL, {}, 400);
+  assertNative(await stateWrite(r, extraWrite, STATE_PATH.replace("/code?", "/ccd?")), STATE_REFUSAL, undefined, 400);
+  assert.equal((await stateWrite(r)).status, 200);
+  (j.model_selector_state as unknown[])[1] = { id: "ccd", model: "claude-opus-5-5", optional_metadata: "new-compatible-version" };
+  r.reply(Buffer.from(JSON.stringify(j)));
+  const recovered = JSON.parse((await r.send(STATE_BOOTSTRAP)).body.toString("utf8"));
+  assert.equal(recovered.model_selector_config[2].models.at(-1).id, GOOGLE_MODEL);
+  assert.deepEqual(recovered.model_selector_config[3], surfaces[3]);
+  assert.equal(r.proxy.lastPickerInjection?.injected, 2);
+  assert.equal(r.proxy.lastPickerInjection?.observation.compatibleCodeSurfaces, 2);
+  assertStatePrivacy(r);
+});
+
+test("a full native menu stays byte-exact while a near-full menu adds only its safe remaining extras", { timeout: 15_000 }, async t => {
+  const r = await rig(t);
+  const json = fixture();
+  const native = Array.from({ length: DESKTOP_PICKER_ROW_LIMIT }, (_, i) => ({ id: `claude-native-${i}`, name: `Native ${i}`, context_window: 200_000 }));
+  json.model_selector_config[1]!.models = native;
+  const raw = zlib.gzipSync(Buffer.from(JSON.stringify(json, null, 2)));
+  r.reply(raw, { "content-encoding": "gzip" });
+  assertNative(await r.send(STATE_BOOTSTRAP), raw, "gzip");
+  assert.equal(r.proxy.lastPickerInjection?.injected, 0);
+  assert.equal(r.proxy.lastPickerInjection?.observation.compatibleCodeSurfaces, 0);
+  r.reply(STATE_REFUSAL, {}, 400);
+  assertNative(await stateWrite(r), STATE_REFUSAL, undefined, 400);
+  json.model_selector_config[1]!.models = native.slice(0, -1);
+  r.reply(Buffer.from(JSON.stringify(json)));
+  const partial = JSON.parse((await r.send(STATE_BOOTSTRAP)).body.toString("utf8"));
+  assert.equal(partial.model_selector_config[1].models.length, DESKTOP_PICKER_ROW_LIMIT);
+  assert.deepEqual(partial.model_selector_config[1].models.slice(0, -1), native.slice(0, -1));
+  assert.equal(partial.model_selector_config[1].models.at(-1).id, GOOGLE_MODEL);
+  r.reply(STATE_REFUSAL, {}, 400); assert.equal((await stateWrite(r)).status, 200);
+  r.reply(Buffer.from(JSON.stringify(json)));
+  assert.equal(selectedModel(await r.send(STATE_BOOTSTRAP)), GOOGLE_MODEL);
+  assertStatePrivacy(r);
+});
+
+test("an exact-bound native preference list accepts and replays one extra without losing native rows", { timeout: 15_000 }, async t => {
+  const r = await rig(t);
+  r.change(cfg => ({ ...cfg, providers: { ...cfg.providers, google: { ...cfg.providers.google!, models: [{ id: GOOGLE_MODEL, effortLevels: ["high"] }] } } }));
+  const rows = Array.from({ length: DESKTOP_PICKER_ROW_LIMIT }, (_, i) => ({ id: `claude-native-${i}`, thinking: { type: "effort", effort: "high" } }));
+  const json = { ...fixture(), model_selector_state: [{ ...nativeState(), thinking_by_model: rows }] };
+  r.reply(Buffer.from(JSON.stringify(json))); await r.send(STATE_BOOTSTRAP);
+  r.reply(STATE_REFUSAL, {}, 400);
+  const chosen = await stateWrite(r, JSON.stringify({ model: GOOGLE_MODEL, thinking: { type: "effort", effort: "high" } }));
+  assert.equal(chosen.status, 200);
+  const selectedRows = JSON.parse(chosen.body.toString("utf8")).thinking_by_model;
+  assert.equal(selectedRows.length, DESKTOP_PICKER_ROW_LIMIT + 1);
+  assert.deepEqual(selectedRows.slice(0, rows.length), rows);
+  r.reply(Buffer.from(JSON.stringify(json)));
+  const replay = JSON.parse((await r.send(STATE_BOOTSTRAP)).body.toString("utf8"));
+  assert.equal(replay.model_selector_state[0].model, GOOGLE_MODEL);
+  assert.deepEqual(replay.model_selector_state[0].thinking_by_model, selectedRows);
+  assertStatePrivacy(r);
+});
+
+for (const [name, change] of [
+  ["absent selector", (j: Record<string, unknown>) => { delete j.model_selector_state; }],
+  ["object selector", (j: Record<string, unknown>) => { j.model_selector_state = { code: nativeState() }; }],
+  ["duplicate state", (j: Record<string, unknown>) => { j.model_selector_state = [nativeState(), nativeState()]; }],
+  ["duplicate menu", (j: Record<string, unknown>) => { (j.model_selector_config as unknown[]).push(fixture().model_selector_config[1]); }],
+  ["oversized optional selector metadata", (j: Record<string, unknown>) => { (j.model_selector_state as Record<string, unknown>[])[0]!.optional_metadata = "测".repeat(22_000); }],
+  ["conflicting active effort", (j: Record<string, unknown>) => { j.model_selector_state = [{ ...nativeState(), thinking: { type: "effort", effort: "high" },
+    thinking_by_model: [{ id: "claude-opus-5-5", thinking: { type: "effort", effort: "low" } }] }]; }],
+] as const) {
+  test(`bootstrap ${name} never offers an unusable extra and preserves its native representation`, { timeout: 15_000 }, async t => {
+    const r = await rig(t); const json: Record<string, unknown> = fixture(); change(json);
+    const raw = zlib.brotliCompressSync(Buffer.from(JSON.stringify(json, null, 2)));
+    r.reply(raw, { "content-encoding": "br" });
+    assertNative(await r.send(STATE_BOOTSTRAP), raw, "br");
+    assert.equal(r.proxy.lastPickerInjection?.injected, 0);
+    assert.equal(r.proxy.lastPickerInjection?.observation.outcome, "unsupported-selection");
+    assert.equal(r.proxy.lastPickerInjection?.observation.compatibleCodeSurfaces, 0);
+    assertStatePrivacy(r);
+  });
+}
+
+test("an unrecognized bootstrap target remains native without erasing an unrelated supported selection", { timeout: 15_000 }, async t => {
+  const r = await rig(t); await r.send(STATE_BOOTSTRAP);
+  r.reply(STATE_REFUSAL, {}, 400); assert.equal((await stateWrite(r)).status, 200);
+  const raw = zlib.gzipSync(Buffer.from(JSON.stringify(fixture(), null, 2)));
+  r.reply(raw, { "content-encoding": "gzip" });
+  assertNative(await r.send(STATE_BOOTSTRAP.replace("/app_start?", "/app_start_v2?")), raw, "gzip");
+  assert.equal(r.proxy.lastPickerInjection?.observation.outcome, "unsupported-selection");
+  assert.equal(r.proxy.lastPickerInjection?.injected, 0);
+  assert.equal(selectedModel(await r.send(STATE_BOOTSTRAP)), GOOGLE_MODEL);
+  assertStatePrivacy(r);
+});
+
+test("an unsupported selector in another authenticated scope leaves the original account's choice intact", { timeout: 15_000 }, async t => {
+  const r = await rig(t); await r.send(STATE_BOOTSTRAP);
+  r.reply(STATE_REFUSAL, {}, 400); assert.equal((await stateWrite(r)).status, 200);
+  const raw = zlib.gzipSync(Buffer.from(JSON.stringify({ ...fixture(), model_selector_state: { updated_layout: true } }, null, 2)));
+  r.reply(raw, { "content-encoding": "gzip" });
+  assertNative(await r.send(STATE_BOOTSTRAP.replace(STATE_ORG, "other-synthetic-org"), undefined,
+    { headers: { cookie: "fixture=other-synthetic-account" } }), raw, "gzip");
+  assert.equal(r.proxy.lastPickerInjection?.observation.outcome, "unsupported-selection");
+  r.reply(Buffer.from(JSON.stringify(fixture())));
+  assert.equal(selectedModel(await r.send(STATE_BOOTSTRAP)), GOOGLE_MODEL);
+  assertStatePrivacy(r);
+});
+
+test("an unscoped bootstrap with a familiar menu remains byte-preserving", { timeout: 15_000 }, async t => {
+  const r = await rig(t);
+  const raw = Buffer.from(JSON.stringify(fixture(), null, 4));
+  r.reply(raw);
+  assertNative(await r.send(`/api/bootstrap?private=${QUERY_SECRET}`), raw);
+  assert.equal(r.proxy.lastPickerInjection?.observation.outcome, "unsupported-selection");
+  assert.equal(r.proxy.lastPickerInjection?.observation.compatibleCodeSurfaces, 0);
+  assertStatePrivacy(r);
+});
+
+test("oversized optional metadata on a native selection reply stays exact and drops its old extra template", { timeout: 15_000 }, async t => {
+  const r = await rig(t); await r.send(STATE_BOOTSTRAP);
+  r.reply(STATE_REFUSAL, {}, 400); assert.equal((await stateWrite(r)).status, 200);
+  const raw = zlib.brotliCompressSync(Buffer.from(JSON.stringify({ ...nativeState(), optional_metadata: "测".repeat(22_000) }, null, 2)));
+  r.reply(raw, { "content-encoding": "br" });
+  assertNative(await stateWrite(r, JSON.stringify(nativeState())), raw, "br");
+  r.reply(STATE_REFUSAL, {}, 400);
+  assertNative(await stateWrite(r), STATE_REFUSAL, undefined, 400);
+  r.reply(Buffer.from(JSON.stringify(fixture())));
+  assert.equal(selectedModel(await r.send(STATE_BOOTSTRAP)), "claude-opus-5-5");
+  assertStatePrivacy(r);
+});
+
+test("deep optional metadata in a small native state reply stays byte-exact without failing the router", { timeout: 15_000 }, async t => {
+  const r = await rig(t); await r.send(STATE_BOOTSTRAP);
+  const plain = Buffer.from(`{"id":"code","model":"claude-opus-5-5","optional_metadata":${"[".repeat(20_000)}0${"]".repeat(20_000)}}`);
+  assert.ok(plain.length < 64 * 1024);
+  const raw = zlib.gzipSync(plain);
+  r.reply(raw, { "content-encoding": "gzip" });
+  assertNative(await stateWrite(r, JSON.stringify({ model: "claude-opus-5-5" })), raw, "gzip");
+  r.reply(STATE_REFUSAL, {}, 400);
+  assertNative(await stateWrite(r), STATE_REFUSAL, undefined, 400);
+  r.reply(Buffer.from(JSON.stringify(fixture())));
+  assert.equal((await r.send(STATE_BOOTSTRAP)).status, 200);
+  assert.equal(r.proxy.lastPickerInjection?.injected, 1);
+  assert.equal(r.proxy.stats.inFlight, 0);
   assertStatePrivacy(r);
 });
 

@@ -88,6 +88,7 @@ import { storedAccountsFor } from "./pinned-accounts.ts";
 import { CODEX_LOGIN_ID, readChatGptAccounts, removeChatGptAccount, summarize as summarizeChatGptAccount, updateChatGptAccount } from "./providers/chatgpt/accounts.ts";
 import { exhaustedForMs, IMAGE_ASPECTS, IMAGE_BACKGROUNDS, IMAGE_FORMATS, type ChatGptAccountStatus, type ImageRequest, type ImageResult } from "./providers/chatgpt/index.ts";
 import type { GoogleAccountStatus } from "./providers/google/index.ts";
+import { googleThinkingFamily } from "./providers/google/translate.ts";
 import { googleWindowsFromGroups, type QuotaGroup } from "./providers/google/usage.ts";
 import { isOpenCodeGo, type OpenCodeWindow } from "./providers/opencode-usage.ts";
 import { isMiniMaxPlan, type MiniMaxWindow } from "./providers/minimax-usage.ts";
@@ -280,6 +281,7 @@ function previewAccounts<T extends { id: string; paused: boolean; preferred: boo
  */
 function requestAccountNames(deps: AdminDeps): (record: RequestRecord) => string | undefined {
   const cfg = deps.config();
+  if (personalMode(cfg)) return () => undefined;
   const claude = listClaudeAccounts(homeDir());
   const chatgpt = deps.chatgpt?.().accounts?.() ?? {};
   const google = deps.google?.().accounts() ?? {};
@@ -312,7 +314,7 @@ function requestAccountNames(deps: AdminDeps): (record: RequestRecord) => string
 
 /** Claude usage is looked up only where a Claude subscription provider is configured. */
 function hasClaudeSubscription(cfg: Config): boolean {
-  return Object.values(cfg.providers).some((p) => p.type === "anthropic" && p.auth === "claude-code");
+  return !personalMode(cfg) && Object.values(cfg.providers).some((p) => p.type === "anthropic" && p.auth === "claude-code");
 }
 
 /**
@@ -321,6 +323,7 @@ function hasClaudeSubscription(cfg: Config): boolean {
  * declared pool is read from the stored accounts the same way `/api/claude-accounts` does.
  */
 function claudePoolReports(deps: AdminDeps, name: string | undefined): CredentialRow[] {
+  if (personalMode(deps.config())) return [];
   const live = name ? deps.credentials?.()[name] : undefined;
   if (live) return live;
   const projection = new ClaudeAccountAuthPool({ home: homeDir(), current: claudeAuthStore(deps), log: deps.log }).peekCredentials();
@@ -333,6 +336,7 @@ function claudePoolReports(deps: AdminDeps, name: string | undefined): Credentia
  * stored accounts prefer.
  */
 function claudeInUseId(deps: AdminDeps, name: string | undefined): string | undefined {
+  if (personalMode(deps.config())) return undefined;
   const provider = name ? deps.config().providers[name] : undefined;
   if (provider?.type === "anthropic" && provider.accountPool !== true) return isCurrentClaudeAccountPaused(homeDir()) ? undefined : "current";
   try {
@@ -362,12 +366,14 @@ function firstClaudeProvider(cfg: Config): string | undefined {
  * figures, so no reader can take what the cache kept from before the pause for a current reading.
  */
 async function claudeAccountUsage(deps: AdminDeps): Promise<{ id: string; label: string; quota: Record<string, unknown>; inUse?: boolean; paused?: true }[]> {
+  if (personalMode(deps.config())) return [];
   let usage: Record<string, Record<string, unknown>>;
   try {
     usage = (await deps.claudeUsage?.()) ?? {};
   } catch {
     return [];
   }
+  if (personalMode(deps.config())) return [];
   const inUse = claudeInUseId(deps, firstClaudeProvider(deps.config()));
   const rows: { id: string; label: string; quota: Record<string, unknown>; inUse?: boolean; paused?: true }[] = [];
   // The account in use is listed even while its usage is unknown, with no windows, so no reader
@@ -489,12 +495,14 @@ function isSameAsCurrentLogin(account: { subjectHash?: string | undefined; email
  * for the one that is actually spending.
  */
 async function anthropicLimitAccounts(deps: AdminDeps, name: string): Promise<LimitsAccount[]> {
+  if (personalMode(deps.config())) return [];
   let usage: Record<string, Record<string, unknown>>;
   try {
     usage = (await deps.claudeUsage?.()) ?? {};
   } catch {
     return [];
   }
+  if (personalMode(deps.config())) return [];
   const owners = claudeNumberedAccounts();
   // Only a known current login can name itself or point out a stored copy of itself; when the
   // lookup fails or the login is unreadable the rows stay exactly as they were.
@@ -691,7 +699,11 @@ const CLAUDE_MODEL_FALLBACK: { id: string; name: string }[] = [
 
 /** The account's Claude models, or the table above when Anthropic's list cannot be had. */
 async function claudeModelList(deps: AdminDeps): Promise<(ModelEntry & { name: string })[]> {
+  // Personal Desktop already supplies its own native picker catalogue. Never borrow a login
+  // merely to populate a legacy admin selector or context-window label.
+  if (personalMode(deps.config())) return CLAUDE_MODEL_FALLBACK;
   const live = await deps.claudeModels?.().catch(() => null);
+  if (personalMode(deps.config())) return CLAUDE_MODEL_FALLBACK;
   return live?.length ? live.map(({ line: _line, createdAt: _createdAt, ...model }) => ({ ...model, name: model.name ?? model.id })) : CLAUDE_MODEL_FALLBACK;
 }
 
@@ -1157,9 +1169,9 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
         ...(p.type === "google" && p.auth === "antigravity" ? googleHealth(deps.google?.().accounts?.()[name] ?? []) : {}),
         ...(p.type === "anthropic"
           ? {
-              authSource: p.auth === "claude-code" ? claudeAuthStore(deps).describeSource() : null,
-              signedIn: p.auth === "claude-code" ? (listClaudeAccounts(homeDir()).length > 0 ? "oauth" : readClaudeAuthFile(homeDir())?.source ?? null) : null,
-              accountCount: p.auth === "claude-code" ? listClaudeAccounts(homeDir()).length : 0,
+              authSource: p.auth === "claude-code" && !personalMode(deps.config()) ? claudeAuthStore(deps).describeSource() : null,
+              signedIn: p.auth === "claude-code" && !personalMode(deps.config()) ? (listClaudeAccounts(homeDir()).length > 0 ? "oauth" : readClaudeAuthFile(homeDir())?.source ?? null) : null,
+              accountCount: p.auth === "claude-code" && !personalMode(deps.config()) ? listClaudeAccounts(homeDir()).length : 0,
             }
           : {}),
       }] as const;
@@ -1442,12 +1454,17 @@ async function probeClaudeCodeAuth(deps: AdminDeps): Promise<{ ok: boolean; auth
   return { ok: currentUsable || hasUsableAccount, auth: currentUsable || hasUsableAccount ? "ok" : "missing", source, signedIn, accountCount: accounts.length, models: await claudeModelList(deps) };
 }
 
-/** The reasoning levels a `GET /v1beta/models` entry says the model takes, or none to offer. */
-function googleEffortLevels(entry: { thinking?: unknown; id?: unknown }): string[] {
-  // `thinking: true` is the listing's own flag that a model reasons. The Generative Language API
-  // documents no per-model effort ladder, so a thinking model is offered the Gemini-3 levels this
-  // router maps onto (translate.ts): a model that only knows a subset clamps server-side.
-  return entry.thinking === true ? ["minimal", "low", "medium", "high"] : [];
+/** The supported ladder for a recognized thinking model from `GET /v1beta/models`. */
+function googleEffortLevels(id: string, thinking: unknown): string[] {
+  if (thinking !== true) return [];
+  // A thinking flag alone says nothing about the accepted levels. Keep discovery aligned with
+  // the translator: Carbon/Argon cannot disable thinking, and an unknown family gets no ladder.
+  switch (googleThinkingFamily(id)) {
+    case "gemini4": return ["low", "medium", "high"];
+    case "gemini3":
+    case "gemini25": return ["minimal", "low", "medium", "high"];
+    default: return [];
+  }
 }
 
 /**
@@ -1495,7 +1512,7 @@ async function probeGoogle(body: { apiKey?: unknown; url?: unknown }, probeFetch
         // prediction models share the catalogue but cannot serve a turn.
         const methods = Array.isArray(entry.supportedGenerationMethods) ? entry.supportedGenerationMethods : [];
         if (!methods.some((method) => method === "generateContent")) continue;
-        const levels = googleEffortLevels(entry);
+        const levels = googleEffortLevels(id, entry.thinking);
         models.push({
           id,
           ...(typeof entry.displayName === "string" ? { name: entry.displayName } : {}),
@@ -2079,8 +2096,9 @@ export async function backfillContextWindows(deps: AdminDeps): Promise<string[]>
  * Returns the `provider/model` ids it declared.
  */
 export async function adoptNewClaudeModels(deps: AdminDeps): Promise<string[]> {
+  if (personalMode(deps.config())) return [];
   const live = await deps.claudeModels?.().catch(() => null);
-  if (!live?.length) return [];
+  if (!live?.length || personalMode(deps.config())) return [];
   const stateFile = path.join(homeDir(), "claude-models-offered.json");
   let offered = new Set<string>();
   try {
@@ -2843,6 +2861,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; tlsPort: nu
         }
         const requested = parsed as Record<string, unknown>;
         if (personalMode(deps.config()) && (requested.type === "grok" ||
+            (requested.type === "anthropic" && requested.auth === "claude-code") ||
             (requested.type === "google" && requested.auth === "antigravity"))) {
           // Probes run before a provider is saved, so config validation cannot fence their
           // credential reads or an external CLI refresh. Refuse before restoring any secrets.

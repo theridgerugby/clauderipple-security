@@ -1,6 +1,8 @@
 > **Personal security fork.** Use the [fixed-source Windows installation guide](docs/personal-windows-install.md). This fork denies unapproved data destinations and disables remote features and executable auto-updates. The upstream install commands, npm package, store links and feature claims retained below do not describe this personal build. Bootstrap installers are disabled; do not overwrite it with an upstream installation.
 >
 > Before connecting real accounts or research data, verify the test results for the exact full commit and complete the guide's local acceptance checks.
+>
+> **Native-independence work:** the existing installer still uses shared proxy settings, a local CA and a supervised router. The separate [no-proxy Desktop plugin proof](docs/native-desktop-plugin.md) is default-off, builds without npm runtime dependencies, and has not passed real Desktop acceptance. It does not migrate or activate an installed client. See the [security profile](docs/personal-security-profile.md) for the remaining coupling and the read-only independence audit.
 
 <p align="center">
   <picture>

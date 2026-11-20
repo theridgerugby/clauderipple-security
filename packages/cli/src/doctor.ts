@@ -23,6 +23,7 @@ import { sameHome } from "./ownership.ts";
 import { captureRouterCodeIdentity, sameRouterCodeIdentity, statusMatchesRuntime, type InstallRuntimeTarget } from "./install-runtime.ts";
 import { runtime } from "./runtime.ts";
 import { personalMode } from "../../router/src/personal-policy.ts";
+import { auditNativeIndependence, type NativeIndependenceReport } from "./native-independence.ts";
 
 export type Mode = "ripple" | "direct" | "mixed";
 export type ProxyState = "ripple" | "none" | "other";
@@ -35,6 +36,8 @@ export type DoctorReport = {
   desktop: { proxy: ProxyState; url: string | null };
   cli: { proxy: ProxyState; url: string | null };
   problems: Problem[];
+  /** Separate from service health: a working router can still couple native clients to itself. */
+  nativeIndependence?: NativeIndependenceReport;
 };
 
 export type RepairStep = { name: string; ok: boolean; detail: string };
@@ -57,6 +60,8 @@ export type RecoveryDeps = {
   remoteHostInstalled?: () => boolean | Promise<boolean>;
   /** Whether the Claude Code CLI itself has a login (the phone host's sessions need one). */
   claudeLogin?: () => Promise<ClaudeCodeLogin>;
+  /** Read-only trust inspection seam; tests must not query the user's real certificate store. */
+  nativeCaTrust?: () => Promise<boolean | null>;
 };
 
 export async function fetchRouterStatus(adminUrl: string, timeoutMs: number, home: string = homeDir()): Promise<RouterStatus | null> {
@@ -195,7 +200,7 @@ async function snapshot(deps: RecoveryDeps): Promise<Snapshot> {
     else add("supervisor-other-install", `The router's startup entry belongs to another ClaudeRipple installation (${view.program}).`);
   }
   if (!status) {
-    add("router-down", `The router is not answering on ${adminUrl}. ${mode === "direct" ? "Claude is on its default connection, so it is not affected." : "Claude Desktop and Claude Code cannot connect while it is down."}`);
+    add("router-down", `The router is not answering on ${adminUrl}. ${mode === "direct" ? "The inspected shared settings contain no active ClaudeRipple proxy; already-running client connections were not checked." : "Clients using its proxy cannot connect while it is down."}`);
     if (view.registered && view.state !== "running" && view.state !== "unknown") add("supervisor-not-running", "The router's background service is not running.");
   } else if (status.version && status.version !== deps.version) {
     add("router-version-mismatch", `The running router is ${status.version}; this ClaudeRipple is ${deps.version}.`);
@@ -236,7 +241,12 @@ async function snapshot(deps: RecoveryDeps): Promise<Snapshot> {
 }
 
 export async function doctor(deps: RecoveryDeps): Promise<DoctorReport> {
-  return (await snapshot(deps)).report;
+  const current = await snapshot(deps);
+  const nativeIndependence = await auditNativeIndependence({
+    home: deps.home, proxyUrl: proxyUrlFor(current.cfg.listen.port), supervisor: current.view,
+    ...(deps.nativeCaTrust ? { trustedCa: deps.nativeCaTrust } : {}),
+  });
+  return { ...current.report, nativeIndependence };
 }
 
 /**

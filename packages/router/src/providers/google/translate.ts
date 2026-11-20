@@ -131,11 +131,12 @@ function inlineImages(content: string | AnthropicBlock[] | undefined): InlineIma
 //     ai.google.dev/api/generate-content), which does not agree with the guide — so this is
 //     (assumption)-grade and the lower-case guide spelling is used. Our seven-step ladder is
 //     clamped onto those four: `max`/`xhigh`→`high`, `none`→`minimal`.
-//   - Gemini 4 Argon uses the same thinkingLevel field, but only low/medium/high (default
-//     medium): https://ai.google.dev/gemini-api/docs/thinking#thinking-levels (2026-10-23).
-//     The guide now shows Interactions' snake_case field; generateContent's nested camelCase
-//     field is documented at https://ai.google.dev/api/generate-content#ThinkingConfig and is
-//     recommended for Gemini 3 or later. Argon cannot disable thinking: none/minimal → low.
+//   - Gemini 4 Argon and Carbon use the same thinkingLevel field, but only low/medium/high
+//     (default medium): https://aistudio.google.com/docs/thinking?generate-content=true#thinking-levels.
+//     GenerateContent's nested camelCase field is also documented at
+//     https://aistudio.google.com/api-reference/generate-content#Resource:GenerationConfig.
+//     Neither model can disable thinking: none/minimal → low. Only Carbon's documented stable
+//     id is recognized; a new Gemini 4 family or undocumented Carbon variant needs its own evidence.
 //   - Gemini 2.5 takes a token *budget* on `generationConfig.thinkingConfig.thinkingBudget`
 //     (an integer; `0` disables thinking). The per-generation ranges are (assumption): flash
 //     0..24576, pro 128..32768 — the numbers below stay well inside both.
@@ -175,8 +176,8 @@ function gemini25Budget(effort: string): number | undefined {
   }
 }
 
-function thinkingFamily(model: string): "gemini4" | "gemini3" | "gemini25" | null {
-  if (/^gemini-4-argon(?:-|$)/.test(model)) return "gemini4";
+export function googleThinkingFamily(model: string): "gemini4" | "gemini3" | "gemini25" | null {
+  if (model === "gemini-4-carbon" || /^gemini-4-argon(?:-|$)/.test(model)) return "gemini4";
   if (/^gemini-3[-.]/.test(model)) return "gemini3";
   if (/^gemini-2\.5/.test(model)) return "gemini25";
   return null;
@@ -194,7 +195,7 @@ function namedEffort(opts: GoogleTranslateOptions): string | undefined {
 
 function thinkingConfigFor(model: string, effort: string | undefined): GeminiGenerationConfig["thinkingConfig"] | undefined {
   if (!effort) return undefined;
-  const family = thinkingFamily(model);
+  const family = googleThinkingFamily(model);
   if (family === "gemini3" || family === "gemini4") {
     const level = gemini3Level(effort);
     return level ? { thinkingLevel: family === "gemini4" && level === "minimal" ? "low" : level } : undefined;
@@ -269,7 +270,7 @@ function toContents(req: AnthropicRequest, opts: GoogleTranslateOptions): Gemini
           const part: GeminiPart = { functionCall: { name: wireName, args: asArgs(call.input), id: call.id } };
           const signature = opts.thoughtSignatures?.get(call.id);
           if (signature) part.thoughtSignature = signature;
-          else if (opts.signatureSentinel && !signedTurn && !sentinelPlaced && thinkingFamily(opts.model) === "gemini3") {
+          else if (opts.signatureSentinel && !signedTurn && !sentinelPlaced && googleThinkingFamily(opts.model) === "gemini3") {
             part.thoughtSignature = SIGNATURE_SENTINEL;
             sentinelPlaced = true;
           }

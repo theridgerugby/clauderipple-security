@@ -162,15 +162,17 @@ const health = new UpstreamHealth(
   },
 );
 
-const observedClaudeCodeAuth = new ObservedClaudeCodeAuth(path.join(home, "claude-auth-observed.json"));
+// Personal Desktop forwards the caller's native credentials on that one request only. It has
+// no account-pool feature that needs an observed OAuth snapshot or its cleanup side effects.
+const genericRuntime = !personalMode(cfg0);
+const observedClaudeCodeAuth = genericRuntime ? new ObservedClaudeCodeAuth(path.join(home, "claude-auth-observed.json")) : undefined;
 // Before any provider fetches: a reasoning model may stay silent past fetch's 300s default.
 allowLongSilences();
-const proxy = new Proxy({ config: () => store.get(), log, certs, health, home, requests, observedClaudeCodeAuth, hold });
+const proxy = new Proxy({ config: () => store.get(), log, certs, health, home, requests, ...(observedClaudeCodeAuth ? { observedClaudeCodeAuth } : {}), hold });
 reconcileProxyConfig = config => { proxy.resetDesktopSelection(); proxy.reconcileConfig(config); };
 // Personal Desktop only uses the proxy. Constructing these optional integrations can still
 // read old account/power/update state even when their listeners and timers are never started.
-const genericRuntime = !personalMode(cfg0);
-const ingress = genericRuntime ? new OpenAiIngress({ config: () => store.get(), log, requests, home, observedClaudeCodeAuth, chatgpt: (name) => proxy.chatgptForCodex(name), claudeIdentity: (headers) => proxy.claudeIdentity.identifyWith(headers), hold }) : undefined;
+const ingress = genericRuntime ? new OpenAiIngress({ config: () => store.get(), log, requests, home, ...(observedClaudeCodeAuth ? { observedClaudeCodeAuth } : {}), chatgpt: (name) => proxy.chatgptForCodex(name), claudeIdentity: (headers) => proxy.claudeIdentity.identifyWith(headers), hold }) : undefined;
 const inactiveIngressStats: Readonly<IngressStats> = Object.freeze({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 });
 const ingressStats = (): Readonly<IngressStats> => ingress?.stats ?? inactiveIngressStats;
 
@@ -367,14 +369,15 @@ proxy
       clearCredentialCooldown: (provider, id) => proxy.clearCredentialCooldown(provider, id),
       claudeClearCooldown: (id) => proxy.claudeClearCooldown(id),
       picker: () => ({ enabled: !!store.get().picker?.enabled, hosts: terminateHosts(store.get()).slice(1), last: proxy.lastPickerInjection, blockedOrigins: [...proxy.blockedDesktopOrigins] }),
-      observedClaudeCodeAuth,
+      ...(observedClaudeCodeAuth ? { observedClaudeCodeAuth } : {}),
       claudeLocalAuthorization: (allow) => {
+        if (personalMode(store.get())) return;
         proxy.setClaudeLocalAuthorization(allow);
         ingress?.setClaudeLocalAuthorization(allow);
       },
-      claudeUsage: () => proxy.claudeUsage.snapshot(),
-      claudeModels: () => proxy.claudeModels.list(),
-      claudeIdentity: () => proxy.claudeIdentity.identify(),
+      claudeUsage: () => personalMode(store.get()) ? Promise.resolve({}) : proxy.claudeUsage.snapshot(),
+      claudeModels: () => personalMode(store.get()) ? Promise.resolve(null) : proxy.claudeModels.list(),
+      claudeIdentity: () => personalMode(store.get()) ? Promise.resolve(null) : proxy.claudeIdentity.identify(),
       opencodeUsage: (name, credentialId) => proxy.opencodeLimits(name, credentialId),
       minimaxUsage: (name, credentialId) => proxy.minimaxLimits(name, credentialId),
       grokUsage: (name: string) => proxy.grokLimits(name),

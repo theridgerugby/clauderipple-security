@@ -22,6 +22,10 @@ It opens on demand and exits when its last window closes. The independent local 
 its Windows watchdog remain available for Desktop; closing setup does not disconnect either model.
 This guide does not require terminal Claude Code use, a university gateway, or replacing native
 Opus/Sonnet/Haiku choices. First installation still uses PowerShell to run the reviewed source.
+See the [Desktop-only acceptance contract](personal-desktop-contract.md) for the exact behavior
+being verified, including native background usage and update/recovery boundaries. This guide
+installs the existing proxy architecture. The separate [native-plugin proof](native-desktop-plugin.md)
+is default-off and requires additional host acceptance; it is not activated by these commands.
 
 **Current graphical-picker gate:** the adapter covers the observed
 `model_selector_config` Code surfaces. The upstream author's architecture notes record a live
@@ -254,8 +258,11 @@ user's** root store only when you explicitly enable the Desktop picker in the ne
    running. Send one harmless native turn, one Google turn, then select native Claude again.
    Reopen setup only to change a key/model, review an approval, inspect status or recover.
 
-The picker adapter edits only recognised Code surfaces in the native model catalogue. If a
-Desktop update changes that catalogue to an unknown format, it leaves the response unchanged.
+The picker adapter edits only recognised Code surfaces with a supported native selection state.
+It retains harmless added metadata. If a Desktop update makes a surface's selection contract
+ambiguous or unsupported, it omits the extra there and clears stale extra selection state.
+Other supported Code surfaces can continue. With no supported surfaces to edit, it leaves the
+native response bytes and representation headers unchanged.
 A successful activation therefore does not by itself prove the current dropdown shows Gemini.
 If the additional entry is absent, stop the acceptance test and keep native Claude available
 through the default-connection recovery path; do not replace a native Claude entry to hide the
@@ -288,6 +295,9 @@ if ($LASTEXITCODE -ne 0) { throw 'Desktop picker activation failed. Read the ref
 
 Picker mode routes Desktop's app traffic through the local proxy and introduces a running-router
 dependency. It does not change your subscription or make Google API usage part of that subscription.
+An explicitly selected Google inference creates no additional Claude inference and has no hidden
+Claude fallback. Desktop can still issue its own native background requests, including suggestions;
+their normal subscription usage is accepted and those features remain enabled.
 Only approved destinations can connect. A new Desktop build, sign-in flow, download or remote
 connector may require an additional explicit approval. If ordinary functionality is affected,
 use **Use Claude's default connection** in the dashboard and fully restart Desktop, then inspect

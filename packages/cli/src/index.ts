@@ -24,6 +24,7 @@ import { installTrayAgent, removeTrayAgent, trayLoginItemDecision, trayPlistPath
 import { nativeSupervisor, registration, writePaths } from "./registration.ts";
 import { installLauncher, uninstallLauncher } from "./launcher.ts";
 import type { RecoveryDeps } from "./doctor.ts";
+import { nativeIndependenceSummary } from "./native-independence.ts";
 import { applyAppProxy, caTrusted, CA_NAME, currentAppProxy, migrateLegacyAppProxy, nssDb, removeAppProxy, trustCa, untrustCa } from "./picker.ts";
 import { activateDesktopPicker, checkAppProxyActivation, commitDesktopPicker, readDesktopActivationState } from "./desktop-activation.ts";
 import { removeClientIntegrations, setPickerEnabled } from "./integrations.ts";
@@ -655,7 +656,8 @@ function printDoctor(d: Awaited<ReturnType<typeof import("./doctor.ts").doctor>>
   ];
   const w = Math.max(...rows.map((r) => r[0].length));
   for (const [k, v] of rows) console.log(`${k.padEnd(w)}  ${v}`);
-  if (d.problems.length === 0) console.log("\n✓ no problems found");
+  if (d.nativeIndependence) console.log(`\nnative independence: ${nativeIndependenceSummary(d.nativeIndependence)}`);
+  if (d.problems.length === 0) console.log("\n✓ no operational-health problems found");
   else {
     console.log("\nproblems:");
     for (const p of d.problems) console.log(`  ✗ ${p.message} [${p.code}]`);

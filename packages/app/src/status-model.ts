@@ -10,6 +10,8 @@ export type Doctor = {
   desktop?: { proxy?: "ripple" | "none" | "other"; url?: string | null };
   cli?: { proxy?: "ripple" | "none" | "other"; url?: string | null };
   problems?: { code?: string; message?: string }[];
+  /** Read-only persisted-state audit, separate from router health; never proves live independence. */
+  nativeIndependence?: { schemaVersion?: number; scope?: string; originalIndependent?: boolean | null; knownCouplingsAbsent?: boolean | null };
 };
 
 /** `clauderipple repair --json`. */

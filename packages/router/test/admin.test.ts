@@ -10,6 +10,7 @@ import path from "node:path";
 import { DEFAULTS, type Config, type ProviderModel } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
 import { backfillContextWindows, effortLevelsForModel, googleHealth, measureUnsettledModels, parseUpdateCheck, type AdminDeps, type LimitsProvider } from "../src/admin.ts";
+import { chatPickerModels, injectPickerModels } from "../src/picker.ts";
 import { startAdmin, fetch, adminTestTlsOptions, adminTestAuthHeaders } from "./admin-client.ts";
 import type { ImageRequest } from "../src/providers/chatgpt/index.ts";
 import type { GoogleAccountStatus } from "../src/providers/google/index.ts";
@@ -2701,7 +2702,7 @@ test("POST /api/providers/probe[chatgpt] falls back to the measured list when th
   );
 });
 
-test("POST /api/providers/probe[google] lists generateContent models across pages and mints effortLevels", async () => {
+test("POST /api/providers/probe[google] lists generateContent models and offers only recognized effort ladders", async () => {
   const seen: { url: string; key: string | null }[] = [];
   const pages: Record<string, unknown> = {
     "": {
@@ -2715,6 +2716,11 @@ test("POST /api/providers/probe[google] lists generateContent models across page
     page2: {
       models: [
         { name: "models/gemini-2.5-pro", displayName: "Gemini 2.5 Pro", inputTokenLimit: 2097152, supportedGenerationMethods: ["generateContent"], thinking: true },
+        { name: "models/gemini-4-carbon", displayName: "Gemini 4 Carbon", inputTokenLimit: 1048576, supportedGenerationMethods: ["generateContent", "countTokens"], thinking: true },
+        { name: "models/gemini-4-argon", displayName: "Gemini 4 Argon", supportedGenerationMethods: ["generateContent"], thinking: true },
+        { name: "models/gemini-4-future", displayName: "Gemini Future", supportedGenerationMethods: ["generateContent"], thinking: true },
+        { name: "models/gemini-4-carbon-unannounced", supportedGenerationMethods: ["generateContent"], thinking: true },
+        { name: "models/gemini-4-carbon-embedding", supportedGenerationMethods: ["embedContent"], thinking: true },
       ],
     },
   };
@@ -2727,15 +2733,35 @@ test("POST /api/providers/probe[google] lists generateContent models across page
         body: JSON.stringify({ type: "google", auth: "api-key", apiKey: "secret-key", url: "https://generativelanguage.googleapis.com" }),
       });
       assert.equal(res.status, 200);
-      assert.deepEqual(await res.json(), {
+      const result = await res.json() as { models: ProviderModel[] };
+      assert.deepEqual(result, {
         ok: true,
         auth: "ok",
         models: [
           { id: "gemini-3-pro-preview", name: "Gemini 3 Pro Preview", contextWindow: 1048576, effortLevels: ["minimal", "low", "medium", "high"] },
           { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash", contextWindow: 1048576 },
           { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro", contextWindow: 2097152, effortLevels: ["minimal", "low", "medium", "high"] },
+          { id: "gemini-4-carbon", name: "Gemini 4 Carbon", contextWindow: 1048576, effortLevels: ["low", "medium", "high"] },
+          { id: "gemini-4-argon", name: "Gemini 4 Argon", effortLevels: ["low", "medium", "high"] },
+          { id: "gemini-4-future", name: "Gemini Future" },
+          { id: "gemini-4-carbon-unannounced" },
         ],
       });
+      // The saved discovery result is the Desktop picker's per-model evidence. Its synthetic
+      // native row stays unchanged; Carbon receives three levels and unknown families receive none.
+      const personal = makeCfg({
+        security: { mode: "personal", approvedOrigins: ["https://generativelanguage.googleapis.com"] },
+        providers: { google: { type: "google", auth: "api-key", apiKey: "test-key", models: result.models } },
+        cli: { ...DEFAULTS.cli, extraModels: [{ model: "gemini-4-carbon", name: "Gemini 4 Carbon" }, { model: "gemini-4-future", name: "Gemini Future" }] },
+      });
+      assert.deepEqual(effortLevelsForModel(personal, "gemini-4-carbon"), ["low", "medium", "high"]);
+      assert.deepEqual(effortLevelsForModel(personal, "gemini-4-future"), []);
+      const native = { id: "claude-opus-5-5", thinking: { effort_options: ["low", "medium", "high", "xhigh", "max"].map(id => ({ id })) } };
+      const picker = { model_selector_config: [{ id: "code", models: [structuredClone(native)] }] };
+      injectPickerModels(picker, chatPickerModels(personal), undefined, id => effortLevelsForModel(personal, id), { codeOnly: true, compatibleCodeSurfaces: ["code"] });
+      assert.deepEqual(picker.model_selector_config[0]!.models[0], native);
+      assert.deepEqual(picker.model_selector_config[0]!.models.find(model => model.id === "gemini-4-carbon")?.thinking.effort_options.map(option => option.id), ["low", "medium", "high"]);
+      assert.equal(picker.model_selector_config[0]!.models.find(model => model.id === "gemini-4-future")?.thinking, undefined);
     },
     {
       probeFetch: async (url, init) => {

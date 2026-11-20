@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ConfigStore, normalizeConfig } from "../src/config.ts";
+import { ConfigStore, normalizeConfig, type Config } from "../src/config.ts";
 import { writeJsonAtomic, writeSecretJsonAtomic } from "../src/locked-file.ts";
 import { readPrivateFile } from "../src/private-file.ts";
 import { configurePersonalEgressPolicy } from "../src/personal-policy.ts";
@@ -11,12 +11,12 @@ import { egressFetch } from "../src/egress.ts";
 import { Logger } from "../src/log.ts";
 import { RequestLog } from "../src/requestlog.ts";
 import { startAdmin, fetch as adminFetch, unauthenticatedFetch } from "./admin-client.ts";
-import type { AdminDeps } from "../src/admin.ts";
+import { adoptNewClaudeModels, type AdminDeps } from "../src/admin.ts";
 
 const ORIGIN = "https://school.example.test";
 const SECRET = "SYNTHETIC-KEY-ADMIN-PERSONAL-NOT-REAL";
 
-async function fixture(t: TestContext, controls: Pick<AdminDeps, "runCli" | "picker" | "startCliDetached" | "claudeCodeCredentialReaders" | "claudeIdentity" | "chatgpt" | "google" | "power" | "remote" | "agentsChanged"> = {}, beforeStart?: (home: string) => void) {
+async function fixture(t: TestContext, controls: Pick<AdminDeps, "runCli" | "picker" | "startCliDetached" | "claudeCodeCredentialReaders" | "claudeIdentity" | "claudeUsage" | "claudeModels" | "probeFetch" | "chatgpt" | "google" | "power" | "remote" | "agentsChanged"> = {}, beforeStart?: (home: string) => void) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-personal-admin-"));
   const previous = { home: process.env.CLAUDERIPPLE_HOME, settings: process.env.CLAUDE_SETTINGS_PATH };
   process.env.CLAUDERIPPLE_HOME = home;
@@ -36,7 +36,7 @@ async function fixture(t: TestContext, controls: Pick<AdminDeps, "runCli" | "pic
     fs.rmSync(home, { recursive: true, force: true });
   });
   beforeStart?.(home);
-  server = await startAdmin({
+  const deps: AdminDeps = {
     config: () => store.get(), configFile: file, agentDir: path.join(home, "agents"),
     log: new Logger(null, 1_000_000, 1, false, true),
     requests: new RequestLog(path.join(home, "requests.jsonl"), undefined, undefined, true),
@@ -44,12 +44,13 @@ async function fixture(t: TestContext, controls: Pick<AdminDeps, "runCli" | "pic
     health: () => 0, version: "synthetic-personal-policy",
     claudeCodeCredentialReaders: { keychain: () => null, credentialsFile: () => null },
     ...controls,
-  });
+  };
+  server = await startAdmin(deps);
   const base = `https://127.0.0.1:${server.tlsPort}`;
   const send = (resource: string, body: unknown, method = "POST") => adminFetch(base + resource, {
     method, headers: { "content-type": "application/json" }, body: JSON.stringify(body),
   });
-  return { base, file, store, send, settings: process.env.CLAUDE_SETTINGS_PATH! };
+  return { base, file, store, send, deps, settings: process.env.CLAUDE_SETTINGS_PATH! };
 }
 
 test("personal admin leaves legacy update state untouched and reports the coordinator disabled", async t => {
@@ -115,6 +116,92 @@ test("personal admin refuses hidden account, updater and integration capabilitie
     await response.text();
   }
   assert.deepEqual(calls, []);
+});
+
+test("personal admin never discovers native credentials or account metadata through probes and passive pages", async t => {
+  const calls: string[] = [];
+  const forbidden = (label: string): never => { calls.push(label); throw new Error(`unexpected native account access: ${label}`); };
+  const f = await fixture(t, {
+    claudeCodeCredentialReaders: { keychain: () => forbidden("keychain"), credentialsFile: () => forbidden("credentialsFile") },
+    claudeIdentity: async () => forbidden("identity"),
+    claudeUsage: async () => forbidden("usage"),
+    claudeModels: async () => forbidden("models"),
+    probeFetch: async () => forbidden("transport"),
+  });
+  // A stale account-pool provider must not turn status polling into credential discovery.
+  const current = f.store.get();
+  writeSecretJsonAtomic(f.file, { ...current, providers: { ...current.providers, legacy: { type: "anthropic", auth: "claude-code", accountPool: true } } });
+  assert.equal(f.store.get().providers.legacy?.type, "anthropic");
+  const beforeConfig = fs.readFileSync(f.file);
+  const beforeNames = fs.readdirSync(path.dirname(f.file)).sort();
+
+  const refused = await f.send("/api/providers/probe", { type: "anthropic", auth: "claude-code" });
+  assert.equal(refused.status, 403);
+  assert.match(await refused.text(), /disabled in personal mode/i);
+  for (const resource of ["/api/status", "/api/limits", "/api/claude-models", "/api/context-windows", "/api/requests"]) {
+    const response = await adminFetch(f.base + resource);
+    assert.equal(response.status, 200, resource);
+    const body = await response.json() as Record<string, any>;
+    if (resource === "/api/status") {
+      assert.equal(body.providers.legacy.authSource, null);
+      assert.equal(body.providers.legacy.signedIn, null);
+      assert.equal(body.providers.legacy.accountCount, 0);
+      assert.equal(body.claude, undefined);
+    }
+    if (resource === "/api/limits") assert.deepEqual(body.providers, []);
+    if (resource === "/api/claude-models") assert.equal(body.source, "fallback");
+  }
+  assert.deepEqual(calls, [], "no native keychain, account identity, usage, catalogue or probe transport access");
+  assert.deepEqual(fs.readFileSync(f.file), beforeConfig);
+  assert.deepEqual(fs.readdirSync(path.dirname(f.file)).sort(), beforeNames);
+  assert.equal(fs.existsSync(f.settings), false);
+});
+
+test("personal Google API-key discovery remains available without native login callbacks", async t => {
+  const calls: string[] = [];
+  const origin = "https://generativelanguage.googleapis.com";
+  const f = await fixture(t, {
+    claudeCodeCredentialReaders: { keychain: () => { calls.push("keychain"); return null; }, credentialsFile: () => { calls.push("credentialsFile"); return null; } },
+    claudeModels: async () => { calls.push("nativeModels"); return null; },
+    claudeIdentity: async () => { calls.push("nativeIdentity"); return null; },
+    probeFetch: async (url, init) => {
+      calls.push("google");
+      assert.equal(new URL(url).origin, origin);
+      const headers = new Headers(init.headers);
+      assert.equal(headers.get("x-goog-api-key"), SECRET);
+      assert.equal(headers.get("authorization"), null);
+      assert.equal(headers.get("cookie"), null);
+      return Response.json({ models: [{ name: "models/gemini-4-carbon", displayName: "Carbon", supportedGenerationMethods: ["generateContent"], thinking: true }] });
+    },
+  });
+  writeSecretJsonAtomic(f.file, { ...f.store.get(), security: { mode: "personal", approvedOrigins: [origin] } });
+  const response = await f.send("/api/providers/probe", { type: "google", auth: "api-key", url: origin, apiKey: SECRET });
+  assert.equal(response.status, 200);
+  const body = await response.json() as { ok: boolean; models: { id: string }[] };
+  assert.equal(body.ok, true);
+  assert.equal(body.models[0]?.id, "gemini-4-carbon");
+  assert.deepEqual(calls, ["google"]);
+});
+
+test("native catalogue maintenance stays inert in personal mode and discards an earlier generic result", async t => {
+  let calls = 0;
+  const f = await fixture(t, { claudeModels: async () => { calls++; return [{ id: "claude-synthetic-new" }]; } });
+  const beforeConfig = fs.readFileSync(f.file);
+  const beforeNames = fs.readdirSync(path.dirname(f.file)).sort();
+  assert.deepEqual(await adoptNewClaudeModels(f.deps), []);
+  assert.equal(calls, 0);
+
+  const { security: _security, ...generic } = f.store.get();
+  let cfg: Config = generic;
+  let resolve!: (models: { id: string }[]) => void;
+  const catalog = new Promise<{ id: string }[]>(done => { resolve = done; });
+  const pending = adoptNewClaudeModels({ ...f.deps, config: () => cfg, claudeModels: () => { calls++; return catalog; } });
+  assert.equal(calls, 1, "the generic request was already started");
+  cfg = { ...generic, security: { mode: "personal", approvedOrigins: [] } };
+  resolve([{ id: "claude-synthetic-new" }]);
+  assert.deepEqual(await pending, []);
+  assert.deepEqual(fs.readFileSync(f.file), beforeConfig);
+  assert.deepEqual(fs.readdirSync(path.dirname(f.file)).sort(), beforeNames);
 });
 
 test("native admin approval is explicit, exact, credential-preserving and immediately revocable", async t => {

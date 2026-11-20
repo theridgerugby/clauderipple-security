@@ -15,6 +15,23 @@ function storage(t: TestContext) {
   return { home, file };
 }
 
+test("memory-only discard drops observed authority and version without changing consent or files", t => {
+  const { home, file } = storage(t);
+  const auth = new ObservedClaudeCodeAuth(file);
+  authorizeClaudeLocalAuth(home);
+  auth.observe(["authorization", "Bearer synthetic-discarded-secret", "user-agent", "claude-cli/2.0.1 (external, cli)"], 1);
+  const before = fs.readFileSync(claudeLocalAuthRevokedPath(home), "utf8");
+  t.mock.method(fs, "writeFileSync", () => { throw new Error("discard must not write"); });
+  t.mock.method(fs, "renameSync", () => { throw new Error("discard must not rename"); });
+  auth.discard();
+  assert.equal(auth.getFresh(1), null);
+  assert.equal(auth.cliVersion(1), null);
+  assert.equal(fs.readFileSync(claudeLocalAuthRevokedPath(home), "utf8"), before);
+  assert.equal(isClaudeLocalAuthRevoked(home), false, "discard is not an upstream or local logout");
+  auth.observe(["authorization", "Bearer synthetic-new-generic-secret"], 2);
+  assert.equal(auth.getFresh(2)?.authorization, "Bearer synthetic-new-generic-secret", "normal generic observation remains available later");
+});
+
 for (const activity of ["observe", "noteUsed"] as const) {
   test(`continuous ${activity} stays fresh in RAM and never writes a credential`, t => {
     const { home, file } = storage(t);

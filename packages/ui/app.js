@@ -405,6 +405,8 @@ function applyDesktopUiProfile() {
     deferredGenericView = null;
     if (generic) showView(name);
   }
+  // Configuration can arrive after doctor. Update only its note, without another probe or log read.
+  if (typeof renderNativeIndependence === "function") renderNativeIndependence();
 }
 
 function selectOption(value, text) { return el("option", { value }, [text]); }
@@ -1223,6 +1225,37 @@ function connResultText(r) {
   return t(keys[r.action] || "conn.res.fail");
 }
 
+/** A healthy router and native independence are separate claims. Show only fixed, local text. */
+function connNativeIndependence(s) {
+  if (currentConfig?.security?.mode !== "personal") return null;
+  const report = s?.doctor?.nativeIndependence;
+  let key = "conn.native.unknown";
+  if (report && typeof report === "object" && !Array.isArray(report) && report.schemaVersion === 1 && report.scope === "installation-local-persisted-state") {
+    if (report.originalIndependent === false) key = "conn.native.coupled";
+    else if (report.originalIndependent === null && report.knownCouplingsAbsent === true) key = "conn.native.savedClear";
+    else if (report.originalIndependent === null && report.knownCouplingsAbsent === false) key = "conn.native.effects";
+  }
+  // No green verdict, raw findings, paths or diagnostic errors. Even a future true needs live proof.
+  return el("div", { class: "conn-note conn-native-independence", role: "status" }, [
+    el("div", { class: "conn-note-text" }, [el("strong", { text: t("conn.native.title") }), el("span", { text: t(key) })]),
+  ]);
+}
+
+function connIndependenceSlot(s, calm) {
+  const note = connNativeIndependence(s);
+  const slot = el("div", { id: "conn-native-independence-slot", class: calm ? "cell-note conn-calm-note" : "" }, note ? [note] : []);
+  slot.hidden = !note;
+  return slot;
+}
+
+function renderNativeIndependence() {
+  const slot = $("#conn-native-independence-slot");
+  if (!APP || !slot) return;
+  const note = connNativeIndependence(shellState);
+  slot.hidden = !note;
+  slot.replaceChildren(...(note ? [note] : []));
+}
+
 /** The running action, the last result and the "reopen Claude" step: the same in both card sizes. */
 function connNotes(s) {
   const notes = [];
@@ -1301,6 +1334,7 @@ function renderConnection() {
         el("div", { class: "cell-text" }, [el("span", { class: "cell-label strong", text: m.title }), m.lead ? el("span", { class: "cell-sub", text: m.lead }) : null]),
         m.secondary ? el("div", { class: "cell-value" }, [connButton(m.secondary, "btn secondary compact")]) : null,
       ]),
+      connIndependenceSlot(s, true),
       ...connNotes(s).map((note) => el("div", { class: "cell-note conn-calm-note" }, [note])),
       connLoginOffer(s) ? el("div", { class: "cell-note conn-calm-note" }, [connLoginOffer(s)]) : null,
     ]));
@@ -1319,6 +1353,7 @@ function renderConnection() {
         m.reason ? el("p", { class: "conn-reason", text: m.reason }) : null,
       ]),
     ]),
+    connIndependenceSlot(s, false),
     ...connNotes(s),
     actions.length ? el("div", { class: "conn-actions" }, actions) : null,
     connLoginOffer(s),

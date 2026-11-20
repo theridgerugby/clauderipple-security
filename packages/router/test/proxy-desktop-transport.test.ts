@@ -9,6 +9,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
+import zlib from "node:zlib";
 import { EventEmitter, once } from "node:events";
 import type { Duplex } from "node:stream";
 import { CertStore } from "../src/certs.ts";
@@ -41,15 +42,16 @@ function base(t: TestContext) {
   });
   const log = new Logger(null, 4096, 1, true, true);
   const certs = new CertStore(home);
+  const requests = new RequestLog(path.join(home, "requests.jsonl"), 10, 4096, true);
   const proxy = new Proxy({ config: () => cfg, home, log, certs,
-    requests: new RequestLog(path.join(home, "requests.jsonl"), 10, 4096, true),
+    requests,
     health: new UpstreamHealth(() => 100, () => {}), agentDir: path.join(home, "agents"),
     claudeCodeCredentialReaders: { keychain: () => null, credentialsFile: () => null },
     claudeLoginKey: () => undefined, claudeProfileFetch: async () => new Response("{}", { status: 404 }),
   });
   const internals = proxy as unknown as Internals;
   t.after(() => { proxy.close(); log.close(); fs.rmSync(home, { recursive: true, force: true }); });
-  return { home, proxy, internals, certs, config: () => cfg,
+  return { home, proxy, internals, certs, requests, log, config: () => cfg,
     change: (update: (old: Config) => Config, reconcile = true) => { cfg = update(cfg); if (reconcile) proxy.reconcileConfig(cfg); },
   };
 }
@@ -161,7 +163,8 @@ test("opaque tunnels are capped and all pending connections are closed at shutdo
   assert.ok(upstreams.every(sock => sock.destroyed));
 });
 
-type Reply = { status: number; headers: http.IncomingHttpHeaders; body: string };
+type Reply = { status: number; headers: http.IncomingHttpHeaders; body: string; rawBody: Buffer };
+type NativeReply = { status: number; headers: http.OutgoingHttpHeaders; body: Buffer };
 async function readHead(socket: net.Socket): Promise<{ header: string; tail: Buffer }> {
   return await new Promise((resolve, reject) => {
     let bytes = Buffer.alloc(0);
@@ -183,6 +186,7 @@ async function readHead(socket: net.Socket): Promise<{ header: string; tail: Buf
 
 async function rig(t: TestContext) {
   const r = base(t);
+  let nativeReply: NativeReply | undefined;
   const ca = createCa({ cn: "Synthetic Desktop transport CA" });
   const leaves = Object.fromEntries(["api.anthropic.com", "claude.ai", ASSET].map(host => [host, createLeaf({ host, caCertPem: ca.certPem, caKeyPem: ca.keyPem })]));
   const sockets = new Set<Duplex>();
@@ -202,6 +206,16 @@ async function rig(t: TestContext) {
     const server = https.createServer({ cert: leaves[host]!.certPem, key: leaves[host]!.keyPem }, (req, res) => {
       const hit: typeof hits[number] = { host, path: req.url!, headers: req.headers };
       hits.push(hit);
+      if (nativeReply) {
+        const reply = nativeReply;
+        const chunks: Buffer[] = [];
+        req.on("data", bytes => chunks.push(bytes));
+        req.on("end", () => {
+          hit.raw = Buffer.concat(chunks).toString("utf8");
+          res.writeHead(reply.status, reply.headers).end(reply.body);
+        });
+        return;
+      }
       if (req.url === "/v1/messages") {
         const body: Buffer[] = [];
         req.on("data", bytes => body.push(bytes));
@@ -285,7 +299,10 @@ async function rig(t: TestContext) {
         const body: Buffer[] = [];
         response.on("data", chunk => body.push(chunk));
         response.once("error", reject);
-        response.once("end", () => resolve({ status: response.statusCode!, headers: response.headers, body: Buffer.concat(body).toString("utf8") }));
+        response.once("end", () => {
+          const rawBody = Buffer.concat(body);
+          resolve({ status: response.statusCode!, headers: response.headers, body: rawBody.toString("utf8"), rawBody });
+        });
       });
       req.once("error", reject);
       req.end(raw);
@@ -297,7 +314,9 @@ async function rig(t: TestContext) {
     socket.write(`${options.method ?? "GET"} ${options.path ?? "/ws"} HTTP/1.1\r\nHost: ${options.host ?? options.target ?? "claude.ai"}\r\nConnection: Upgrade\r\nUpgrade: ${options.protocol ?? "websocket"}\r\nSec-WebSocket-Key: ${options.key ?? KEY}\r\nSec-WebSocket-Version: 13\r\nCookie: fixture=synthetic-native-session\r\nProxy-Authorization: SYNTHETIC-LOCAL-PROXY-SECRET\r\n\r\n`);
     return { socket, ...(await response) };
   }
-  return { ...r, secure, send, upgrade, hits, leaves, websocketUpstreams, events };
+  return { ...r, secure, send, upgrade, hits, leaves, websocketUpstreams, events,
+    replyWith: (reply: NativeReply) => { nativeReply = reply; },
+  };
 }
 
 test("approved asset CONNECT stays end-to-end TLS without minting a local interception leaf", { timeout: 15_000 }, async t => {
@@ -450,3 +469,54 @@ test("native Desktop subscription turns and auxiliary services ignore stale rout
   assert.equal(r.hits.length, cases.length, "no auxiliary provider was queried first");
   assert.equal(r.proxy.compactPicks.take("desktop-native-session", false, () => undefined), undefined, "ignored queued compaction is cleared");
 });
+
+for (const host of ["api.anthropic.com", "claude.ai"]) {
+  for (const status of [400, 403, 402, 429]) {
+    test(`personal native ${host} ${status}: full error representations and retry policy remain upstream-owned`, { timeout: 20_000 }, async t => {
+      const r = await rig(t);
+      // Deterministic incompressible fixture data keeps encoded bodies above the 4 KiB diagnostic
+      // cap as well. A decompressed prefix cannot accidentally satisfy a compressed-body check.
+      const details = Array.from({ length: 256 }, (_, index) => crypto.createHash("sha256")
+        .update(`synthetic-native-error-${index}`).digest("hex")).join("");
+      const plain = Buffer.from(JSON.stringify({ type: "error", error: {
+        type: status === 429 ? "rate_limit_error" : "invalid_request_error",
+        message: "Synthetic subscription quota exhausted; native refusal details follow.", details,
+      } }));
+      const request = { model: "claude-haiku-5-5", max_tokens: 1, messages: [{ role: "user", content: "Synthetic native refusal" }] };
+      for (const encoding of ["identity", "gzip", "br"] as const) {
+        const body = encoding === "gzip" ? zlib.gzipSync(plain) : encoding === "br" ? zlib.brotliCompressSync(plain) : plain;
+        assert.ok(body.length > 4096, "the encoded fixture must exceed the old refusal cap");
+        const headers: Record<string, string> = {
+          "content-type": "application/json", "content-length": String(body.length),
+          "retry-after": "7", "x-should-retry": "true",
+          "anthropic-ratelimit-unified-status": "rejected",
+          "anthropic-ratelimit-unified-5h-utilization": "1",
+          "anthropic-ratelimit-unified-5h-reset": "4102444800",
+          "anthropic-ratelimit-requests-remaining": "0",
+          "request-id": "synthetic-native-refusal",
+          etag: '"native-error-representation"', "cache-control": "private, no-store",
+          ...(encoding === "identity" ? {} : { "content-encoding": encoding }),
+        };
+        r.replyWith({ status, headers, body });
+        const before = r.hits.length;
+        const reply = await r.send(host === "api.anthropic.com" ? "/v1/messages" : "/api/native-refusal", host, { body: request });
+        assert.equal(reply.status, status, encoding);
+        assert.equal(reply.rawBody.length, body.length, `${encoding}: the complete upstream representation must reach Desktop`);
+        assert.ok(reply.rawBody.equals(body), `${encoding}: every upstream representation byte must remain unchanged`);
+        for (const [name, value] of Object.entries(headers)) assert.equal(reply.headers[name], value, `${encoding}: ${name}`);
+        if (encoding === "identity") assert.equal(reply.headers["content-encoding"], undefined);
+        assert.equal(r.hits.length, before + 1, "a native refusal never creates another model request");
+        const seen = r.hits.at(-1)!;
+        assert.equal(seen.host, host);
+        assert.equal(seen.raw, JSON.stringify(request));
+        assert.equal(seen.headers.authorization, "Bearer SYNTHETIC-NATIVE-SUBSCRIPTION");
+        assert.equal(seen.headers.cookie, "fixture=synthetic-native-session");
+        assert.equal(seen.headers["x-api-key"], undefined);
+        await r.proxy.rows.settled();
+        assert.ok(r.requests.list(10).every(record => (record.note?.length ?? 0) <= 350), "side-band error observations remain bounded");
+        assert.ok(!(r.log.memoryTail(500) ?? "").includes(details), "the full native error must not enter diagnostic memory");
+        assert.equal(fs.existsSync(path.join(r.home, "requests.jsonl")), false, "personal diagnostics remain memory-only");
+      }
+    });
+  }
+}

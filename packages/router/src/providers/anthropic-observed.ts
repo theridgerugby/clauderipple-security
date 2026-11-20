@@ -96,6 +96,10 @@ export class ObservedClaudeCodeAuth {
     this.cliVersionAt = 0;
   }
 
+  /** Drop borrowed in-memory authority when entering a mode that does not use it. No logout,
+   * consent change, native credential access or persistent write is performed. */
+  discard(): void { this.clear(); }
+
   /** Drop in-memory authority immediately, persist refusal, and retire only our legacy copy. */
   revoke(): void {
     this.locallyRevoked = true;

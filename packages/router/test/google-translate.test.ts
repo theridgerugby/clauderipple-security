@@ -85,6 +85,21 @@ test("Gemini 4 Argon sends its documented low/medium/high thinking levels, never
   assert.equal(toGeminiRequest(request, { model: "gemini-5-unknown", effort: "high" }).generationConfig?.thinkingConfig, undefined);
 });
 
+test("Gemini 4 Carbon sends only its documented thinking levels and preserves Google's default", () => {
+  for (const [effort, level] of [["none", "low"], ["minimal", "low"], ["low", "low"], ["medium", "medium"], ["high", "high"], ["xhigh", "high"], ["max", "high"], ["ultra", "high"]] as const) {
+    const out = toGeminiRequest(request, { model: "gemini-4-carbon", effort });
+    assert.deepEqual(out.generationConfig?.thinkingConfig, { thinkingLevel: level }, effort);
+  }
+  for (const effort of [undefined, "bogus"]) {
+    const out = toGeminiRequest(request, { model: "gemini-4-carbon", ...(effort ? { effort } : {}) });
+    assert.equal(out.generationConfig?.thinkingConfig, undefined, "no explicit valid effort leaves Google's medium default intact");
+  }
+  for (const model of ["gemini-4-future", "gemini-5-unknown", "gemini-4-carbonyl", "gemini-4-carbon-unannounced"]) {
+    const out = toGeminiRequest(request, { model, effort: "high" });
+    assert.equal(out.generationConfig?.thinkingConfig, undefined, `${model} gets no guessed thinking configuration`);
+  }
+});
+
 test("a capped ladder clamps the effort the model is told and sent", () => {
   const levels = ["low", "medium", "high"];
   const out = toGeminiRequest({ ...request, output_config: { effort: "xhigh" }, tools: [] }, { model: "gemini-3-pro", effort: "xhigh", caps: { effortLevels: levels } });

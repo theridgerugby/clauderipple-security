@@ -183,7 +183,7 @@ test("personal Google picker advertises only the chosen model's own supported ef
   const native = { id: NATIVE, name: "Native", thinking: { effort_options: [{ id: "high", recommended: true }] } };
   const menu = { model_selector_config: [{ id: "code", models: [structuredClone(native)] as Record<string, unknown>[] }] };
   assert.deepEqual(effortLevelsForModel(cfg, GEMINI), []);
-  injectPickerModels(menu, chatPickerModels(cfg), undefined, id => effortLevelsForModel(cfg, id), { codeOnly: true });
+  injectPickerModels(menu, chatPickerModels(cfg), undefined, id => effortLevelsForModel(cfg, id), { codeOnly: true, compatibleCodeSurfaces: ["code"] });
   assert.deepEqual(menu.model_selector_config[0]!.models[0], native);
   assert.equal(Object.hasOwn(menu.model_selector_config[0]!.models[1]!, "thinking"), false);
   cfg.providers.google!.models![0]!.effortLevels = ["low", "high"];

@@ -317,8 +317,9 @@ test("doctor: shape, mode and proxies on a healthy install", async () => {
   fs.writeFileSync(settings, JSON.stringify({ env: { HTTPS_PROXY: proxyUrl, NODE_EXTRA_CA_CERTS: path.join(home, "ca.pem") } }));
   applyAppProxy(proxyUrl);
   const { ops } = fakeSupervisor({ pid: 77 });
-  const d = await doctor({ home, version: "9.9.9", supervisor: ops, routerStatus: answering("9.9.9"), remoteHostInstalled: () => false });
-  assert.deepEqual(d, {
+  const d = await doctor({ home, version: "9.9.9", supervisor: ops, routerStatus: answering("9.9.9"), remoteHostInstalled: () => false, nativeCaTrust: async () => false });
+  const { nativeIndependence, ...health } = d;
+  assert.deepEqual(health, {
     mode: "ripple",
     router: { responding: true, runtimeVerified: true, version: "9.9.9", pid: 77, url: proxyUrl, adminUrl: "http://127.0.0.1:18792" },
     supervisor: { registered: true, program: process.execPath, programExists: true, state: "running", installedHome: null },
@@ -326,6 +327,10 @@ test("doctor: shape, mode and proxies on a healthy install", async () => {
     cli: { proxy: "ripple", url: proxyUrl },
     problems: [],
   });
+  assert.equal(nativeIndependence?.originalIndependent, false, "healthy routing is not native independence");
+  assert.equal(nativeIndependence?.knownCouplingsAbsent, false);
+  assert.equal(nativeIndependence?.findings.sharedProxy.state, "present");
+  assert.equal(nativeIndependence?.findings.desktopProxy.state, "present");
 });
 
 test("doctor authenticates over TLS using an existing recovery fixture home", async t => {
@@ -343,7 +348,7 @@ test("doctor authenticates over TLS using an existing recovery fixture home", as
   const config = JSON.parse(readPrivateFile(file).toString("utf8"));
   writeSecretJsonAtomic(file, { ...config, admin: { port: fixture.endpoint.publicPort } });
   const { ops, calls } = fakeSupervisor({});
-  const result = await doctor({ home, version: "9.9.9", supervisor: ops, remoteHostInstalled: () => false });
+  const result = await doctor({ home, version: "9.9.9", supervisor: ops, remoteHostInstalled: () => false, nativeCaTrust: async () => false });
   assert.equal(result.router.responding, true);
   assert.equal(result.router.version, "9.9.9");
   assert.equal(result.router.runtimeVerified, false, "authenticated liveness alone does not prove source identity");

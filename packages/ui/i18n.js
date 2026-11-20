@@ -3464,6 +3464,22 @@ Object.assign(I18N.pt, {
   "mac.unavailable.title": "Este recurso não está disponível nesta versão", "mac.unavailable.body": "Atualize o ClaudeRipple para a versão mais recente para gerenciar o notebook nesta tela.",
 });
 
+// Personal-only native-independence note. Other locales use t()'s existing English fallback.
+Object.assign(I18N.en, {
+  "conn.native.title": "Native Claude independence",
+  "conn.native.coupled": "Proxy settings still couple Claude Desktop or terminal Claude Code to Ripple. Router health does not establish independent operation.",
+  "conn.native.savedClear": "No known coupling was found in the inspected saved state. Live Claude Desktop and terminal Claude Code independence still needs verification.",
+  "conn.native.effects": "CA trust, saved restoration or background components remain. Live native Claude independence is unverified.",
+  "conn.native.unknown": "Native Claude independence has not been verified. Missing or incomplete diagnostics do not count as a pass.",
+});
+Object.assign(I18N.zh, {
+  "conn.native.title": "原生 Claude 独立性",
+  "conn.native.coupled": "Claude Desktop 或终端 Claude Code 的代理设置仍依赖 Ripple。路由器运行正常不代表原生功能已独立。",
+  "conn.native.savedClear": "已检查的持久化状态中未发现已知依赖。Claude Desktop 和终端 Claude Code 的实际独立运行仍需验证。",
+  "conn.native.effects": "仍有证书信任、恢复快照或后台组件。原生 Claude 是否可独立运行尚未验证。",
+  "conn.native.unknown": "原生 Claude 独立运行尚未验证。缺失或不完整的诊断不能视为通过。",
+});
+
 /** The languages offered, each named in itself, in the order the selector lists them. */
 const LANGUAGES = [
   ["en", "English"], ["ko", "한국어"], ["zh", "简体中文"], ["ja", "日本語"], ["es", "Español"], ["pt", "Português (BR)"],

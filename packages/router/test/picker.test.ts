@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chatPickerModels, injectPickerModels, isBootstrapPath, personalPickerModelProblem } from "../src/picker.ts";
+import { chatPickerModels, DESKTOP_PICKER_ROW_LIMIT, injectPickerModels, isBootstrapPath, personalPickerModelProblem } from "../src/picker.ts";
 import { DEFAULTS, type Config } from "../src/config.ts";
 
 const bootstrap = () => ({
@@ -107,7 +107,7 @@ test("no-ops on unexpected shapes", () => {
   for (const malformed of [null, "future-format", 42, ["nested"]]) {
     const json = { model_selector_config: [{ id: "code", models: [{ id: "claude-opus-5-5" }, malformed] }] };
     const before = JSON.stringify(json);
-    assert.equal(injectPickerModels(json, [{ model: "m", name: "M" }], undefined, undefined, { codeOnly: true }).injected, 0);
+    assert.equal(injectPickerModels(json, [{ model: "m", name: "M" }], undefined, undefined, { codeOnly: true, compatibleCodeSurfaces: ["code"] }).injected, 0);
     assert.equal(JSON.stringify(json), before, "unknown model-list shape stays unchanged");
   }
 });
@@ -156,7 +156,7 @@ test("personal Desktop scope appends only to known Code surfaces and preserves n
   };
   const before = structuredClone(j);
   const extra = [{ model: "gemini-4-carbon", name: "Gemini 4 Carbon", contextWindow: 1_000_000 }];
-  const result = injectPickerModels(j, extra, undefined, () => ["medium", "high"], { codeOnly: true });
+  const result = injectPickerModels(j, extra, undefined, () => ["medium", "high"], { codeOnly: true, compatibleCodeSurfaces: ["code", "ccd"] });
   assert.equal(result.injected, 2);
   assert.deepEqual(j.account, before.account, "account/plan data is never rewritten");
   for (const [i, surface] of j.model_selector_config.entries()) {
@@ -175,8 +175,38 @@ test("personal Desktop scope appends only to known Code surfaces and preserves n
     assert.deepEqual(added.thinking, { effort_options: [{ id: "medium" }, { id: "high", recommended: true }] });
   }
   const first = JSON.stringify(j);
-  assert.equal(injectPickerModels(j, extra, undefined, undefined, { codeOnly: true }).injected, 0);
+  assert.equal(injectPickerModels(j, extra, undefined, undefined, { codeOnly: true, compatibleCodeSurfaces: ["code", "ccd"] }).injected, 0);
   assert.equal(JSON.stringify(j), first, "repeated injection is a full no-op");
+});
+
+test("personal menu additions require explicit per-surface selection compatibility", () => {
+  const json = { model_selector_config: ["code", "ccd", "future-code"].map(id => ({
+    id, models: [{ id: "claude-opus-5-5", name: "Native Opus" }], metadata: { preserve: true },
+  })) };
+  const before = structuredClone(json);
+  const extra = [{ model: "gemini-fixture", name: "Fixture Gemini" }];
+  assert.equal(injectPickerModels(json, extra, undefined, undefined, { codeOnly: true }).injected, 0);
+  assert.deepEqual(json, before, "a missing capability result is a complete native no-op");
+  assert.equal(injectPickerModels(json, extra, undefined, undefined, { codeOnly: true, compatibleCodeSurfaces: [] }).injected, 0);
+  const result = injectPickerModels(json, extra, undefined, undefined, { codeOnly: true, compatibleCodeSurfaces: ["ccd"] });
+  assert.equal(result.injected, 1);
+  assert.deepEqual(json.model_selector_config[0], before.model_selector_config[0]);
+  assert.deepEqual(json.model_selector_config[2], before.model_selector_config[2]);
+  assert.equal(json.model_selector_config[1]!.models.at(-1)!.id, "gemini-fixture");
+});
+
+test("personal additions reserve bounded menu capacity and preserve every native row", () => {
+  const json = { model_selector_config: [{ id: "code", models: Array.from({ length: DESKTOP_PICKER_ROW_LIMIT - 2 }, (_, i) => ({ id: `claude-native-${i}`, name: `Native ${i}` })) }] };
+  const native = structuredClone(json.model_selector_config[0]!.models);
+  const extras = Array.from({ length: DESKTOP_PICKER_ROW_LIMIT * 2 }, (_, i) => ({ model: `gemini-fixture-${i}`, name: `Fixture ${i}` }));
+  const options = { codeOnly: true, compatibleCodeSurfaces: ["code"] as const };
+  assert.equal(injectPickerModels(json, extras, undefined, undefined, options).injected, 2);
+  assert.equal(json.model_selector_config[0]!.models.length, DESKTOP_PICKER_ROW_LIMIT);
+  assert.deepEqual(json.model_selector_config[0]!.models.slice(0, native.length), native);
+  assert.deepEqual(json.model_selector_config[0]!.models.slice(native.length).map(model => model.id), ["gemini-fixture-0", "gemini-fixture-1"]);
+  const before = JSON.stringify(json);
+  assert.equal(injectPickerModels(json, extras, undefined, undefined, options).injected, 0);
+  assert.equal(JSON.stringify(json), before);
 });
 
 test("a repeated/native extra id cannot overwrite native entry or either context-window map", () => {

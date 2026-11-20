@@ -21,6 +21,7 @@ import { configurePersonalEgressPolicy } from "../src/personal-policy.ts";
 import { chatPickerModels } from "../src/picker.ts";
 import { Proxy } from "../src/proxy.ts";
 import { RequestLog } from "../src/requestlog.ts";
+import { ObservedClaudeCodeAuth } from "../src/providers/anthropic-observed.ts";
 import { createCa, createLeaf } from "../src/x509.ts";
 import { workerLadderLine } from "../../mod/hooks/ladder.ts";
 
@@ -50,7 +51,15 @@ async function rig(t: TestContext) {
   const sockets = new Set<Duplex>();
   const servers: https.Server[] = [];
   const connections = { native: 0, google: 0 };
+  const accountCalls = { observed: 0, profile: 0, keychain: 0, credentialsFile: 0, loginKey: 0 };
+  const observedAuth = new ObservedClaudeCodeAuth();
+  const observe = observedAuth.observe.bind(observedAuth);
+  t.mock.method(observedAuth, "observe", (headers: readonly string[], at?: number) => {
+    accountCalls.observed++;
+    observe(headers, at);
+  });
   let googleMode: "ok" | "hold" | "redirect" | "retired" = "ok";
+  let nativeFailure: number | "reset" | undefined;
   let googleParts: Record<string, unknown>[] = [{ text: GOOGLE_ANSWER }];
   let closedGoogleStreams = 0;
   let redirectTarget = "";
@@ -80,6 +89,13 @@ async function rig(t: TestContext) {
         const raw = Buffer.concat(chunks).toString("utf8");
         (kind === "native" ? native : google).push({ url: req.url ?? "", raw, headers: { ...req.headers } });
         if (kind === "native") {
+          if (nativeFailure === "reset") { res.destroy(); return; }
+          if (nativeFailure !== undefined) {
+            res.writeHead(nativeFailure, { "content-type": "application/json" }).end(JSON.stringify({
+              type: "error", error: { type: "api_error", message: `Synthetic native ${nativeFailure} refusal.` },
+            }));
+            return;
+          }
           res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
             id: "msg_native_fixture", type: "message", role: "assistant", model: NATIVE_MODEL,
             content: [{ type: "text", text: NATIVE_ANSWER }], stop_reason: "end_turn", stop_sequence: null,
@@ -141,8 +157,10 @@ async function rig(t: TestContext) {
   proxy = new Proxy({ config: () => cfg, home, certs, log, requests,
     health: new UpstreamHealth(() => 100, () => {}), agentDir: path.join(home, "fixture-agents"),
     upstreamPort: nativePort, upstreamAgent: nativeAgent,
-    claudeCodeCredentialReaders: { keychain: () => null, credentialsFile: () => null },
-    claudeLoginKey: () => undefined, claudeProfileFetch: async () => new Response("{}", { status: 404 }),
+    observedClaudeCodeAuth: observedAuth,
+    claudeCodeCredentialReaders: { keychain: () => { accountCalls.keychain++; return null; }, credentialsFile: () => { accountCalls.credentialsFile++; return null; } },
+    claudeLoginKey: () => { accountCalls.loginKey++; return undefined; },
+    claudeProfileFetch: async () => { accountCalls.profile++; return new Response("{}", { status: 404 }); },
   });
   await proxy.listen();
   const proxyPort = ((proxy as unknown as { server: net.Server }).server.address() as net.AddressInfo).port;
@@ -201,9 +219,11 @@ async function rig(t: TestContext) {
       socket.destroy();
     }
   }
-  return { home, native, google, connections, send, log, proxy, requests,
+  return { home, native, google, connections, send, log, proxy, requests, accountCalls, observedAuth,
+    reconcile: () => proxy!.reconcileConfig(cfg),
     picker: () => chatPickerModels(cfg), closedGoogleStreams: () => closedGoogleStreams,
     mode: (value: typeof googleMode) => { googleMode = value; },
+    failNative: (value: typeof nativeFailure) => { nativeFailure = value; },
     parts: (value: Record<string, unknown>[]) => { googleParts = value; },
     // Deliberately bypass activation validation to simulate legacy settings reappearing while
     // Desktop is running. Every extra provider below still points at this synthetic TLS origin.
@@ -214,6 +234,52 @@ async function rig(t: TestContext) {
     },
   };
 }
+
+test("personal Google Desktop: native credentials are forwarded without observation, identity lookup or local login access", async t => {
+  const r = await rig(t);
+  assert.equal((await r.send(payload(NATIVE_MODEL))).status, 200);
+  assert.equal((await r.send(payload(GOOGLE_MODEL))).status, 200);
+  await r.proxy.rows.settled();
+  assert.equal(await r.proxy.claudeIdentity.identify(), null, "even an identity callback cannot read the native login in personal mode");
+  assert.equal(await r.proxy.claudeIdentity.identifyWith({ authorization: MAIN_AUTH }), null);
+  r.change(cfg => ({ ...cfg, providers: { ...cfg.providers, legacy: { type: "anthropic", auth: "claude-code", accountPool: true } } }));
+  assert.deepEqual(r.proxy.credentialHealth(), {}, "legacy account-pool status cannot discover native credentials");
+  assert.deepEqual(r.accountCalls, { observed: 0, profile: 0, keychain: 0, credentialsFile: 0, loginKey: 0 });
+  assert.equal(r.observedAuth.getFresh(), null, "no reusable native OAuth snapshot is retained");
+  assert.equal(r.native[0]!.headers.authorization, MAIN_AUTH);
+  assert.equal(r.native[0]!.headers.cookie, MAIN_COOKIE);
+  assert.equal(r.native[0]!.headers["x-api-key"], MAIN_KEY);
+  assert.equal(r.google[0]!.headers["x-goog-api-key"], GOOGLE_KEY);
+  assert.equal(r.google[0]!.headers.authorization, undefined);
+});
+
+test("personal Google Desktop: entering personal mode discards generic observation and identity cache without changing native forwarding", async t => {
+  const r = await rig(t);
+  let security: Config["security"];
+  r.change(current => { security = current.security; const { security: _old, ...next } = current; return next; });
+  // This library-level generic-mode positive control keeps the fixture's exact origin policy.
+  // A production personal entry point would reject a missing policy rather than disable it.
+  configurePersonalEgressPolicy(() => security);
+  assert.equal((await r.send(payload(NATIVE_MODEL))).status, 200);
+  await r.proxy.rows.settled();
+  assert.equal(r.accountCalls.observed, 1, "generic positive control retains account-pool observation");
+  assert.equal(r.accountCalls.profile, 1, "generic positive control performs its ordinary identity lookup");
+  assert.equal(r.observedAuth.getFresh()?.authorization, MAIN_AUTH);
+  r.change(current => ({ ...current, security: security! }));
+  r.reconcile();
+  assert.equal(r.observedAuth.getFresh(), null);
+  assert.equal((await r.send(payload(NATIVE_MODEL))).status, 200);
+  await r.proxy.rows.settled();
+  assert.equal(r.accountCalls.observed, 1);
+  assert.equal(r.accountCalls.profile, 1);
+  assert.equal(r.accountCalls.keychain + r.accountCalls.credentialsFile + r.accountCalls.loginKey, 0);
+  assert.equal(r.native.length, 2);
+  for (const hit of r.native) assert.equal(hit.headers.authorization, MAIN_AUTH);
+  r.change(current => { const { security: _old, ...next } = current; return next; });
+  assert.equal((await r.send(payload(NATIVE_MODEL))).status, 200);
+  await r.proxy.rows.settled();
+  assert.equal(r.accountCalls.profile, 2, "returning to generic mode cannot reuse the discarded identity cache");
+});
 
 for (const stream of [false, true]) {
   test(`personal Google Desktop: ${stream ? "streamed" : "JSON"} Google reply uses only its own key`, async t => {
@@ -257,6 +323,98 @@ test("personal Google Desktop: selecting native Claude preserves its request and
   assert.ok(!JSON.stringify(hit).includes(GOOGLE_KEY));
   assert.equal(r.google.length, 1, "the native turn is not routed through Google");
 });
+
+test("personal Google Desktop: concurrent native turns and native auxiliaries keep their own transport counts and credentials", async t => {
+  const r = await rig(t);
+  const googleSession = "synthetic-google-main-session";
+  const nativeSession = "synthetic-native-main-session";
+  const concurrentAuth = "Bearer sk-ant-oat01-SYNTHETIC-CONCURRENT-NATIVE";
+  const concurrentCookie = "sessionKey=SYNTHETIC-CONCURRENT-NATIVE";
+  const nativeCases: { label: string; model: string; headers: Record<string, string> }[] = [
+    { label: "independent native main", model: "claude-new-native-fixture", headers: {
+      "x-claude-code-session-id": nativeSession, "x-claude-code-request-class": "main",
+      authorization: concurrentAuth, cookie: concurrentCookie,
+    } },
+    { label: "native title beside a Google main", model: "claude-haiku-native-fixture", headers: {
+      "x-claude-code-session-id": googleSession, "x-claude-code-request-class": "auxiliary",
+    } },
+    { label: "native suggestion beside a Google main", model: "claude-haiku-native-fixture", headers: {
+      "x-claude-code-session-id": googleSession, "x-claude-code-request-class": "auxiliary",
+    } },
+    { label: "native compaction beside a Google main", model: NATIVE_MODEL, headers: {
+      "x-claude-code-session-id": googleSession, "x-claude-code-request-class": "compaction",
+    } },
+    { label: "native subagent beside a Google main", model: "claude-sonnet-native-fixture", headers: {
+      "x-claude-code-session-id": googleSession, "x-claude-code-request-class": "subagent",
+      "x-claude-code-agent-id": "synthetic-native-worker",
+    } },
+    { label: "unscoped native auxiliary", model: "claude-haiku-native-fixture", headers: {
+      "x-claude-code-request-class": "auxiliary",
+    } },
+  ];
+  const nativeBodies = nativeCases.map(entry => ({ ...payload(entry.model), messages: [{ role: "user", content: `${RESEARCH}: ${entry.label}` }] }));
+  const replies = await Promise.all([
+    r.send(payload(GOOGLE_MODEL), false, { "x-claude-code-session-id": googleSession, "x-claude-code-request-class": "main" }),
+    ...nativeCases.map((entry, index) => r.send(nativeBodies[index]!, false, entry.headers)),
+  ]);
+  for (const reply of replies) assert.equal(reply.status, 200, reply.body);
+  assert.equal(r.google.length, 1, "only the explicitly selected Google request reaches Google");
+  assert.equal(r.native.length, nativeCases.length, "each client-issued native request reaches Anthropic once; the add-on creates no extra inference");
+  for (const [index, entry] of nativeCases.entries()) {
+    const raw = JSON.stringify(nativeBodies[index]);
+    const matches = r.native.filter(hit => hit.raw === raw);
+    assert.equal(matches.length, 1, entry.label);
+    const hit = matches[0]!;
+    assert.equal(hit.url, "/v1/messages");
+    assert.equal(hit.headers.authorization, entry.headers.authorization ?? MAIN_AUTH);
+    assert.equal(hit.headers.cookie, entry.headers.cookie ?? MAIN_COOKIE);
+    assert.equal(hit.headers["x-api-key"], MAIN_KEY);
+    for (const [name, value] of Object.entries(entry.headers)) assert.equal(hit.headers[name], value, `${entry.label}: ${name}`);
+    assert.equal(hit.headers["x-goog-api-key"], undefined);
+    assert.ok(!JSON.stringify(hit).includes(GOOGLE_KEY));
+  }
+  for (const secret of [MAIN_AUTH, MAIN_COOKIE, MAIN_KEY, concurrentAuth, concurrentCookie]) {
+    assert.ok(!JSON.stringify(r.google).includes(secret), "native account credentials never enter the Google request");
+  }
+  // These are client-request transport counts. The fixture neither invokes Desktop to generate
+  // auxiliaries nor makes claims about how Anthropic's billing ledger charges those requests.
+});
+
+test("personal Google Desktop: a Google success and failure make no native calls, then the exact native model is restored", async t => {
+  const r = await rig(t);
+  const headers = { "x-claude-code-session-id": "synthetic-switch-back-session", "x-claude-code-request-class": "main" };
+  assert.equal((await r.send(payload(GOOGLE_MODEL), false, headers)).status, 200);
+  assert.equal(r.native.length, 0);
+  assert.equal(r.google.length, 1);
+  r.mode("retired");
+  const failed = await r.send(payload(GOOGLE_MODEL), false, headers);
+  assert.equal(failed.status, 400, failed.body);
+  assert.equal(r.google.length, 2);
+  assert.equal(r.native.length, 0, "the Google error creates no fallback Anthropic inference");
+  assert.equal(r.connections.native, 0, "even an Anthropic upstream connection is unnecessary for these explicit Google requests");
+  const restored = payload("claude-opus-new-native-fixture");
+  assert.equal((await r.send(restored, false, headers)).status, 200);
+  assert.equal(r.google.length, 2);
+  assert.equal(r.native.length, 1);
+  assert.equal(r.native[0]!.raw, JSON.stringify(restored), "switching back preserves the exact client-chosen native model");
+  assert.equal(r.native[0]!.headers.authorization, MAIN_AUTH);
+  assert.equal(r.native[0]!.headers.cookie, MAIN_COOKIE);
+});
+
+for (const failure of [401, 429, 503, "reset"] as const) {
+  test(`personal Google Desktop: a native ${failure} failure does not create an automatic inference retry`, async t => {
+    const r = await rig(t);
+    r.failNative(failure);
+    const body = payload(NATIVE_MODEL);
+    const reply = await r.send(body);
+    assert.equal(reply.status, failure === "reset" ? 502 : failure, reply.body);
+    assert.equal(r.native.length, 1, "the client's single Messages POST is forwarded exactly once");
+    assert.equal(r.native[0]!.raw, JSON.stringify(body));
+    assert.equal(r.native[0]!.headers.authorization, MAIN_AUTH);
+    assert.equal(r.google.length, 0, "native failures do not switch providers");
+    assert.equal(r.connections.google, 0);
+  });
+}
 
 test("personal Google Desktop: one mixed conversation can carry tools across Google and native switches", async t => {
   const r = await rig(t);

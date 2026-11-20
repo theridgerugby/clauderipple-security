@@ -11,6 +11,10 @@ Use [the source installation guide](personal-windows-install.md), including its 
 checks. The full commit and observed hosted test results are recorded in
 [the Windows personal fork PR](https://github.com/theridgerugby/clauderipple-security/pull/2). A matching package
 version alone does not identify this fork.
+The [Desktop-only acceptance contract](personal-desktop-contract.md) separates tested behavior,
+the owner's accepted native background usage, update resilience and remaining client checks.
+The separate [native-plugin isolation proof](native-desktop-plugin.md) explores a no-proxy path.
+It is default-off and has not replaced the installed runtime described below.
 
 ## Enforced boundaries
 
@@ -21,6 +25,7 @@ version alone does not identify this fork.
 | A request smuggled through an approved CONNECT | Locally terminated traffic requires agreement between CONNECT, SNI and inner HTTP Host. In picker mode, other explicitly approved HTTPS origins on port 443 can use opaque TLS pass-through; no blanket network allowance. Only authority-bound native Desktop WebSockets can upgrade, never model-provider inference. Absolute-form forwarding remains disabled. | `personal-policy.test.ts`, real CONNECT/TLS and Desktop compatibility tests |
 | Main account exposed to an optional gateway | Rewritten provider requests use that provider's credential; native Claude traffic remains bound to `api.anthropic.com`. Built-in ChatGPT account traffic remains bound to `chatgpt.com`. | `personal-profile-smoke.test.ts`, `personal-google-desktop.test.ts` check request headers and body over real local TLS |
 | An old model mapping changes a native subscription selection | Activation rejects conflicting routing and client settings. With the personal picker enabled, the runtime preserves incoming native Claude model IDs and their original credentials before old routes, classifiers, web-search or compaction overrides can redirect them. Distinct Google selections still use their own provider. | `desktop-policy.test.ts`, `desktop-activation.test.ts`, `personal-google-desktop.test.ts` |
+| A native refusal is truncated or its retry policy changes | Unrouted personal native responses stream their full original representation and retry/rate-limit headers. Only bounded side-band diagnostics are observed; native Messages POSTs are not automatically retried. | `proxy-desktop-transport.test.ts`, `personal-google-desktop.test.ts` |
 | Prompt text or old worker settings override the selected extra | Personal Desktop routing ignores prompt markers and legacy classifier, web-reader, compaction and worker-ladder overrides. A selected extra uses its explicit primary; saved route fallbacks cannot silently choose another model. | `desktop-policy.test.ts`, personal Google local-TLS regressions |
 | An ordinary setup action silently rewrites Claude defaults | Personal installation adds only owned proxy environment keys, leaving native model slots and context limits unchanged. Ordinary API-key/checklist saves never synchronize client settings, and cannot toggle picker activation. The personal UI gates unrelated configuration pages and their mutation handlers. | `desktop-install-settings.test.ts`, `admin-personal-policy.test.ts`, personal UI tests |
 | Disconnecting loses unrelated settings edited while connected | Removal preserves current non-proxy settings in a clean native entry when necessary, without overwriting the previous native document. The direct-connection snapshot records the actual restored entry; concurrent edits cause a conservative refusal. | `desktop-config-preservation.test.ts`, `recovery.test.ts` |
@@ -28,13 +33,17 @@ version alone does not identify this fork.
 | Hidden setup endpoints alter account state or launch unrelated work | The native IPC bridge and authenticated personal admin API refuse account/OAuth, updater, Remote/phone, mod, Codex and power routes. Production CLI subscription sign-in and unrelated integration activation are refused; explicit owned cleanup stays available. | `admin-ipc.test.ts`, `admin-personal-policy.test.ts`, `security-config.test.ts`, native app harness |
 | Claude cookies or custom client headers copied to a model vendor | Personal routed requests carry only a small allowlist of non-secret protocol headers. Configured provider credentials are added separately. Proxy hop-by-hop and response session-setting headers are removed. | `personal-profile-smoke.test.ts`, `proxy-headers.test.ts` |
 | Provider secrets or interception CA signing keys copied off disk | Windows-owned provider/config secrets and interception CA/leaf private keys use CurrentUser DPAPI after owner/ACL/descriptor validation. No plaintext master key or migration backup. | `secret-storage.test.ts`, `config-secrets.test.ts`, `certificate-storage.test.ts`, native Windows runs |
-| Extra borrowed Claude token retention | Observed client credentials remain in bounded process memory. Durable consent generations stop stale refreshes from restoring a locally revoked login. | `anthropic-observed.test.ts`, `anthropic-local-auth.test.ts`, `claude-oauth.test.ts` |
+| Extra borrowed Claude token retention | Personal startup does not construct the reusable native-credential observer. Entering personal mode discards previously observed credentials and optional identity caches in memory without logging out or writing native account state. | `anthropic-observed.test.ts`, `anthropic-identity.test.ts`, `desktop-runtime.test.ts`, personal Google TLS tests |
+| Hidden native account queries | Personal native requests, status, limits, model discovery and probes do not borrow subscription credentials for extra profile, usage or catalogue requests. In-flight optional profile lookups are cancelled and late results cannot repopulate cleared state. | `admin-personal-policy.test.ts`, `anthropic-identity.test.ts`, native-header TLS regressions |
+| Restart discards native work or closes a CLI | Windows reopen validates the Desktop image and exact window-process identity, requests an orderly close, and stops if the app remains open. It never forces termination or guesses an executable to launch. Unfamiliar installations require a manual restart. | `claude-desktop-reopen.test.ts` uses snapshots and mocked process execution; real Windows app acceptance remains required |
+| A healthy router is mistaken for native independence | Doctor reports proxy, CA, restoration and service coupling separately from operational health. The existing Desktop setup card displays this already-loaded report with fixed text and no extra polling. Missing evidence never becomes a success verdict. | `native-independence.test.ts`, `ui-native-independence.test.ts`, recovery tests |
 | Research reflected into diagnostic logs | Personal request history and diagnostics remain in bounded RAM, with no echo or new disk history/dump. Windows Task Scheduler and the actual Electron launcher do not redirect raw child stdout/stderr to files; inherited Electron logging and SSL-key-log sinks are removed from the child environment. | `personal-policy.test.ts`, reflected-error TLS smoke, `schtasks-definition.test.ts`, `personal-dashboard-launch.test.ts`, native scheduled-task check |
 | Rapid setup/recovery overwrites an earlier backup | Each changed settings write creates an exclusive, unique backup; a failure preserves restoration evidence and leaves the client unchanged. Backups are never silently pruned. | `settings.test.ts`, `direct-ownership.test.ts` |
 | Ambient Node settings weaken upstream TLS or redirect traffic | The Windows task launcher removes Node preloads, additional trust stores, insecure TLS overrides, proxy variables and debug sinks before any Node child. The router refuses unsafe direct starts; sensitive CLI commands refuse unsafe startup environments without showing their values. | `personal-windows-node-env.test.ts`, hosted Windows task run |
 | Local port takeover | Native administration uses the installation's exact TLS identity and generation plus its private capability. Unknown responders and stale instances do not receive authenticated traffic. | Existing native Electron and admin transport harnesses |
 | Old process mistaken for reviewed code | Startup captures a runtime source fingerprint. Install/recovery and picker activation verify the runtime before changing client proxy settings. | `install-runtime.test.ts`, `install-runtime-tls.test.ts`, recovery and picker activation tests |
 | Extra models alter unrelated Desktop menus | Personal-mode additions are scoped to recognised Code surfaces. Native model entries and their context-window metadata remain untouched; invalid or unapproved extra routes are not advertised. Unknown catalogue shapes are returned unchanged. | Picker regression tests |
+| A menu update advertises an extra that cannot be selected | Each Code surface needs a supported, unambiguous native selection contract. Harmless added metadata is retained within a 64 KiB serialized native-payload limit per slot; this is not a total-memory estimate. Unsupported surfaces omit additions and invalidate stale selections; supported surfaces retain their eligible model options. Deep nesting cannot turn an optional edit into a native-response exception. | `desktop-selection.test.ts`, `picker.test.ts`, `proxy-bootstrap.test.ts` |
 | A late menu reply overrides a newer selection | The memory-only selection cache scopes state by a per-process HMAC of account credentials and organization. Known Code surfaces share generation ordering; successful native changes clear extra overlays. Only the recognized `400 model_not_selectable` refusal for an approved configured extra can become a local success. | `desktop-selection.test.ts`, real TLS cases in `proxy-bootstrap.test.ts` |
 | Bootstrap editing corrupts native traffic or diagnostic privacy | Encoded/decompressed sizes are bounded; unknown, malformed, integrity-protected or oversized responses preserve native bytes and headers. Successful edits replace representation metadata. Diagnostics contain fixed outcomes and counts, with bounded model labels, never cookies, raw payloads or organization paths. | `proxy-bootstrap.test.ts` |
 | An encrypted configuration breaks Windows monitoring | The watchdog reads only a bounded public port through the fixed Node/private-reader helper, including DPAPI decoding. | `watchdog-port.test.ts`, native PowerShell fixture |
@@ -92,11 +101,20 @@ protected with CurrentUser DPAPI and ownership checks, but intercepting HTTPS
 still creates a local trust boundary. Do not describe this as a native Claude
 Desktop plugin or as zero-impact on standalone Claude Code.
 
-A stricter goal is Desktop-only, process-scoped proxy configuration with no
-changes to terminal/IDE Claude Code's user-level `settings.json`. That design
-and a real owner-machine Desktop + terminal subscription coexistence test remain
-acceptance gates. The existing synthetic regression tests demonstrate credential
-and request routing isolation, not that broader deployment property.
+A separate default-off proof now uses official mod hooks and a short-lived Google
+request helper instead of configuring any proxy. It has no persistent service,
+listener, trust-store change or shared CLI setting. Its small selector is above
+the Code input, separate from the original account menu. Buffered output,
+unclassifiable-request provenance, host guard/unload behavior and real Windows
+acceptance remain blockers. It is not installed by the personal source installer
+and does not migrate existing settings. See [its precise contract](native-desktop-plugin.md).
+
+`doctor` and the on-demand setup card expose the legacy coupling explicitly.
+They do not equate a running router with operational independence, remove
+unrelated settings, or infer a successful Desktop + terminal coexistence test
+from local files. The card reuses its existing diagnostic result and does not
+start another request, background check or polling loop.
+
 
 ## Normal-use verification
 
@@ -126,6 +144,12 @@ The same-conversation fixture also switches Google tool/thinking history to nati
 back: ordinary text/tool results survive, native signed thinking remains intact on its own path,
 and Google's tool signature returns only to Google. Foreign unsigned thinking is removed before
 native replay, following the existing adapter's compatibility rule.
+Concurrent traces also distinguish a Google main inference from client-issued native titles,
+suggestions, compaction and subagent requests. The latter retain their normal native behavior
+and may consume normal Claude usage. The owner explicitly accepts prompt-suggestion usage;
+other native side-call costs must remain visible during acceptance. These synthetic transport counts
+establish no extra Anthropic inference or hidden fallback for a Google request; they do not
+measure a production account's billing ledger.
 
 `proxy-bootstrap.test.ts` exercises the observed menu-preference PATCH, bootstrap reload and
 return-to-native flow over real local TLS, including compressed refusals, account/organization

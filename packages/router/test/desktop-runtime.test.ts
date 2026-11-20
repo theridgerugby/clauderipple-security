@@ -88,13 +88,17 @@ async function runtime(t: TestContext, personal = true) {
     blockedDesktopOrigins: string[] = [];
     lastPickerInjection = null;
     rows = {settled:async () => {}};
-    constructor(_options: unknown) {}
+    claudeUsage = {snapshot:async () => {record("claude.usage"); return {};}};
+    claudeModels = {list:async () => {record("claude.models"); return null;}};
+    claudeIdentity = {identify:async () => {record("claude.identity"); return null;}};
+    constructor(options: {observedClaudeCodeAuth?: unknown}) { if (options.observedClaudeCodeAuth) record("proxy.receivedObservedAuth"); }
     async listen(): Promise<void> { record("proxy.listen"); }
     async drain(): Promise<void> { record("proxy.drain"); }
     reconcileConfig(): void { record("proxy.reconcile"); }
     resetDesktopSelection(): void { record("proxy.clearSelection"); }
     chatgptRefreshAll(): void { record("chatgpt.quota"); }
     chatgptRefreshCatalog(): void { record("chatgpt.catalogue"); }
+    setClaudeLocalAuthorization(): void { record("claude.authorization"); }
   }
   class SyntheticIngress {
     stats = statistics();
@@ -102,6 +106,7 @@ async function runtime(t: TestContext, personal = true) {
     constructor(_options: unknown) { record("ingress.construct"); }
     async listen(): Promise<number> { record("ingress.listen"); return 18793; }
     async drain(): Promise<void> { record("ingress.drain"); }
+    setClaudeLocalAuthorization(): void { record("ingress.authorization"); }
   }
   class SyntheticTunnels {
     constructor(_options: unknown) { record("remote.construct"); }
@@ -166,7 +171,7 @@ async function runtime(t: TestContext, personal = true) {
     openRequestLog:() => ({}), terminateHosts:() => ["api.anthropic.com"],
     HoldGate:class {close() {}}, execRunner:() => (() => {throw new Error("unexpected process execution");}),
     UpstreamHealth:class {consecutiveFailures=0;}, EXIT_UPSTREAM_UNREACHABLE:75, checkConnectivity:() => {throw new Error("unexpected network check");},
-    ObservedClaudeCodeAuth:class {}, allowLongSilences:() => {},
+    ObservedClaudeCodeAuth:class {constructor() {record("authObserver.construct");}}, allowLongSilences:() => {},
     Proxy:SyntheticProxy, OpenAiIngress:SyntheticIngress,
     AutoUpdater:SyntheticUpdater, autoUpdateEnabled:(config:Config) => config.autoUpdate === true,
     AwakeController:SyntheticAwake, TetherController:SyntheticTether,
@@ -208,6 +213,8 @@ async function runtime(t: TestContext, personal = true) {
 }
 
 const unrelatedWork = new Set([
+  "authObserver.construct","proxy.receivedObservedAuth",
+  "claude.usage","claude.models","claude.identity","claude.authorization","ingress.authorization",
   "agents.construct","ingress.construct","updater.construct","awake.construct","tether.construct",
   "agents.regenerate","agents.changed","compact.sync","codex.enabled","codex.write","codex.follow",
   "ingress.listen","remote.construct","remote.cleanup","remote.reconcile","remote.assetsRead","remote.sync",
@@ -223,6 +230,7 @@ test("personal router startup preserves global Claude settings/workers and Codex
   assert.ok(run.calls.includes("proxy.listen"));
   assert.ok(run.calls.includes("admin.start"));
   assert.ok(run.calls.includes("windows.environmentCheck"));
+  assert.equal(run.admin.observedClaudeCodeAuth, undefined, "personal startup exposes no observed-account authority to admin");
   assert.deepEqual(run.timers.filter(timer => timer.kind !== "immediate").map(timer => timer.ms), [5*60_000],
     "only the existing own-router statistics timer remains");
 });
@@ -252,6 +260,17 @@ test("personal administrative power/remote callbacks do not start hidden service
   assert.deepEqual(run.snapshot(),run.before);
 });
 
+test("personal native-account callbacks neither inspect nor alter the native login", async t => {
+  const run = await runtime(t);
+  assert.equal(Object.keys(await run.admin.claudeUsage!()).length, 0);
+  assert.equal(await run.admin.claudeModels!(), null);
+  assert.equal(await run.admin.claudeIdentity!(), null);
+  run.admin.claudeLocalAuthorization!(true);
+  run.admin.claudeLocalAuthorization!(false);
+  assert.deepEqual(run.calls.filter(call => unrelatedWork.has(call)), []);
+  assert.deepEqual(run.snapshot(), run.before);
+});
+
 test("personal shutdown drains the proxy without constructing or running unrelated cleanup controllers", async t => {
   const run = await runtime(t);
   assert.equal(run.admin.power, undefined);
@@ -276,10 +295,17 @@ test("an empty fail-closed personal configuration does not remove or rewrite exi
 
 test("generic mode positive control retains integration writers, worker/context maintenance and optional services", async t => {
   const run=await runtime(t,false);
-  for (const call of ["agents.construct","ingress.construct","updater.construct","awake.construct","tether.construct",
+  for (const call of ["authObserver.construct","proxy.receivedObservedAuth","agents.construct","ingress.construct","updater.construct","awake.construct","tether.construct",
     "agents.regenerate","compact.sync","codex.enabled","codex.write","codex.follow","ingress.listen",
     "remote.cleanup","chatgpt.quota","chatgpt.catalogue","awake.start","tether.start","updater.start"])
     assert.ok(run.calls.includes(call),call);
+  assert.ok(run.admin.observedClaudeCodeAuth, "generic account-pool support remains available");
+  await run.admin.claudeUsage!();
+  await run.admin.claudeModels!();
+  await run.admin.claudeIdentity!();
+  run.admin.claudeLocalAuthorization!(true);
+  for (const call of ["claude.usage", "claude.models", "claude.identity", "claude.authorization", "ingress.authorization"])
+    assert.ok(run.calls.includes(call), call);
   assert.notDeepEqual(run.snapshot(),run.before,"the instrumented writers must actually change fixture bytes when invoked");
   assert.equal(run.snapshot().userWorker,run.before.userWorker);
   assert.equal(run.snapshot().codexConfig,run.before.codexConfig);
@@ -297,6 +323,10 @@ test("a generic-to-personal reload stops the Codex watcher and queued entry-poin
   assert.equal(run.cacheActive(),false);
   assert.ok(run.calls.slice(at).includes("codex.unfollow"));
   run.tickCache(); run.admin.agentsChanged?.();
+  assert.equal(Object.keys(await run.admin.claudeUsage!()).length, 0);
+  assert.equal(await run.admin.claudeModels!(), null);
+  assert.equal(await run.admin.claudeIdentity!(), null);
+  run.admin.claudeLocalAuthorization!(true);
   await run.maintenance();
   // A pre-existing generic tunnel manager may reconcile an empty host list to stop its old
   // tunnels. This is cleanup, not a new connection. The real controllers' private timers are

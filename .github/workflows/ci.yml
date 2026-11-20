@@ -59,6 +59,7 @@ jobs:
       # its relative imports and checks the manifests; `claude plugin test packages/mod` stays a
       # maintainer step on a machine that has the engine.
       - run: npm run check:mod
+      - run: npm run check:native-plugin
       # TAP emits each failed assertion immediately, even if a later fixture hangs.
       # Node parses --test-shard only before positional test paths. Keep the test-file list
       # identical to test:ci; appending the flag through `npm run ... --` silently ran all files.
@@ -66,7 +67,10 @@ jobs:
       # the native PowerShell ACL/DPAPI startup deadline under hosted runner contention.
       # Every file still runs on one of four independent shards; within-file tests still
       # exercise genuine eight-process credential races and fail-closed deadlines.
-      - run: node --test --test-reporter=tap --test-concurrency=1 --test-shard=${{ matrix.shard }}/4 packages/router/test/*.test.ts packages/cli/test/*.test.ts test/mod/*.test.ts packages/remote/test/*.test.ts packages/app/test/*.test.ts test/package/*.test.mjs
+      - run: node --test --test-reporter=tap --test-concurrency=1 --test-shard=${{ matrix.shard }}/4 packages/router/test/*.test.ts packages/cli/test/*.test.ts test/mod/*.test.ts packages/remote/test/*.test.ts packages/app/test/*.test.ts test/package/*.test.mjs test/native-plugin/*.test.ts test/native-plugin/*.test.mjs
+      - name: Build inert native plugin proof (no installation)
+        if: matrix.shard == 1
+        run: npm run build:native-plugin
       - run: npm run build
 
   # A full developer install could hide an accidental runtime dependency. Exercise the exact
