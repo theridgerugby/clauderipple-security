@@ -69,6 +69,35 @@ settings retain their separate owner-only ACL protections; they are not all DPAP
 Existing historical logs are not silently deleted. Start with the
 fresh data directory in the guide and review old retained files separately.
 
+## Known operational side effect: standalone Claude Code shares the proxy
+
+The current personal source installer writes its owned `HTTPS_PROXY` and
+`NODE_EXTRA_CA_CERTS` values into the user-level `~/.claude/settings.json`
+(`packages/cli/src/settings.ts`). Claude Code's terminal, IDE extensions and
+Desktop Code engine can all read that shared user setting. As a result, the
+standalone Claude Code CLI may also use the local router and becomes dependent
+on its availability while the integration is active. Native model IDs,
+subscription credentials, default model slots and context limits are preserved,
+but this **does not yet satisfy complete operational independence for terminal
+Claude Code**. A stopped router can disrupt an otherwise ordinary subscription
+session until the owned proxy settings are restored. The source guide documents
+the `direct on` recovery path and the need to restart affected clients.
+
+Picker activation also imports an interception CA into the current Windows
+user's certificate trust store and changes a Desktop app-wide proxy setting.
+The CA trust entry and persistent router/watchdog are additional system effects
+requiring explicit consent and clean removal. The setup window may be closed;
+the router and watchdog continue running. The interception CA's private key is
+protected with CurrentUser DPAPI and ownership checks, but intercepting HTTPS
+still creates a local trust boundary. Do not describe this as a native Claude
+Desktop plugin or as zero-impact on standalone Claude Code.
+
+A stricter goal is Desktop-only, process-scoped proxy configuration with no
+changes to terminal/IDE Claude Code's user-level `settings.json`. That design
+and a real owner-machine Desktop + terminal subscription coexistence test remain
+acceptance gates. The existing synthetic regression tests demonstrate credential
+and request routing isolation, not that broader deployment property.
+
 ## Normal-use verification
 
 `personal-profile-smoke.test.ts` runs the real proxy and provider adapter against locally trusted
