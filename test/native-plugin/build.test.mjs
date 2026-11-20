@@ -17,10 +17,11 @@ function fixture(t) {
   return root;
 }
 
-test("native proof manifest keeps explicit consent, exact-build gate and sensitive optional key", () => {
+test("native proof manifest keeps consent, a minimum feature level, no release pin, and a sensitive optional key", () => {
   const { manifest } = checkNativePlugin(checkout);
   assert.equal(manifest.userConfig.consent.default, false);
-  assert.equal(manifest.userConfig.validated_engine_version.default, "");
+  assert.equal(manifest.engines["claude-code"], ">=2.1.323");
+  assert.equal(Object.hasOwn(manifest.userConfig, "validated_engine_version"), false);
   assert.equal(manifest.userConfig.api_key.sensitive, true);
   assert.equal(manifest.userConfig.api_key.required, undefined);
 });

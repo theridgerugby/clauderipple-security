@@ -104,10 +104,13 @@ Desktop plugin or as zero-impact on standalone Claude Code.
 A separate default-off proof now uses official mod hooks and a short-lived Google
 request helper instead of configuring any proxy. It has no persistent service,
 listener, trust-store change or shared CLI setting. Its small selector is above
-the Code input, separate from the original account menu. Buffered output,
-unclassifiable-request provenance, host guard/unload behavior and real Windows
-acceptance remain blockers. It is not installed by the personal source installer
-and does not migrate existing settings. See [its precise contract](native-desktop-plugin.md).
+the Code input, separate from the original account menu. The old exact-build
+pin has been replaced by an in-memory passive compatibility check that observes
+an ordinary native main-step request and response, requiring no added model request.
+Engine updates clear the proof and trigger natural re-verification. Buffered output,
+missing HTTP turn provenance, host guard/unload behavior and real Windows acceptance
+remain blockers. It is not installed by the personal source installer and does
+not migrate existing settings. See [its precise contract](native-desktop-plugin.md).
 
 `doctor` and the on-demand setup card expose the legacy coupling explicitly.
 They do not equate a running router with operational independence, remove

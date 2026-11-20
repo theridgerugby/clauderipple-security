@@ -6,7 +6,7 @@
  *
  * A worker unload removes all hooks. The host may then use native Claude.
  * No whole-worker fail-closed claim is made. Guard/Windows/process support
- * requires explicit owner acceptance, pinned to an exact engine version.
+ * requires a host compatibility check. Engine patches do not need a new pin.
  */
 import type { EngineInterface, HookStream, ProcessSpawnChunk, ProcessSpawnRequest, ProcessSpawnResult, Register, Timer, TurnStepChunk, TurnStepResult } from 'claude-code';
 
@@ -82,7 +82,7 @@ const INPUT_LIMIT = 8 * 1024 * 1024;
 const OUTPUT_LIMIT = 3 * 1024 * 1024;
 const SIGNATURE_LIMIT = 512 * 1024;
 const REFUSED = 'Gemini could not complete this request. No automatic Claude retry was requested. Select Claude to continue with your subscription.';
-const UNVALIDATED = 'Gemini disabled: exact-build owner acceptance, a trusted Node path, and an AI Studio key are required.';
+const UNVALIDATED = 'Gemini auto-check pending: send an ordinary Claude request once in this session. A trusted Node path and AI Studio key are also required.';
 const byteLength = (value: string): number => new TextEncoder().encode(value).length;
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 const validNodePath = (path: unknown): path is string => typeof path === 'string'
@@ -215,11 +215,37 @@ export function readHelperResult(result: ProcessResult): { response: HttpRespons
   return { response: { status: r.status as number, ok: r.ok, headers: { 'content-type': contentType }, text: r.text }, thoughtSignatures: signatures };
 }
 
-function supportedVersion(version: string, pinned: unknown): boolean {
-  if (typeof pinned !== 'string' || !pinned || version !== pinned) return false;
-  const match = /^2\.1\.(\d+)$/.exec(version);
-  // Future versions require review of the contract, not a speculative >= check.
-  return !!match && Number(match[1]) >= 323;
+/** 2.1.323 introduced the AbovePrompt list used by this mod. Later builds
+ * prove their own engine transport contract from a successful ordinary native
+ * request; release numbers alone never grant Gemini readiness. */
+export function supportedVersion(version: string): boolean {
+  const parts = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
+  if (!parts) return false;
+  const major = Number(parts[1]!);
+  const minor = Number(parts[2]!);
+  const patch = Number(parts[3]!);
+  return Number.isSafeInteger(major) && Number.isSafeInteger(minor) && Number.isSafeInteger(patch)
+    && (major > 2 || (major === 2 && (minor > 1 || (minor === 1 && patch >= 323))));
+}
+/** These contract checks retain no prompt, token, account, response body or
+ * model selection. A changed host has to show the same behavior organically. */
+function nativeStepShape(event: StepEvent): boolean {
+  return typeof event.turnId === 'string' && event.turnId.length > 0
+    && Number.isSafeInteger(event.index) && event.index >= 0
+    && Number.isSafeInteger(event.messageCount) && event.messageCount >= 0
+    && typeof event.model === 'string' && event.model.length > 0 && !event.model.startsWith(PREFIX);
+}
+function nativeTransportResult(value: unknown): boolean {
+  return record(value) && value.isStreaming === true
+    && typeof value.status === 'number' && Number.isInteger(value.status)
+    && value.status >= 200 && value.status < 300 && record(value.headers);
+}
+function nativeModelMatches(stepModel: string, httpModel: unknown): boolean {
+  if (typeof httpModel !== 'string' || !httpModel || httpModel.startsWith(PREFIX)) return false;
+  if (stepModel === httpModel) return true;
+  if (stepModel === 'default') return /^claude-(?:opus|sonnet|haiku)-/.test(httpModel);
+  return (stepModel === 'opus' || stepModel === 'sonnet' || stepModel === 'haiku')
+    && httpModel.startsWith(`claude-${stepModel}-`);
 }
 function requestBody(event: HttpEvent): Record<string, unknown> | undefined {
   const body = event.init?.body;
@@ -252,11 +278,17 @@ export const register: Register = (on, options = {}): void => {
   let signatures: Signature[] = [];
   let needsKey = false;
   let contractFailed = false;
+  let observedVersion = '';
+  let stepObserved = false;
+  let transportObserved = false;
+  let nativeCanaryActive = false;
+  let nativeCanaryTransport = false;
+  let nativeCanaryModel = '';
   const selectedSteps = new WeakSet<object>();
   const selectedHttp = new WeakSet<object>();
   type Pending = { effort?: Effort; body?: string; result?: Promise<HttpResponse>; responded?: true };
   const active = new Map<string, Pending>();
-  const reset = (): void => { mode = 'claude'; ready = false; owner = ''; working = false; signatures = []; needsKey = false; active.clear(); epoch++; };
+  const reset = (): void => { mode = 'claude'; ready = false; owner = ''; working = false; signatures = []; needsKey = false; contractFailed = false; observedVersion = ''; stepObserved = false; transportObserved = false; nativeCanaryActive = false; nativeCanaryTransport = false; nativeCanaryModel = ''; active.clear(); epoch++; };
   const invalidate = ($: { ui: Pick<Host['ui'], 'invalidate'> }): void => { try { $.ui.invalidate('ui.render'); } catch { /* UI failure must not enter inference. */ } };
 
   on('session.end', async ($, e, next) => { reset(); return next(e); });
@@ -271,8 +303,19 @@ export const register: Register = (on, options = {}): void => {
     owner = id;
     const version = await $.session.version();
     const surfaces = await $.session.surfaces();
-    ready = !contractFailed && surfaces.length === 1 && surfaces[0] === 'desktop'
-      && supportedVersion(version.version, options.validated_engine_version)
+    // Invalidate old proof on *any* engine version change; it is renewed by
+    // regular Claude activity and never by a generated test or a Google call.
+    if (version.version !== observedVersion) {
+      observedVersion = version.version;
+      ready = false; stepObserved = false; transportObserved = false;
+      nativeCanaryActive = false; nativeCanaryTransport = false; nativeCanaryModel = '';
+      contractFailed = false; epoch++;
+      // Keep a selected Gemini mode selected-but-unavailable until the
+      // person explicitly switches to Claude. No implicit quota fallback.
+    }
+    ready = !contractFailed && stepObserved && transportObserved
+      && surfaces.length === 1 && surfaces[0] === 'desktop'
+      && supportedVersion(version.version)
       && typeof $.process?.spawn === 'function' && typeof $.clock?.after === 'function' && validNodePath(options.node_path);
     const { Box, Text, Select } = $.ui.resolve(e);
     const currentEpoch = epoch;
@@ -303,12 +346,33 @@ export const register: Register = (on, options = {}): void => {
   }).catch(async ($, e, next) => { ready = false; return next(e); });
 
   on('turn.step', async function* ($, e, next) {
-    if (mode !== 'gemini' || e.agentId !== undefined) return yield* next(e);
+    if (mode !== 'gemini' || e.agentId !== undefined) {
+      // Passive, free compatibility canary. The host must send an ordinary
+      // native Messages request *inside this very main-loop step*. Results
+      // from unrelated native background requests cannot satisfy the proof.
+      if (mode === 'claude' && e.agentId === undefined && nativeStepShape(e)
+        && !next.signal?.aborted && !stepObserved) {
+        const canaryEpoch = epoch;
+        nativeCanaryActive = true; nativeCanaryTransport = false; nativeCanaryModel = e.model;
+        try {
+          const result = yield* next(e);
+          if (!next.signal?.aborted && epoch === canaryEpoch && nativeCanaryTransport) {
+            stepObserved = true; transportObserved = true;
+          }
+          return result;
+        } finally {
+          nativeCanaryActive = false; nativeCanaryTransport = false; nativeCanaryModel = '';
+        }
+      }
+      return yield* next(e);
+    }
     selectedSteps.add(e);
     if (!ready || next.signal?.aborted) return yield* refusal(e);
     const id = await $.session.id();
     const surfaces = await $.session.surfaces();
-    if (id !== owner || surfaces.length !== 1 || surfaces[0] !== 'desktop') return yield* refusal(e);
+    const version = await $.session.version();
+    if (id !== owner || version.version !== observedVersion || !supportedVersion(version.version)
+      || surfaces.length !== 1 || surfaces[0] !== 'desktop') return yield* refusal(e);
     // A unique marker belongs only to this selected main-loop step. Never set
     // the persistent model, subscription default, environment, or model picker.
     const marker = `${PREFIX}${epoch}-${++counter}`;
@@ -354,6 +418,22 @@ export const register: Register = (on, options = {}): void => {
 
   on('http.fetch', async ($, e, next) => {
     if (next.origin?.plugin !== 'engine') return next(e);
+    // Passive network contract: one successful, authentic Claude model call
+    // with a streamed host response proves this engine still exposes the
+    // documented Messages interception shape. The request and its result
+    // return untouched. Only two booleans survive; no auth/prompt is stored.
+    if (mode === 'claude' && nativeCanaryActive && !transportObserved && !active.size && messagesUrl(e)
+      && typeof e.init?.body === 'string' && !e.init.body.includes(PREFIX)) {
+      const parsed = requestBody(e);
+      // A matching *model* in the active main-step window rejects unrelated
+      // providers and most side calls. A true request/turn ID is still absent
+      // from the host API, so concurrent native steps remain a documented gap.
+      const candidate = nativeModelMatches(nativeCanaryModel, parsed?.model)
+        && Array.isArray(parsed?.messages);
+      const result = await next(e);
+      if (candidate && !next.signal?.aborted && nativeCanaryActive && nativeTransportResult(result)) nativeCanaryTransport = true;
+      return result;
+    }
     // Native idle requests avoid parsing unless they mention our reserved model
     // namespace. Expired own markers must never be retried against native Claude.
     if (!active.size && (typeof e.init?.body !== 'string' || !e.init.body.includes(PREFIX))) return next(e);

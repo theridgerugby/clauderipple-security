@@ -69,7 +69,8 @@ export function checkNativePlugin(root = checkout) {
   const plugin = path.join(root, "plugins/gemini-native");
   const manifest = JSON.parse(fs.readFileSync(regularFile(plugin, ".claude-plugin/plugin.json"), "utf8"));
   if (manifest.name !== "gemini-native-experimental" || manifest.userConfig?.consent?.default !== false ||
-      manifest.userConfig?.validated_engine_version?.default !== "" || manifest.userConfig?.api_key?.sensitive !== true ||
+      manifest.engines?.["claude-code"] !== ">=2.1.323" ||
+      Object.hasOwn(manifest.userConfig ?? {}, "validated_engine_version") || manifest.userConfig?.api_key?.sensitive !== true ||
       manifest.userConfig?.api_key?.required === true || manifest.userConfig?.api_key?.default !== undefined) throw new Error("Native plugin safety gates are missing");
   const hooks = JSON.parse(fs.readFileSync(regularFile(plugin, "hooks/hooks.json"), "utf8"));
   if (JSON.stringify(hooks) !== JSON.stringify({ modules: ["./register.ts"] })) throw new Error("Native plugin hook entrypoints changed");

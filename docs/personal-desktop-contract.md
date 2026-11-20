@@ -65,11 +65,15 @@ and available features. This path does not silently convert the account to that 
 Official [mods](https://code.claude.com/docs/en/plugins/mods/reference) expose Desktop render sites
 and model-step/HTTP hooks. A separate [default-off isolation proof](native-desktop-plugin.md) now
 implements that path with a small AbovePrompt selector and a one-shot Google helper. It leaves
-the original menu alone and is not activated or installed by the legacy installer. Complete host
-acceptance, true streaming, provider-state replay and failure behavior remain gates. The official
+the original menu alone and is not activated or installed by the legacy installer. Its compatibility
+gate uses ordinary native traffic, current host capabilities and the minimum required feature
+floor instead of a manually pinned full engine release. Engine changes trigger a new passive proof
+without any extra subscription request. Complete host acceptance, true streaming, provider-state
+replay and failure behavior remain gates. The official
 [events guide](https://code.claude.com/docs/en/plugins/mods/events) documents that a failed hook can
-fall through to the normal chain. This fork has not substituted this proof for the installed integration, removed a
-managed guard, or claimed those interfaces guarantee compatibility with all future releases.
+fall through to the normal chain. This fork has not substituted this proof for the installed
+integration, removed a managed guard, or claimed those interfaces guarantee compatibility
+with all future releases.
 
 ## Availability and security boundary
 

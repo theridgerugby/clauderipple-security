@@ -2,7 +2,7 @@
 >
 > Before connecting real accounts or research data, verify the test results for the exact full commit and complete the guide's local acceptance checks.
 >
-> **Native-independence work:** the existing installer still uses shared proxy settings, a local CA and a supervised router. The separate [no-proxy Desktop plugin proof](docs/native-desktop-plugin.md) is default-off, builds without npm runtime dependencies, and has not passed real Desktop acceptance. It does not migrate or activate an installed client. See the [security profile](docs/personal-security-profile.md) for the remaining coupling and the read-only independence audit.
+> **Native-independence work:** the existing installer still uses shared proxy settings, a local CA and a supervised router. The separate [no-proxy Desktop plugin proof](docs/native-desktop-plugin.md) is default-off, builds without npm runtime dependencies, and has not passed real Desktop acceptance. Its engine-update compatibility uses a passive same-step native traffic contract, with no version pin or extra model probe. It does not migrate or activate an installed client. See the [security profile](docs/personal-security-profile.md) for remaining coupling and the read-only independence audit.
 
 <p align="center">
   <picture>

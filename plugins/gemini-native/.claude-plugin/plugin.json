@@ -2,22 +2,16 @@
   "name": "gemini-native-experimental",
   "displayName": "Gemini Carbon isolation proof (experimental)",
   "version": "0.0.1",
-  "description": "Default-off Desktop Code main-loop isolation proof. Adds a separate selector above the input. Gemini replies are buffered; native subagents/background requests still use Claude. The original model menu is unchanged. Requires exact-build owner acceptance.",
+  "description": "Default-off Desktop Code main-loop isolation proof. Adds a separate selector above the input. Gemini replies are buffered; native subagents/background requests still use Claude. The original model menu is unchanged. Uses passive native contract checks on each engine version instead of manual per-release pins.",
   "author": { "name": "ClaudeRipple" },
   "license": "GPL-3.0-only",
-  "engines": { "claude-code": ">=2.1.323 <2.2.0" },
+  "engines": { "claude-code": ">=2.1.323" },
   "userConfig": {
     "consent": {
       "type": "boolean",
       "title": "Enable the experimental Desktop selector",
-      "description": "Opt in to a separate AbovePrompt selector, buffered Gemini main-loop responses, and sending the selected conversation and tool schemas to Google AI Studio. Subagents/background inference remains native and may use Claude subscription quota. Real Windows/Desktop acceptance is pending.",
+      "description": "Opt in to an AbovePrompt selector and buffered Gemini main-loop responses sent to Google AI Studio. Gemini becomes available after an ordinary native Claude turn confirms the engine interface in this session. Subagents/background inference remains native and may use Claude subscription quota. Real Windows/Desktop acceptance is pending.",
       "default": false
-    },
-    "validated_engine_version": {
-      "type": "string",
-      "title": "Owner-validated engine version",
-      "description": "Leave empty until acceptance tests pass on a personal, guard-free Desktop host with a controlled child-process environment. Enter that exact engine version. This is an owner attestation, not automatic guard detection. Updates require revalidation.",
-      "default": ""
     },
     "api_key": {
       "type": "string",

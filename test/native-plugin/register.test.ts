@@ -3,7 +3,7 @@ import test from 'node:test';
 import type { HookStream, ProcessSpawnChunk, ProcessSpawnRequest, ProcessSpawnResult } from 'claude-code';
 import { handle } from '../../packages/gemini-native/src/request.ts';
 import {
-  collectHelper, createHelperInvocation, readHelperResult, register,
+  collectHelper, createHelperInvocation, readHelperResult, register, supportedVersion,
   type Host, type HttpEvent, type HttpHook, type ObserveHook, type On, type Options,
   type ProcessResult, type RenderEvent, type RenderHook, type Signature, type StepEvent,
   type StepHook, type StepResult,
@@ -71,7 +71,7 @@ function harness(extra: Options = {}) {
     hooks.set(name, entry);
     return { catch(catcher: Hook) { entry.catcher = catcher; } };
   }) as On;
-  const options = { consent: true, node_path: '/trusted/node', validated_engine_version: '2.1.323', api_key: 'google-test-key', ...extra };
+  const options = { consent: true, node_path: '/trusted/node', api_key: 'google-test-key', ...extra };
   register(on as unknown as Parameters<typeof register>[0], options);
   let version = '2.1.323';
   let surfaces: readonly string[] = ['desktop'];
@@ -100,7 +100,21 @@ function harness(extra: Options = {}) {
     try { return await (entry.handler as RenderHook)($, event, next); }
     catch (error) { if (!entry.catcher) throw error; return (entry.catcher as RenderHook)($, event, next); }
   }
+  // This is normal Claude user activity simulated by the mock host. It calls
+  // the unchanged native core, never a provider probe, account lookup, or helper.
+  async function certify(): Promise<void> {
+    await render();
+    await runStep(step(), async function* event {
+      const response = await http(wire(event.model), async () => ({
+        status: 200, ok: true, isStreaming: true, headers: { 'content-type': 'text/event-stream' },
+      }));
+      assert.equal((response as { status: number }).status, 200);
+      return resultOf(event);
+    });
+    await render();
+  }
   async function select(value = 'gemini'): Promise<void> {
+    if (value === 'gemini') await certify();
     const element = find(await render(), 'Select');
     assert.ok(element, 'mock Desktop selector is available');
     (element.props.onSelect as (value: string, source: { surface: string; value: string }) => void)(value, { surface: 'desktop', value });
@@ -151,7 +165,7 @@ function harness(extra: Options = {}) {
     return entry ? (entry.handler as ObserveHook)($, event, async input => input) : event;
   }
   return {
-    $, hooks, options, invocations, timers, render, select, http, runStep, observe,
+    $, hooks, options, invocations, timers, render, select, certify, http, runStep, observe,
     setRun(fn: () => Promise<ProcessResult>) { run = fn; },
     setVersion(value: string) { version = value; },
     setSurfaces(value: readonly string[]) { surfaces = value; },
@@ -186,24 +200,122 @@ test('the native Desktop row does not read an API key; terminal UI is unchanged'
   Object.defineProperty(h.options, 'api_key', { get() { throw new Error('credential read'); } });
   const nativeRow = { existing: 'native content' };
   assert.equal(await h.render('terminal', {}, nativeRow), nativeRow);
+  const initial = await h.render('desktop', {}, nativeRow) as Tree;
+  assert.equal((initial.props.children as unknown[])[0], nativeRow);
+  assert.equal(find(initial, 'Select'), undefined, 'unknown host contract is initially inert');
+  await h.certify();
   const tree = await h.render('desktop', {}, nativeRow) as Tree;
   assert.equal((tree.props.children as unknown[])[0], nativeRow);
   assert.ok(find(tree, 'Select'));
   assert.equal(h.invocations.length, 0);
 });
 
-test('only explicit opt-in plus exact owner-validated supported version exposes the selector', async () => {
-  for (const overrides of [{ validated_engine_version: '' }, { validated_engine_version: '2.1.322' }, { node_path: 'node' }]) {
-    assert.equal(find(await harness(overrides).render(), 'Select'), undefined);
+test('runtime contract, not an exact release pin, admits patch updates after ordinary native activity', async () => {
+  assert.equal(supportedVersion('2.1.322'), false);
+  for (const version of ['2.1.323', '2.1.324', '2.1.328', '2.1.329', '2.2.0', '3.0.0']) {
+    assert.equal(supportedVersion(version), true, version);
+    const h = harness(); h.setVersion(version);
+    assert.equal(find(await h.render(), 'Select'), undefined, 'no automatic trust before normal traffic');
+    await h.certify();
+    assert.ok(find(await h.render(), 'Select'), version);
+    assert.equal(h.invocations.length, 0, 'native contract proof cannot spawn helper');
   }
-  const old = harness({ validated_engine_version: '2.1.322' }); old.setVersion('2.1.322');
-  assert.equal(find(await old.render(), 'Select'), undefined);
-  const changed = harness(); changed.setVersion('2.1.324');
-  assert.equal(find(await changed.render(), 'Select'), undefined);
+  for (const version of ['2.1.322', '2.0.999', '1.9.9', '3.0.0-beta', 'garbage']) {
+    const h = harness(); h.setVersion(version); await h.certify();
+    assert.equal(find(await h.render(), 'Select'), undefined, version);
+  }
+  const changed = harness(); changed.setVersion('2.1.329'); await changed.certify();
   delete changed.$.process;
   assert.equal(find(await changed.render(), 'Select'), undefined);
-  const multi = harness(); multi.setSurfaces(['terminal', 'desktop']);
+  const noPath = harness({ node_path: 'node' }); await noPath.certify();
+  assert.equal(find(await noPath.render(), 'Select'), undefined);
+  const multi = harness(); multi.setSurfaces(['terminal', 'desktop']); await multi.certify();
   assert.equal(find(await multi.render(), 'Select'), undefined);
+});
+
+
+test('native proof requires a successful streamed Messages exchange with the expected model/request shape', async () => {
+  const h = harness(); await h.render();
+  const good = () => ({ status: 200, isStreaming: true, headers: { 'content-type': 'text/event-stream' } });
+  // A network call detached from the current turn can never certify the
+  // selected main inference path, even when its response is successful.
+  await h.http(wire('claude-native'), async () => good());
+  assert.equal(find(await h.render(), 'Select'), undefined);
+  for (const value of [
+    { status: 200, headers: {}, text: 'body only' },
+    { status: 429, isStreaming: true, headers: {} },
+    { status: 200, isStreaming: false, headers: {} },
+    { status: 200, isStreaming: true, headers: 'bad' },
+  ]) {
+    await h.runStep(step(), async function* () {
+      const event = wire('claude-native');
+      assert.equal(await h.http(event, async () => value), value, 'native response must be identical');
+      return resultOf(step());
+    });
+    assert.equal(find(await h.render(), 'Select'), undefined);
+  }
+  await h.runStep(step(), async function* () {
+    const unsupported = wire('claude-native');
+    unsupported.init!.body = JSON.stringify({ model: 'claude-native', messages: 'future schema' });
+    assert.equal(await h.http(unsupported, async () => good()) !== undefined, true);
+    return resultOf(step());
+  });
+  assert.equal(find(await h.render(), 'Select'), undefined);
+  const native = wire('claude-native');
+  const response = good();
+  await h.runStep(step(), async function* () {
+    assert.equal(await h.http(native, async input => { assert.equal(input, native); return response; }), response);
+    return resultOf(step());
+  });
+  assert.ok(find(await h.render(), 'Select'), 'the same completed step and native HTTP stream establish the contract');
+  assert.equal(h.invocations.length, 0);
+});
+
+test('the passive native contract is model-matched and supports standard Claude model aliases', async () => {
+  const h = harness(); await h.render();
+  await h.runStep(step({ model: 'claude-sonnet-5-5' }), async function* () {
+    const foreign = wire('claude-opus-5-5');
+    await h.http(foreign, async () => ({ status: 200, isStreaming: true, headers: {} }));
+    return resultOf(step());
+  });
+  assert.equal(find(await h.render(), 'Select'), undefined, 'unrelated Claude model cannot certify a main step');
+  await h.runStep(step({ model: 'sonnet' }), async function* () {
+    await h.http(wire('claude-sonnet-5-5'), async () => ({ status: 200, isStreaming: true, headers: {} }));
+    return resultOf(step());
+  });
+  assert.ok(find(await h.render(), 'Select'), 'native alias model is accepted by the same behavioral contract');
+});
+
+test('a live engine version update requires an automatic fresh canary; selected Gemini cannot silently fall into Claude', async () => {
+  const h = harness(); await h.select();
+  h.setVersion('2.1.329');
+  const old = find(await h.render(), 'Select');
+  assert.ok(old);
+  assert.match(old.props.label as string, /unavailable/);
+  const blocked = await h.runStep(step());
+  assert.equal(blocked.coreCalls, 0, 'selected Gemini must never resume native inference on engine change');
+  assert.match(blocked.result.answer, /No automatic Claude retry/);
+  await h.select('claude');
+  assert.equal(find(await h.render(), 'Select'), undefined, 'fresh version has no proven traffic yet');
+  const native = step();
+  assert.equal((await h.runStep(native)).received, native);
+  assert.equal(find(await h.render(), 'Select'), undefined, 'a turn without an observed network stream is insufficient');
+  await h.http(wire('claude-native'), async () => ({ status: 200, isStreaming: true, headers: {} }));
+  assert.equal(find(await h.render(), 'Select'), undefined, 'an unrelated network call is insufficient');
+  await h.certify();
+  assert.ok(find(await h.render(), 'Select'), 'same code now admits the updated engine');
+  assert.equal(h.invocations.length, 0);
+});
+
+test('a normal native error never establishes a transport proof, and a failed transport never changes the original failure', async () => {
+  const h = harness(); await h.render();
+  const request = wire('claude-native');
+  await assert.rejects(h.runStep(step(), async function* () {
+    await h.http(request, async () => { throw new Error('native upstream refused'); });
+    return resultOf(step());
+  }), /native upstream refused/);
+  assert.equal(find(await h.render(), 'Select'), undefined);
+  assert.equal(h.invocations.length, 0);
 });
 
 test('missing key refuses the explicit selection without launching a helper', async () => {
@@ -489,7 +601,7 @@ test('selected-stream cleanup releases the marker without replacing the original
 });
 
 test('busy turns prevent selection; session end resets to native and invalidates stale UI callbacks', async () => {
-  const h = harness();
+  const h = harness(); await h.certify();
   const old = find(await h.render(), 'Select')!;
   await h.observe('turn.start');
   (old.props.onSelect as (v: string, e: object) => void)('gemini', { surface: 'desktop' });
