@@ -7,7 +7,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
-import { startAdmin } from "../src/admin.ts";
+import { startAdmin, adminTestAuthHeaders, adminTestTlsOptions } from "./admin-client.ts";
 import { CertStore } from "../src/certs.ts";
 import { DEFAULTS, type Config } from "../src/config.ts";
 import { UpstreamHealth } from "../src/health.ts";
@@ -112,7 +112,8 @@ async function rig() {
   await proxy.listen();
   const admin = await startAdmin({ config: () => cfg, configFile: path.join(home, "config.json"), log, requests, stats: () => proxy.stats, health: () => 0, version: "test", compactPick: (session, model) => model === null ? proxy.compactPicks.clear(session) : proxy.compactPicks.set(session, model) });
   const pick = (body: unknown, headers: Record<string, string> = {}) => new Promise<{ status: number }>((resolve, reject) => {
-    const req = http.request(`http://127.0.0.1:${admin.port}/api/compact-pick`, { method: "POST", headers: { "content-type": "application/json", ...headers } }, res => {
+    const base = `http://127.0.0.1:${admin.port}`;
+    const req = https.request({ ...adminTestTlsOptions(base), path: "/api/compact-pick", method: "POST", headers: { ...adminTestAuthHeaders(base), "content-type": "application/json", ...headers } }, res => {
       res.resume(); res.once("end", () => resolve({ status: res.statusCode! }));
     });
     req.once("error", reject); req.end(JSON.stringify(body));
@@ -219,6 +220,31 @@ test("missing target, unset setting and corrupt setting all retain a response on
     assert.equal(r.native.length, 5);
     assert.ok(r.native.every(entry => entry.raw === JSON.stringify(fixture())));
     assert.equal(r.proxy.stats.inFlight, 0);
+  } finally { await r.stop(); }
+});
+
+for (const wire of ["anthropic", "openai"] as const) test(`compaction ${wire} redirect refusals reach the client without an original-destination fallback`, async () => {
+  const r = await rig();
+  try {
+    // Leave this direct library fixture without personal mode: it deliberately exercises the
+    // legacy deferred-error wrapper as well as the terminal policy boundary. Production personal
+    // mode disables automatic cross-provider fallback independently.
+    if (wire === "openai") {
+      const url = (r.cfg.providers.local as { url: string }).url;
+      r.cfg.providers.local = { type: "openai-compatible", url, wire: "chat", headers: { authorization: "Bearer synthetic-only" }, models: [{ id: "summary" }] };
+    }
+    r.settings("summary");
+    for (const status of [302, 304, 307]) {
+      const before = r.routed.length;
+      r.fail(status);
+      const text = await r.send();
+      assert.match(text, /HTTP\/1.1 502/);
+      assert.match(text, /redirect/i);
+      assert.doesNotMatch(text, /core summary|compact target refused|synthetic-only/);
+      assert.equal(r.routed.length, before + 1, "the configured provider is contacted once");
+      assert.equal(r.native.length, 0, "the original destination receives no prompt or credential");
+      assert.equal(r.proxy.stats.inFlight, 0, "a swallowed deferred error cannot leave the turn pending");
+    }
   } finally { await r.stop(); }
 });
 

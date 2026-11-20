@@ -2,12 +2,16 @@ import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
+import { isDeepStrictEqual } from "node:util";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ChatGptAdapter } from "../src/providers/chatgpt/index.ts";
 import { saveChatGptAccount } from "../src/providers/chatgpt/accounts.ts";
 import { Logger } from "../src/log.ts";
+import { WINDOWS_PRIVATE_ACL_SCRIPT } from "../src/windows-private-acl.ts";
+import { WINDOWS_DPAPI_SCRIPT } from "../src/secret-storage.ts";
+import { windowsPowerShellEnv } from "../../cli/src/windows-powershell.ts";
 
 const quota = { rate_limit: { primary_window: { used_percent: 25, limit_window_seconds: 18000 } } };
 const catalog = { models: [{ slug: "timeout-test-model", visibility: "list" }] };
@@ -15,6 +19,52 @@ const cases = [
   { name: "quota", timeout: 10_000, body: quota, read: (adapter: ChatGptAdapter) => adapter.fetchRateLimits() },
   { name: "catalog", timeout: 15_000, body: catalog, read: (adapter: ChatGptAdapter) => adapter.fetchModels() },
 ];
+
+// Account fixtures still use the production Windows private-file writer. Permit only its
+// fixed ACL program, with its exact bounded options and a target inside this temporary home.
+// Every other child process remains blocked, including PowerShell credential-store readers.
+function isFixtureAclCall(home: string, command: unknown, args: unknown, options: unknown, systemRoot = process.env.SystemRoot): boolean {
+  if (!systemRoot || !path.win32.isAbsolute(systemRoot) ||
+      command !== path.win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")) return false;
+  const expected = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_PRIVATE_ACL_SCRIPT];
+  if (!Array.isArray(args) || args.length !== expected.length || !args.every((arg, i) => arg === expected[i])) return false;
+  if (!options || typeof options !== "object" || Array.isArray(options)) return false;
+  const opts = options as Record<string, unknown>;
+  if (Object.keys(opts).sort().join(",") !== "encoding,input,maxBuffer,timeout,windowsHide" ||
+      opts.encoding !== "utf8" || opts.timeout !== 30_000 || opts.maxBuffer !== 16 * 1024 || opts.windowsHide !== true ||
+      typeof opts.input !== "string" || opts.input.length > 128 * 1024) return false;
+  let request: unknown;
+  try { request = JSON.parse(opts.input); } catch { return false; }
+  if (!request || typeof request !== "object" || Array.isArray(request)) return false;
+  const record = request as Record<string, unknown>;
+  if (Object.keys(record).some(key => !["path", "directory", "verifyOnly"].includes(key)) ||
+      typeof record.path !== "string" || !path.isAbsolute(record.path) || record.path.includes("\0") ||
+      typeof record.directory !== "boolean" || (record.verifyOnly !== undefined && record.verifyOnly !== true)) return false;
+  const relative = path.relative(home, record.path);
+  return relative === "" || relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+// A DPAPI round trip may touch only the known synthetic account document or ciphertext this very
+// fixture just created. It cannot unprotect arbitrary OS/profile secrets or invoke other source.
+function isFixtureDpapiCall(command: unknown, args: unknown, options: unknown, produced: ReadonlySet<string>, systemRoot = process.env.SystemRoot): boolean {
+  if (!systemRoot || !path.win32.isAbsolute(systemRoot) || command !== path.win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")) return false;
+  const expected = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_DPAPI_SCRIPT];
+  if (!Array.isArray(args) || args.length !== expected.length || !args.every((arg, i) => arg === expected[i])) return false;
+  if (!options || typeof options !== "object" || Array.isArray(options)) return false;
+  const opts = options as Record<string, unknown>;
+  if (Object.keys(opts).sort().join(",") !== "encoding,env,input,maxBuffer,timeout,windowsHide" || !isDeepStrictEqual(opts.env, windowsPowerShellEnv()) || opts.encoding !== "utf8" || opts.timeout !== 10_000 ||
+      opts.maxBuffer !== Math.ceil((8 * 1024 * 1024 + 16 * 1024) / 3) * 4 || opts.windowsHide !== true || typeof opts.input !== "string" || opts.input.length > 64 * 1024) return false;
+  try {
+    const request = JSON.parse(opts.input) as Record<string, unknown>;
+    if (Object.keys(request).sort().join(",") !== "data,entropy,operation" || typeof request.data !== "string" ||
+        request.entropy !== Buffer.from("ClaudeRipple private secret v1\0chatgpt-accounts.json").toString("base64")) return false;
+    if (request.operation === "unprotect") return produced.has(request.data);
+    if (request.operation !== "protect") return false;
+    const doc = JSON.parse(Buffer.from(request.data, "base64").toString("utf8"));
+    return doc.version === 1 && Array.isArray(doc.accounts) && doc.accounts.length === 1 && doc.accounts.every((account: Record<string, unknown>) =>
+      account.accountId === "fixture-workspace" && ["fixture-token", "fixture-fresh"].includes(String(account.accessToken)) && ["fixture-refresh", "fixture-next"].includes(String(account.refreshToken)));
+  } catch { return false; }
+}
 
 function rig(t: TestContext) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-sidecall-timeout-"));
@@ -25,7 +75,15 @@ function rig(t: TestContext) {
   const noOsCredentials = () => { throw new Error("OS credential readers are disabled in this test"); };
   t.mock.method(childProcess, "execFileSync", noOsCredentials);
   t.mock.method(childProcess, "execSync", noOsCredentials);
-  t.mock.method(childProcess, "spawnSync", noOsCredentials);
+  const realSpawnSync = childProcess.spawnSync;
+  const producedCiphertexts = new Set<string>();
+  t.mock.method(childProcess, "spawnSync", (command: string, args?: readonly string[], options?: childProcess.SpawnSyncOptions) => {
+    const dpapi = isFixtureDpapiCall(command, args, options, producedCiphertexts);
+    if (process.platform !== "win32" || !isFixtureAclCall(home, command, args, options) && !dpapi) return noOsCredentials();
+    const result = realSpawnSync(command, args ?? [], options ?? {});
+    if (dpapi && result.status === 0 && JSON.parse(String(options!.input)).operation === "protect") producedCiphertexts.add(String(result.stdout));
+    return result;
+  });
   syncBuiltinESMExports();
   t.after(() => {
     t.mock.restoreAll();
@@ -57,6 +115,57 @@ function rig(t: TestContext) {
   });
   return { adapter, signals, calls: () => calls, refreshes: () => refreshes, reply: (next: typeof reply) => { reply = next; } };
 }
+
+test("the credential-isolation exception accepts only the fixed private ACL helper inside the fixture home", () => {
+  const home = path.resolve(os.tmpdir(), "cr-sidecall-allowlist");
+  const root = "C:\\Windows";
+  const command = path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_PRIVATE_ACL_SCRIPT];
+  const options = { input: JSON.stringify({ path: path.join(home, "account.json"), directory: false }),
+    encoding: "utf8", timeout: 30_000, maxBuffer: 16 * 1024, windowsHide: true };
+  assert.equal(isFixtureAclCall(home, command, args, options, root), true);
+  assert.equal(isFixtureAclCall(home, command, args, { ...options, input: JSON.stringify({ path: home, directory: true, verifyOnly: true }) }, root), true);
+  for (const unsafe of ["powershell.exe", "security", "cmdkey.exe", `${command}.exe`]) {
+    assert.equal(isFixtureAclCall(home, unsafe, args, options, root), false);
+  }
+  for (const altered of [[...args, "extra"], args.slice(1), [...args.slice(0, -1), `${WINDOWS_PRIVATE_ACL_SCRIPT}\nGet-StoredCredential`]]) {
+    assert.equal(isFixtureAclCall(home, command, altered, options, root), false);
+  }
+  for (const altered of [
+    { ...options, shell: true }, { ...options, env: {} }, { ...options, timeout: 0 }, { ...options, timeout: 10_000 },
+    { ...options, maxBuffer: Infinity }, { ...options, encoding: "buffer" }, { ...options, windowsHide: false },
+    { ...options, input: "malformed" },
+    ...[path.join(home, "..", "outside.json"), path.join(`${home}-sibling`, "account.json"), "relative.json"].map(file =>
+      ({ ...options, input: JSON.stringify({ path: file, directory: false }) })),
+    { ...options, input: JSON.stringify({ path: home, directory: true, extra: "forbidden" }) },
+  ]) assert.equal(isFixtureAclCall(home, command, args, altered, root), false);
+});
+
+test("timeout fixtures keep OS credential readers blocked while using private account storage", t => {
+  rig(t);
+  assert.throws(() => childProcess.execFileSync("security", ["find-generic-password"]), /OS credential readers are disabled/);
+  assert.throws(() => childProcess.execSync("cmdkey /list"), /OS credential readers are disabled/);
+  assert.throws(() => childProcess.spawnSync("powershell.exe", ["-NoProfile", "-Command", "Get-StoredCredential"]), /OS credential readers are disabled/);
+});
+
+test("DPAPI fixture exception refuses arbitrary plaintext, ciphertext, entropy and altered helpers", () => {
+  const root = "C:\\Windows", command = path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_DPAPI_SCRIPT];
+  const request = { operation: "protect", entropy: Buffer.from("ClaudeRipple private secret v1\0chatgpt-accounts.json").toString("base64"),
+    data: Buffer.from(JSON.stringify({ version: 1, accounts: [{ accountId: "fixture-workspace", accessToken: "fixture-token", refreshToken: "fixture-refresh" }] })).toString("base64") };
+  const options = { input: JSON.stringify(request), encoding: "utf8", timeout: 10_000, maxBuffer: Math.ceil((8 * 1024 * 1024 + 16 * 1024) / 3) * 4, windowsHide: true, env: windowsPowerShellEnv() };
+  const produced = new Set(["synthetic-produced-ciphertext"]);
+  assert.equal(isFixtureDpapiCall(command, args, options, produced, root), true);
+  assert.equal(isFixtureDpapiCall(command, args, { ...options, input: JSON.stringify({ ...request, operation: "unprotect", data: "synthetic-produced-ciphertext" }) }, produced, root), true);
+  for (const altered of [{ ...request, operation: "unprotect" }, { ...request, entropy: "elsewhere" }, { ...request, data: Buffer.from("unrelated credential").toString("base64") }]) {
+    assert.equal(isFixtureDpapiCall(command, args, { ...options, input: JSON.stringify(altered) }, produced, root), false);
+  }
+  assert.equal(isFixtureDpapiCall("powershell.exe", args, options, produced, root), false);
+  assert.equal(isFixtureDpapiCall(command, [...args, "Get-StoredCredential"], options, produced, root), false);
+  assert.equal(isFixtureDpapiCall(command, args, { ...options, shell: true }, produced, root), false);
+  assert.equal(isFixtureDpapiCall(command, args, { ...options, env: {} }, produced, root), false);
+  assert.equal(isFixtureDpapiCall(command, args, { ...options, env: { ...options.env, PsMoDuLePaTh: "unapproved-modules" } }, produced, root), false);
+});
 
 function stalledBody(signal: AbortSignal) {
   const reading = Promise.withResolvers<void>();

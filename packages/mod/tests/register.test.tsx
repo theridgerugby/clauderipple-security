@@ -77,6 +77,9 @@ function boundaries(on: On, patch: Partial<Settings> = {}, options: { config?: u
   mock.env(on, { HOME: '/home/test', LANG: 'en_US.UTF-8', ...(options.key ? { TYPESAFE_API_KEY: options.key } : {}), ...options.env })
   let hostLanguage = options.language
   const processes: { argv: readonly string[]; timeoutMs?: number }[] = []
+  const bridgeCalls: { argv: readonly string[]; stdin: string; env?: Readonly<Record<string, string>> }[] = []
+  const nativeHome = options.env?.CLAUDERIPPLE_HOME ?? `${options.env?.HOME ?? '/home/test'}/.clauderipple`
+  const nativeRuntime = { version: 1, home: nativeHome, node: '/fixture/runtime/node', bridge: '/fixture/runtime/admin-bridge.js', env: {} }
   on('settings.read', () => ({ value: { language: hostLanguage } }))
   let resolvedLanguage: unknown
   on('state.set', { plugin: 'ripple', key: 'lang' }, async ($, e, next) => {
@@ -85,7 +88,19 @@ function boundaries(on: On, patch: Partial<Settings> = {}, options: { config?: u
     return result
   })
   on('session.cwd', () => ({ value: '/work' }))
-  on('process.run', ($, e) => {
+  on('process.run', async ($, e) => {
+    if (e.argv[0] === nativeRuntime.node && e.argv[1] === nativeRuntime.bridge) {
+      bridgeCalls.push({ argv: e.argv, stdin: e.init?.stdin ?? '', env: e.init?.env })
+      const request = JSON.parse(e.init?.stdin ?? '{}')
+      if (request.kind === 'ui') {
+        if (options.browserFailure === 'throw') throw new Error('native dashboard unavailable')
+        return { value: { exitCode: 0, stdout: JSON.stringify({ ok: !options.browserFailure }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      // Test fixture adapter only. Production calls no admin HTTP from the engine; the fixture
+      // forwards request data to these tests' existing API stubs without executing any process.
+      const value = await $.http.fetch(request.url, { method: request.method, headers: request.headers, ...(request.body !== undefined ? { body: request.body } : {}) })
+      return { value: { exitCode: 0, stdout: JSON.stringify(value), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     processes.push({ argv: e.argv, timeoutMs: e.init?.timeoutMs })
     if (['open', 'xdg-open', 'cmd'].includes(e.argv[0] ?? '') && options.browserFailure) {
       if (options.browserFailure === 'throw') throw new Error('browser unavailable')
@@ -96,7 +111,9 @@ function boundaries(on: On, patch: Partial<Settings> = {}, options: { config?: u
     return { value: { exitCode: 0, stdout: options.appleLocale ?? '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   const files = new Map<string, string>()
+  files.set(`${nativeHome}/admin-runtime.json`, JSON.stringify(nativeRuntime))
   let logFailure: 'read' | 'write' | null = null
+  on('fs.stat', ($, e) => ({ value: { kind: e.path === nativeHome ? 'dir' : (files.has(e.path) || [nativeRuntime.node, nativeRuntime.bridge].includes(e.path)) ? 'file' : 'other', size: files.get(e.path)?.length ?? 0, mtimeMs: NOW, isLink: false } }))
   on('fs.exists', ($, e) => ({ value: files.has(e.path) }))
   on('fs.write', ($, e) => {
     if (e.path.endsWith('/worker-picks.jsonl') && logFailure === 'write') return { deny: 'worker log write denied' }
@@ -155,7 +172,7 @@ function boundaries(on: On, patch: Partial<Settings> = {}, options: { config?: u
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('prompt.read', () => ({ value: { text: '', cursor: 0 } }))
   on('prompt.fill', ($, e) => { filled.push(e.text); return { isFilled: true } })
-  return { files, failWorkerLog: (value: 'read' | 'write' | null) => { logFailure = value }, registered, clock, saved, storeWrites, storeReads, settingsRequests, router: () => router, remote: (value: ModSettingsSnapshot) => { router = value }, offline: (value: boolean) => { offline = value }, conflict: (value: Settings) => { conflict = value }, alwaysConflict: (value: boolean) => { alwaysConflict = value }, toasts, logs, panes, submitted, contexts, filled, processes, language: () => resolvedLanguage, setLanguage: (value: unknown) => { hostLanguage = value }, setModel: (id: string) => { model = id }, setPercent: (value: number) => { percent = value } }
+  return { files, bridgeCalls, nativeRuntime, failWorkerLog: (value: 'read' | 'write' | null) => { logFailure = value }, registered, clock, saved, storeWrites, storeReads, settingsRequests, router: () => router, remote: (value: ModSettingsSnapshot) => { router = value }, offline: (value: boolean) => { offline = value }, conflict: (value: Settings) => { conflict = value }, alwaysConflict: (value: boolean) => { alwaysConflict = value }, toasts, logs, panes, submitted, contexts, filled, processes, language: () => resolvedLanguage, setLanguage: (value: unknown) => { hostLanguage = value }, setModel: (id: string) => { model = id }, setPercent: (value: number) => { percent = value } }
 }
 function http(on: On, exhausted = false, config: unknown = CONFIG, zen?: (input: { url: string; init?: { body?: string; headers?: Readonly<Record<string, string>> } }) => void) {
   const urls: string[] = []
@@ -2722,31 +2739,47 @@ test('quick settings show Base even before any mode is saved', async ($, on) => 
   await ui.unmount()
 })
 
-for (const platform of ['Darwin', 'Windows_NT', 'Linux'] as const) test('all settings opens the mod dashboard on ' + platform, async ($, on) => {
+for (const platform of ['Darwin', 'Windows_NT', 'Linux'] as const) test('all settings opens the native mod dashboard on ' + platform, async ($, on) => {
   const b = boundaries(on, { language: 'en' }, { platform, env: platform === 'Windows_NT' ? { OS: 'Windows_NT' } : {} })
   http(on)
   await start($)
   await command($, 'settings')
   const ui = await band($)
   await ui.press({ key: 'all-settings' })
-  const url = 'http://127.0.0.1:9992/#mod'
-  const argv = platform === 'Darwin' ? ['open', url] : platform === 'Windows_NT' ? ['cmd', '/c', 'start', '', url] : ['xdg-open', url]
-  expect(b.processes.map(p => p.argv)).toEqual(platform === 'Windows_NT' ? [argv] : [['uname', '-s'], argv])
+  expect(b.processes).toEqual([])
+  expect(b.bridgeCalls.at(-1)?.argv).toEqual([b.nativeRuntime.node, b.nativeRuntime.bridge])
+  expect(JSON.parse(b.bridgeCalls.at(-1)?.stdin ?? '{}')).toEqual({ kind: 'ui', view: 'mod' })
   expect(b.toasts).toEqual([])
   expect(b.settingsRequests.filter(r => r.method === 'PUT').length).toBe(0)
   await ui.unmount()
 })
 
-for (const failure of ['exit', 'throw'] as const) test('a browser ' + failure + ' failure toasts the dashboard URL', async ($, on) => {
+for (const failure of ['exit', 'throw'] as const) test('a native dashboard ' + failure + ' failure gives a clean recovery hint without a credential', async ($, on) => {
   const b = boundaries(on, { language: 'en' }, { platform: 'Darwin', browserFailure: failure })
+  const token = 'a'.repeat(64)
+  b.files.set('/home/test/.clauderipple/admin-token', token + '\n')
   http(on)
   await start($)
   await command($, 'settings')
   const ui = await band($)
   await ui.press({ key: 'all-settings' })
-  expect(b.toasts).toContain('http://127.0.0.1:9992/#mod')
-  expect(b.logs.some(log => log.includes('open mod settings'))).toBe(true)
+  expect(b.toasts).toContain('Could not open native settings. Run `clauderipple mod on`, then `clauderipple ui`. No browser capability was opened.')
+  expect([...b.toasts, ...b.logs].some(text => text.includes(token))).toBe(false)
   await ui.unmount()
+})
+
+test('local admin calls use native stdin without reading credentials through the engine filesystem', async ($, on) => {
+  const token = 'b'.repeat(64)
+  const paths: string[] = []
+  const b = boundaries(on, {}, { paths })
+  b.files.set('/home/test/.clauderipple/admin-tls-token', token + '\n')
+  http(on)
+  await start($)
+  await command($, 'settings')
+  expect(b.bridgeCalls.length).toBeGreaterThan(0)
+  expect(paths.some(file => file.endsWith('/admin-tls-token') || file.endsWith('/admin-token'))).toBe(false)
+  expect(JSON.stringify(b.bridgeCalls).includes(token)).toBe(false)
+  expect([...b.toasts, ...b.logs].some(text => text.includes(token))).toBe(false)
 })
 
 test('host survey wins; minimal layout renders through SessionMode', async ($, on) => {
@@ -3317,7 +3350,7 @@ test('setup step 2 opens the dashboard; its draft preserves edits and follows re
   await ui.press({ key: 'next' })
   expect(await ui.find({ type: 'Text', text: 'Workers start on the ladder; set it up on the dashboard.' })).toBeDefined()
   await ui.press({ key: 'all-settings' })
-  expect(b.processes.at(-1)?.argv).toEqual(['xdg-open', 'http://127.0.0.1:9992/#mod'])
+  expect(JSON.parse(b.bridgeCalls.at(-1)?.stdin ?? '{}')).toEqual({ kind: 'ui', view: 'mod' })
   // Changes on the dashboard reach setup without replacing the person's judge edit.
   const general = DEFAULTS.rules.general
   const light = { target: { agent: 'general-purpose', model: 'haiku' }, effort: 'low' }

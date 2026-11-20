@@ -7,6 +7,7 @@ import { execFile } from "node:child_process";
 import path from "node:path";
 
 import { ORIGIN } from "./protocol";
+import { externalUrl, isDashboardUrl, isPrivilegedWindow, watchPrivilegedWindow } from "./security";
 
 export type Bounds = { x: number; y: number; width: number; height: number };
 
@@ -31,10 +32,6 @@ function fits(b: Bounds): boolean {
     const h = Math.min(b.y + b.height, a.y + a.height) - Math.max(b.y, a.y);
     return w >= Math.min(200, b.width) && h >= Math.min(120, b.height);
   });
-}
-
-function isOurs(url: string): boolean {
-  return url.startsWith(`${ORIGIN}/`) || url === ORIGIN;
 }
 
 /**
@@ -72,20 +69,36 @@ export function openWindow(deps: WindowDeps, view?: string): void {
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,
+      nodeIntegrationInWorker: false,
+      nodeIntegrationInSubFrames: false,
+      webviewTag: false,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      experimentalFeatures: false,
       spellcheck: false,
     },
   });
+  watchPrivilegedWindow(win.webContents);
   if (!mac) win.removeMenu();
   // Links the dashboard opens (release notes, sign-in pages) belong in the user's browser.
   win.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https?:\/\//i.test(url)) void shell.openExternal(url);
+    const target = externalUrl(url);
+    if (target && win && isPrivilegedWindow(win.webContents)) void shell.openExternal(target).catch(() => undefined);
     return { action: "deny" };
   });
   win.webContents.on("will-navigate", (event, url) => {
-    if (isOurs(url)) return;
+    if (isDashboardUrl(url)) return;
     event.preventDefault();
-    if (/^https?:\/\//i.test(url)) void shell.openExternal(url);
+    const target = externalUrl(url);
+    if (target && win && isPrivilegedWindow(win.webContents)) void shell.openExternal(target).catch(() => undefined);
   });
+  win.webContents.on("will-frame-navigate", event => {
+    if (!event.isMainFrame || !isDashboardUrl(event.url)) event.preventDefault();
+  });
+  win.webContents.on("will-redirect", event => {
+    if (!event.isMainFrame || !isDashboardUrl(event.url)) event.preventDefault();
+  });
+  win.webContents.on("will-attach-webview", event => event.preventDefault());
   const remember = () => {
     if (win && !win.isDestroyed() && !win.isMinimized() && !win.isFullScreen()) deps.saveBounds(win.getNormalBounds());
   };
@@ -169,5 +182,5 @@ export function windowVisible(): boolean {
 
 /** Sends the bridge's state to the page, if the window is open. */
 export function sendToWindow(channel: string, payload: unknown): void {
-  if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
+  if (win && !win.isDestroyed() && isPrivilegedWindow(win.webContents)) win.webContents.send(channel, payload);
 }

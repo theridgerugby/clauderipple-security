@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { desktopUiGuardSource } from "./ui-native-fixture.ts";
 
 const source = fs.readFileSync(new URL("../../ui/app.js", import.meta.url), "utf8");
 const block = source.slice(source.indexOf("let autoUpdateSaving ="), source.indexOf("function versionRow("));
@@ -19,6 +20,7 @@ function ui(h: Harness): { toggleAutoUpdate(enabled: boolean): Promise<void>; au
   return new Function("h", `
     const status = h.status, t = key => key, document = { querySelector: () => h.input };
     let currentConfig = { stale: true };
+    ${desktopUiGuardSource(source)}
     const api = async () => { h.reads++; if (h.failRead) throw new Error('offline'); return { providers: { untouched: true }, routes: { keep: 'me' } }; };
     const configRequest = async next => { if (h.failWrite) throw new Error('save failed'); h.writes.push(next); };
     const refreshHealth = async () => { h.refreshes++; };

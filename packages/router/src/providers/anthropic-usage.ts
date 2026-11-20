@@ -10,6 +10,7 @@
 // so the GUI and the tray read one format for every account.
 
 import { retryAfterMs, type Credential } from "../pool.ts";
+import { guardEgressFetch, isEgressPolicyError } from "../egress.ts";
 
 type Window = { utilization?: unknown; resets_at?: unknown } | null | undefined;
 
@@ -248,6 +249,7 @@ export class ClaudeUsage {
     try {
       credentials = await this.source.credentials();
     } catch (e) {
+      if (isEgressPolicyError(e)) throw e;
       this.opts.warn?.(`claude usage: no credentials: ${(e as Error).message}`);
       return Object.fromEntries(this.last);
     }
@@ -335,7 +337,7 @@ export class ClaudeUsage {
   private async fetchOne(credential: Credential, at: number): Promise<FetchOutcome> {
     const owner = (credential.ownerId ?? credential.id).slice(0, 8);
     try {
-      const res = await (this.opts.fetch ?? fetch)(`https://${this.opts.upstream()}/api/oauth/usage`, {
+      const res = await guardEgressFetch(this.opts.fetch)(`https://${this.opts.upstream()}/api/oauth/usage`, {
         method: "GET",
         headers: { ...credential.headers, accept: "application/json" },
         signal: AbortSignal.timeout(this.opts.timeoutMs ?? 5000),
@@ -349,6 +351,7 @@ export class ClaudeUsage {
       }
       return { ok: true, snapshot: claudeUsageFromBody(await res.json(), at) };
     } catch (e) {
+      if (isEgressPolicyError(e)) throw e;
       this.opts.warn?.(`claude usage ${owner}: ${(e as Error).message}`);
       return { ok: false, failure: { status: 0 } };
     }

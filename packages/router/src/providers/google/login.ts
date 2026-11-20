@@ -12,6 +12,7 @@
 // **not measured live** — see docs/ARCHITECTURE.md §4d.
 
 import crypto from "node:crypto";
+import { guardEgressFetch } from "../../egress.ts";
 import http from "node:http";
 import net from "node:net";
 import { redactErrorText } from "../../redact.ts";
@@ -46,7 +47,7 @@ export type GoogleOAuthOptions = {
 export async function exchangeGoogleCode(
   opts: { code: string; codeVerifier: string; redirectUri: string; fetch?: FetchLike; now?: () => number },
 ): Promise<GoogleOAuthGrant> {
-  const res = await (opts.fetch ?? fetch)(GOOGLE_OAUTH.tokenUrl, {
+  const res = await guardEgressFetch(opts.fetch)(GOOGLE_OAUTH.tokenUrl, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
     body: new URLSearchParams({

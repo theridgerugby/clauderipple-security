@@ -13,7 +13,8 @@ import { keepAwakeCommand, PowerHold, nodeSpawner } from "../src/power.ts";
 import { MAC_CONSENT_DENIED, MAC_CONSENT_PENDING, macConsent, macProtected, noisyFolder } from "../src/folders.ts";
 import { batchCommand, launcherOptions } from "../src/sdk-launcher.ts";
 import { HostServer } from "../src/server.ts";
-import { LocalControl, localSecret } from "../src/local-control.ts";
+import { LocalControl } from "../src/local-control.ts";
+import { localControlRequest, readLocalControlState } from "../src/local-transport.ts";
 import { loadConfig, saveConfig } from "../src/config.ts";
 import { Sessions } from "../src/sessions.ts";
 import { PermissionQueue } from "../src/permissions.ts";
@@ -155,23 +156,37 @@ test("onSessions timer logs listing failure, stays reachable and retries the nex
   fail = false; host.onSessions(); await delay(200);
   assert.equal(sessions.list().length, 1);
 });
-test("shutdown requires the existing loopback secret, answers before callback, and drain confirms port closure", async t => {
-  const dir = temp(t);
+test("shutdown requires the pinned TLS capability, answers before callback, and drain confirms closure", async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ripple-shutdown-"));
   const cfg = loadConfig(dir);
+  fs.writeFileSync(path.join(dir, "local.secret"), "legacy-fixture", { mode: 0o600 });
   let stops = 0;
-  let server: http.Server;
-  const local = new LocalControl({ dir, config: cfg, version: "test", hostPublicKey: "public", phones: () => [], rotate: () => {}, shutdown: () => { stops++; server.close(); } });
-  server = http.createServer((req, res) => { void local.handle(req, res); });
-  t.after(() => server.close());
+  const server = http.createServer((_req, res) => { res.writeHead(410); res.end(); });
+  const local = new LocalControl({ dir, config: cfg, version: "test", hostPublicKey: "public", phones: () => [], rotate: () => {}, shutdown: () => { stops++; void local.close(); server.close(); } });
+  t.after(async () => { await local.close(); server.closeAllConnections(); server.close(); fs.rmSync(dir, { recursive: true, force: true }); });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   const address = server.address(); assert.ok(address && typeof address === "object");
   cfg.port = address.port; saveConfig(cfg, dir);
+  await local.listen(cfg.port);
   const url = `http://127.0.0.1:${cfg.port}/local/shutdown`;
-  assert.equal((await fetch(url, { method: "POST" })).status, 403);
+  assert.equal((await fetch(url, { method: "POST" })).status, 410);
   assert.equal(stops, 0);
-  assert.equal((await fetch(url, { headers: { "x-ripple-local": localSecret(dir) } })).status, 404);
-  await controlShutdown(dir);
+  assert.equal((await localControlRequest(dir, "/local/shutdown")).status, 404);
+  const receipt = await controlShutdown(dir);
   assert.equal(stops, 1);
+  assert.ok(readLocalControlState(dir), "last authenticated discovery survives clean shutdown");
+  await controlShutdown(dir);
+  assert.equal(stops, 1, "repeated shutdown does not re-enter the legacy upgrade trap");
+  saveConfig({ ...cfg, port: cfg.port === 65535 ? 65534 : cfg.port + 1 }, dir);
+  await assert.doesNotReject(() => receipt.assertStillStopped());
+  assert.equal(stops, 1, "a second install stage uses the receipt without targeting a different port");
+});
+
+test("a legacy marker with no authenticated discovery requires manual stop, never a hard-kill assumption", async t => {
+  const dir = temp(t);
+  fs.writeFileSync(path.join(dir, "local.secret"), "legacy-test-only", { mode: 0o600 });
+  await assert.rejects(controlShutdown(dir), /stop the old host manually/);
+  assert.equal(fs.readFileSync(path.join(dir, "local.secret"), "utf8"), "legacy-test-only");
 });
 
 test("an update restarts only the phone host this installation registered, and not mid-turn", () => {

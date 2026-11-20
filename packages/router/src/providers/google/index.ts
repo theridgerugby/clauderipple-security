@@ -14,7 +14,6 @@
 // vendor sent. The antigravity path picks the account the conversation is sticky to and moves to the
 // next one only on a refusal that has not reached the client (§4 Credential pools).
 
-import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -26,6 +25,7 @@ import { CredentialPool, pinnedCredential, retryAfterMs } from "../../pool.ts";
 import { credentialHeaderValues, redactErrorText } from "../../redact.ts";
 import { SseParser } from "../chatgpt/sse.ts";
 import { fetchWithRetry } from "../retry.ts";
+import { egressFetch, isEgressPolicyError } from "../../egress.ts";
 import { FINGERPRINT_BLOCK_HINT, isCloudflareFingerprintBlock } from "../openai/index.ts";
 import { StartInputs } from "../start-input.ts";
 import { estimateTokens, formatSse, GoogleStreamMapper, toGeminiRequest, type GeminiRequest } from "./translate.ts";
@@ -33,8 +33,10 @@ import { antigravityBaseUrl, createTransport, credentialParts, googleBaseUrl, re
 import { ThoughtSignatureStore, type ThoughtSignatureSink } from "./thoughtSignatures.ts";
 import { conversationKey, serverToolNames, toolNameRestoreMap, type AnthropicRequest } from "../chatgpt/translate.ts";
 import { GoogleAccountPool, type GoogleAccountSummary, type GoogleCredential, type FetchLike } from "./accounts.ts";
-import { fetchAvailableModels, LearnedCatalogue, mergeHostCatalogues, resolveAntigravityWireModel, staticAntigravityModels, GOOGLE_OAUTH, type HostMap, type MergedCatalogue, type ParsedHostCatalogue } from "./antigravity.ts";
+import { fetchAvailableModels, LearnedCatalogue, mergeHostCatalogues, resolveAntigravityWireModel, staticAntigravityModels, GOOGLE_OAUTH, type HostMap, type LearnedSnapshot, type MergedCatalogue, type ParsedHostCatalogue } from "./antigravity.ts";
+import { parseAdminJson } from "../../admin-input.ts";
 import { writeJsonAtomic } from "../../locked-file.ts";
+import { readPrivateFile } from "../../private-file.ts";
 import { antigravityQuotaScope, GoogleUsage, type QuotaGroup } from "./usage.ts";
 import { ANTIGRAVITY_PROMPT_REFUSAL_MESSAGE, isAntigravityPromptRefusal } from "./prompt-refusal.ts";
 import { promptAdditions } from "../../identity.ts";
@@ -211,6 +213,8 @@ function groupNames(group: string): { spent: string; other: string } {
  */
 export const LEARNED_MODELS_FILE = "antigravity-models.json";
 const LEARNED_MODELS_VERSION = 2;
+const LEARNED_MODELS_MAX_BYTES = 2 * 1024 * 1024;
+const LEARNED_MODELS_MAX_PROVIDERS = 128;
 
 /**
  * The lists another stored provider kept for the hosts in `asked`: the first provider that asks
@@ -236,14 +240,35 @@ function listsOfOthers(stored: Record<string, unknown>, asked: readonly string[]
 /**
  * Every provider's stored lists in `home`; none when the file is absent, unreadable or of another
  * version. `newer` says a later build wrote it, whose format is not this one's to overwrite.
+ * An existing file that cannot be read within the byte/regular-file bounds is not replaced either.
  */
-function readLearnedFile(home: string): { providers: Record<string, unknown>; newer: boolean } {
+function readLearnedFile(home: string): { providers: Record<string, LearnedSnapshot>; newer: boolean; unwritable?: true } {
+  let text: string;
+  try { text = readPrivateFile(path.join(home, LEARNED_MODELS_FILE), LEARNED_MODELS_MAX_BYTES).toString("utf8"); }
+  catch (error) {
+    return { providers: {}, newer: false, ...((error as NodeJS.ErrnoException).code === "ENOENT" ? {} : { unwritable: true as const }) };
+  }
   try {
-    const stored = JSON.parse(fs.readFileSync(path.join(home, LEARNED_MODELS_FILE), "utf8")) as { version?: unknown; providers?: unknown } | null;
+    // The descriptor bounds allocation even before the native JSON parser. Recognize a future
+    // envelope first: that format may legitimately exceed this version's structure limits.
+    const stored = JSON.parse(text) as { version?: unknown; providers?: unknown } | null;
     const version = stored?.version;
     if (typeof version === "number" && version > LEARNED_MODELS_VERSION) return { providers: {}, newer: true };
+    // The iterative validator bounds depth/value count before any catalogue lookup or
+    // recursive serialization sees current/legacy records. No raw parser message is logged.
+    parseAdminJson(text);
     const providers = version === LEARNED_MODELS_VERSION ? stored?.providers : undefined;
-    return { providers: providers && typeof providers === "object" && !Array.isArray(providers) ? { ...(providers as Record<string, unknown>) } : {}, newer: false };
+    if (!providers || typeof providers !== "object" || Array.isArray(providers)) return { providers: {}, newer: false };
+    const entries = Object.entries(providers);
+    if (entries.length > LEARNED_MODELS_MAX_PROVIDERS) return { providers: {}, newer: false };
+    // Sanitize every provider, including ones merely carried through the next save. Keep empty
+    // entries too: a provider with its own empty lists must not inherit another one's models.
+    return { providers: Object.fromEntries(entries.map(([name, lists]) => {
+      // A configured custom base can be longer than the default constructor's unscoped-host
+      // bound. Preserve its key here; each adapter still filters to only the hosts it asks.
+      const hosts = lists && typeof lists === "object" && !Array.isArray(lists) ? Object.keys(lists) : undefined;
+      return [name, new LearnedCatalogue(lists, hosts).snapshot()];
+    })), newer: false };
   } catch {
     return { providers: {}, newer: false };
   }
@@ -527,7 +552,7 @@ export class GoogleAdapter {
       { model, stream: false, antigravity: { accessToken: credential.accessToken, projectId: credential.projectId, conversationKey: `recheck:${ownerId}` }, antigravityBaseUrl: this.hostFor(model, undefined) },
     );
     try {
-      const upstream = await fetch(built.url, { method: "POST", headers: built.headers, body: built.body, signal: AbortSignal.timeout(30_000) });
+      const upstream = await egressFetch(built.url, { method: "POST", headers: built.headers, body: built.body, signal: AbortSignal.timeout(30_000) });
       const text = await upstream.text().catch(() => "");
       if (upstream.ok) {
         this.verifyUrls.delete(ownerId);
@@ -541,7 +566,8 @@ export class GoogleAdapter {
       // Any other answer is not about verification; the next real turn sorts it out.
       this.log.info(`google ${this.name}: verification recheck of ${ownerId.slice(0, 8)} answered ${upstream.status}`);
       return "unknown";
-    } catch {
+    } catch (error) {
+      if (isEgressPolicyError(error)) throw error;
       return "unknown";
     }
   }
@@ -598,6 +624,7 @@ export class GoogleAdapter {
         cliFailed: (host, reason) => cliReasons.set(host, reason),
       });
     } catch (error) {
+      if (isEgressPolicyError(error)) throw error;
       // An answer is untrusted input. Whatever it does to the parse, it is an unreadable catalogue
       // and never a failed turn (`fetchModels` does not throw, and a turn awaits it).
       this.log.warn(`google ${this.name}: the model catalogue could not be processed (${(error as Error).name}); treated as unreadable`);
@@ -655,14 +682,21 @@ export class GoogleAdapter {
     // A save that cannot replace the file holds the event loop while the rename is retried
     // (locked-file.ts, two seconds on Windows), so after a failure it waits for a change or the hour.
     if (Date.now() - this.learnedSaveFailedAt < MODELS_CACHE_MS) return;
-    const stored = readLearnedFile(this.home);
-    if (stored.newer) return;
-    const mine = this.learned.snapshot();
-    const theirs = Object.hasOwn(stored.providers, this.name) ? stored.providers[this.name] : undefined;
-    if (theirs === undefined ? Object.keys(mine).length === 0 : JSON.stringify(theirs) === JSON.stringify(mine)) return;
     try {
-      // The file was read just now, so another provider's lists of this home are written back as they are.
-      writeJsonAtomic(path.join(this.home, LEARNED_MODELS_FILE), { version: LEARNED_MODELS_VERSION, providers: { ...stored.providers, [this.name]: mine } });
+      const stored = readLearnedFile(this.home);
+      if (stored.newer || stored.unwritable) return;
+      const mine = this.learned.snapshot();
+      const theirs = Object.hasOwn(stored.providers, this.name) ? stored.providers[this.name] : undefined;
+      if (theirs === undefined ? Object.keys(mine).length === 0 : JSON.stringify(theirs) === JSON.stringify(mine)) return;
+      const providers = { ...stored.providers, [this.name]: mine };
+      if (Object.keys(providers).length > LEARNED_MODELS_MAX_PROVIDERS) throw new Error("learned model cache has too many providers");
+      const value = { version: LEARNED_MODELS_VERSION, providers };
+      // Never publish a cache the bounded reader would reject next time. Keep comparison and
+      // serialization in this same best-effort boundary: a cache failure must not fail a turn.
+      const serialized = JSON.stringify(value, null, 2) + "\n";
+      if (Buffer.byteLength(serialized) > LEARNED_MODELS_MAX_BYTES) throw new Error("learned model cache exceeds its size bound");
+      parseAdminJson(serialized);
+      writeJsonAtomic(path.join(this.home, LEARNED_MODELS_FILE), value);
     } catch (error) {
       this.learnedSaveFailedAt = Date.now();
       this.log.warn(`google ${this.name}: could not save the learned models (${(error as NodeJS.ErrnoException).code ?? (error as Error).name}); trying again when they change, or in an hour`);
@@ -852,6 +886,7 @@ export class GoogleAdapter {
     } catch (error) {
       res.off("close", onClose);
       if (controller.signal.aborted) return { status: 0, bytes: 0, note: "client closed" };
+      if (isEgressPolicyError(error)) throw error;
       (error as Error).message = redact((error as Error).message);
       const out = anthropicError(502, "api_error", `Google provider unreachable: ${(error as Error).message}`);
       if (!res.headersSent) res.writeHead(out.status, { "content-type": "application/json" }).end(out.body);
@@ -908,7 +943,7 @@ export class GoogleAdapter {
         for (const secret of secrets) upstreamSecrets.add(secret);
         return { built };
       },
-    });
+    }).catch((error: unknown) => { res.off("close", onClose); throw error; });
 
     if (sent.kind !== "ok") {
       res.off("close", onClose);
@@ -1129,6 +1164,7 @@ export class GoogleAdapter {
         }, { log: (line) => this.log.info(`google ${this.name}: ${spec.redact(line)}`), stopOn: isModelCapacityExhausted });
       } catch (e) {
         if (spec.signal.aborted) return { kind: "aborted" };
+        if (isEgressPolicyError(e)) throw e;
         this.pool.penalise(this.name, credential.id, 0);
         tried.add(credential.ownerId);
         lastThrown = e as Error;

@@ -22,6 +22,7 @@ import {
 } from "../src/providers/anthropic-accounts.ts";
 import { readClaudeAuthFile, saveClaudeOAuthFile } from "../src/providers/anthropic-token-file.ts";
 import { posixModes } from "../../../test/capabilities.ts";
+import { readPrivateFile } from "../src/private-file.ts";
 
 function home(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "cr-claude-accounts-"));
@@ -56,7 +57,7 @@ test("account storage is private, exposes safe summaries, and never stores the u
   try {
     const account = saveClaudeOAuthAccount(dir, grant("one"), "2026-09-20T00:00:00.000Z");
     if (posixModes) assert.equal(fs.statSync(claudeAccountsPath(dir)).mode & 0o777, 0o600);
-    const raw = fs.readFileSync(claudeAccountsPath(dir), "utf8");
+    const raw = readPrivateFile(claudeAccountsPath(dir)).toString("utf8");
     assert.doesNotMatch(raw, /upstream-one/);
     assert.match(raw, /[0-9a-f]{64}/);
     assert.deepEqual(listClaudeAccounts(dir), [{
@@ -127,7 +128,9 @@ test("a stale process lock is recovered without leaving lock files", () => {
   try {
     const lock = `${claudeAccountsPath(dir)}.lock`;
     fs.mkdirSync(lock, { mode: 0o700 });
-    const old = new Date(Date.now() - 60_000);
+    // A synchronous holder cannot refresh its mtime until its mutation returns. Only a lock
+    // older than the conservative stale threshold is safe to reclaim after a crashed writer.
+    const old = new Date(Date.now() - 180_000);
     fs.utimesSync(lock, old, old);
     const account = saveClaudeOAuthAccount(dir, grant("recovered"));
     assert.equal(listClaudeAccounts(dir)[0]!.id, account.id);
@@ -145,7 +148,7 @@ test("a malformed pool fails closed and cannot be overwritten by a mutation", ()
     assert.deepEqual(readClaudeAccountsFile(dir), []);
     assert.deepEqual(readClaudeOAuthAccounts(dir), []);
     assert.throws(() => saveClaudeOAuthAccount(dir, grant("replacement")), /refusing to overwrite/);
-    assert.equal(fs.readFileSync(claudeAccountsPath(dir), "utf8"), malformed);
+    assert.equal(readPrivateFile(claudeAccountsPath(dir)).toString("utf8"), malformed);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

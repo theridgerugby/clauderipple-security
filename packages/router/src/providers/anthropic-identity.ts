@@ -7,6 +7,7 @@
 // Only the email and a one-way hash of the UUID leave this module; the body is never logged.
 
 import crypto from "node:crypto";
+import { guardEgressFetch, isEgressPolicyError } from "../egress.ts";
 import type { Credential } from "../pool.ts";
 import type { RequestRecord } from "../requestlog.ts";
 import { subjectHash } from "./anthropic-accounts.ts";
@@ -94,6 +95,8 @@ type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
 type IdentityOptions = {
   /** The Anthropic API host (`config.upstream`). */
   upstream: () => string;
+  /** A live mode gate, checked before credential access, HTTP and cache publication. */
+  enabled?: () => boolean;
   fetch?: FetchLike;
   now?: () => number;
   /** How long a failed lookup is kept before it is asked again (ten minutes). */
@@ -127,22 +130,43 @@ export class ClaudeCurrentIdentity {
   private readonly cache = new Map<string, { at: number; value: ClaudeLoginIdentity | null }>();
   private readonly source: IdentitySource;
   private readonly opts: IdentityOptions;
+  private generation = 0;
+  private readonly pending = new Set<AbortController>();
 
   constructor(source: IdentitySource, opts: IdentityOptions) {
     this.source = source;
     this.opts = opts;
   }
 
+  /** Forget optional account metadata and cancel only our own profile requests. Native
+   * inference, login and persistent account state are never changed. */
+  discard(): void {
+    this.generation++;
+    this.cache.clear();
+    for (const controller of this.pending) controller.abort();
+    this.pending.clear();
+  }
+
+  private enabled(): boolean {
+    if (this.opts.enabled?.() !== false) return true;
+    this.discard();
+    return false;
+  }
+
   /** The identity of the pool's own copy of the current login. */
   async identify(): Promise<ClaudeLoginIdentity | null> {
+    if (!this.enabled()) return null;
+    const generation = this.generation;
     let headers: Record<string, string> | undefined;
     try {
       headers = (await this.source.credentials()).find((credential) => credential.ownerId === "current")?.headers;
     } catch (e) {
+      if (generation !== this.generation || !this.enabled()) return null;
+      if (isEgressPolicyError(e)) throw e;
       this.opts.warn?.(`claude identity: no credentials: ${(e as Error).message}`);
       return null;
     }
-    if (!headers) return null;
+    if (!headers || generation !== this.generation || !this.enabled()) return null;
     return this.identifyWith(headers);
   }
 
@@ -151,6 +175,8 @@ export class ClaudeCurrentIdentity {
    * that login, which need not be the pool's copy, so the caller passes the headers it sent.
    */
   async identifyWith(headers: Record<string, string>): Promise<ClaudeLoginIdentity | null> {
+    if (!this.enabled()) return null;
+    const generation = this.generation;
     const auth = authHeaderValue(headers);
     if (!auth) return null;
     const key = crypto.createHash("sha256").update(auth).digest("hex");
@@ -159,7 +185,13 @@ export class ClaudeCurrentIdentity {
     // is retried after ten minutes.
     const hit = this.cache.get(key);
     if (hit && now - hit.at < (hit.value ? this.opts.successTtlMs ?? DAY_MS : this.opts.ttlMs ?? 10 * 60_000)) return hit.value;
-    const value = await this.fetchProfile(headers);
+    const controller = new AbortController();
+    this.pending.add(controller);
+    let value: ClaudeLoginIdentity | null;
+    try { value = await this.fetchProfile(headers, controller.signal); }
+    finally { this.pending.delete(controller); }
+    // A response that ignored cancellation must not restore an identity after the mode changed.
+    if (generation !== this.generation || !this.enabled()) return null;
     this.cache.delete(key);
     this.cache.set(key, { at: now, value });
     if (this.cache.size > 8) {
@@ -169,14 +201,15 @@ export class ClaudeCurrentIdentity {
     return value;
   }
 
-  private async fetchProfile(headers: Record<string, string>): Promise<ClaudeLoginIdentity | null> {
+  private async fetchProfile(headers: Record<string, string>, signal: AbortSignal): Promise<ClaudeLoginIdentity | null> {
     try {
-      const res = await (this.opts.fetch ?? fetch)(`https://${this.opts.upstream()}/api/oauth/profile`, {
+      const res = await guardEgressFetch(this.opts.fetch)(`https://${this.opts.upstream()}/api/oauth/profile`, {
         method: "GET",
         // The same headers the usage lookup sends for the current login.
         headers: { ...headers, accept: "application/json" },
-        signal: AbortSignal.timeout(this.opts.timeoutMs ?? 5000),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(this.opts.timeoutMs ?? 5000)]),
       });
+      if (signal.aborted) { await res.body?.cancel().catch(() => {}); return null; }
       // The status alone: a failure body is not worth the risk of echoing.
       if (!res.ok) {
         this.opts.warn?.(`claude identity: HTTP ${res.status}`);
@@ -184,6 +217,8 @@ export class ClaudeCurrentIdentity {
       }
       return claudeIdentityFromBody(await res.json());
     } catch (e) {
+      if (signal.aborted) return null;
+      if (isEgressPolicyError(e)) throw e;
       this.opts.warn?.(`claude identity: ${(e as Error).message}`);
       return null;
     }

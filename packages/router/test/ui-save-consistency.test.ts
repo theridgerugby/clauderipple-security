@@ -1,9 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { assertNativeAdminFetch, nativeDashboardWindow, desktopUiGuardSource } from './ui-native-fixture.ts';
 
-// Execute the dashboard's real rendering, save, retry, toast and keyboard functions. Only browser
-// DOM/timers and fetch are replaced: there is no listener, network request or real configuration.
+// Execute the native dashboard's real rendering, save, retry, toast and keyboard functions.
+// DOM/timers and the native IPC backend are replaced; no real configuration or network is used.
 const source = fs.readFileSync(new URL('../../ui/app.js', import.meta.url), 'utf8');
 function block(from: string, to: string) {
   const start = source.indexOf(from), end = source.indexOf(to, start);
@@ -108,6 +109,7 @@ async function harness(initial = fixture()) {
     beforePut: null as (() => Promise<void>) | null,
   };
   const fetchMock = async (url: string, options?: { method?: string; body?: string }) => {
+    assertNativeAdminFetch(url, options);
     assert.equal(url, '/api/config', 'only the mock config endpoint is allowed');
     const response = (body: unknown, status = 200) => ({ ok: status === 200, status, text: async () => JSON.stringify(body) });
     if (options?.method !== 'PUT') {
@@ -124,8 +126,9 @@ async function harness(initial = fixture()) {
     return response({ ok: true, configRevision: h.latest.configRevision, ...(h.warning ? { warning: h.warning } : {}) });
   };
   const ui = new Function('document', 'window', 'Node', 'fetch', 'setTimeout', 'clearTimeout', `
-    const t = key => key, APP = null;
-    let currentConfig = null, slotsLoaded = false, effortCatalog = null;
+    const t = key => key, APP = window.rippleApp;
+    let currentConfig = {}, slotsLoaded = false, effortCatalog = null;
+    ${desktopUiGuardSource(source)}
     const claudeModels = ['a', 'b', 'c'].map(id => ({id})), CHATGPT_MODELS = [];
     const loadCatalogs = async () => {}, presets = [];
     ${block('function $(', '// Inside the ClaudeRipple app')}
@@ -149,7 +152,7 @@ async function harness(initial = fixture()) {
     { querySelectorAll: queryAll, querySelector: (s: string) => queryAll(s)[0] ?? null,
       createElement: (tag: string) => new DomNode(tag.toUpperCase()), createElementNS: (_ns: string, tag: string) => new DomNode(tag.toUpperCase()),
       createTextNode: (text: string) => { const node = new DomNode('#TEXT'); node.textContent = text; return node; } },
-    { addEventListener: (name: string, fn: (event: KeyEvent) => void) => { assert.equal(name, 'keydown'); keyboard = fn; } },
+    { ...nativeDashboardWindow(fetchMock), addEventListener: (name: string, fn: (event: KeyEvent) => void) => { assert.equal(name, 'keydown'); keyboard = fn; } },
     DomNode, fetchMock,
     (fn: () => void, ms: number) => { const id = ++timerId; timers.set(id, { fn, ms }); return id; },
     (id: number) => { timers.delete(id); },

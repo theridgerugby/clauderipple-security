@@ -19,7 +19,7 @@ import { ConfigStore, homeDir } from "../../router/src/config.ts";
 import { adminPort } from "../../router/src/admin.ts";
 import { ensureInstallationId, readInstallationId } from "../../router/src/installation-id.ts";
 import { sameHome } from "./ownership.ts";
-import { runtime } from "./runtime.ts";
+import { adminRequestSync } from "./admin-client.ts";
 
 /** "absent": nothing answers; "other": something answers but is not provably this instance. */
 export type RouterIdentity = "ours" | "other" | "absent";
@@ -82,11 +82,10 @@ export const listenPids: ListenPids = (port) => {
  * The real probe runs in a child process, so a hung admin API cannot hold the CLI: it prints the
  * parsed status and exits, and anything else (refusal, timeout, non-JSON) reads as no answer.
  */
-export function probeStatus(url: string, timeoutMs: number): Record<string, unknown> | null {
+export function probeStatus(url: string, timeoutMs: number, home: string = homeDir()): Record<string, unknown> | null {
   try {
-    const rt = runtime();
-    const script = `fetch(${JSON.stringify(url)}, {signal: AbortSignal.timeout(${timeoutMs})}).then(async r => { if (!r.ok) process.exit(1); const s = await r.json(); process.stdout.write(JSON.stringify(s)); }).catch(() => process.exit(1));`;
-    const out = execFileSync(rt.node, ["-e", script], { env: { ...process.env, ...rt.env }, stdio: ["ignore", "pipe", "ignore"], windowsHide: true, timeout: timeoutMs + 1_000 }).toString();
+    const out = adminRequestSync(url, home, { timeoutMs });
+    if (out === null) return null;
     const parsed = JSON.parse(out) as unknown;
     return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
   } catch {
@@ -118,7 +117,9 @@ function ownInstallationId(home: string): string | null {
  * on this home's admin port is exactly `expectedPid`. Otherwise `"other"`.
  */
 export function probeRouter(home: string = homeDir(), opts: { probe?: StatusProbe; timeoutMs?: number; expectedPid?: number | null; listenPids?: ListenPids } = {}): RouterProbe {
-  const status = (opts.probe ?? probeStatus)(`${adminUrl(home)}/api/status`, opts.timeoutMs ?? 3_000);
+  const status = opts.probe
+    ? opts.probe(`${adminUrl(home)}/api/status`, opts.timeoutMs ?? 3_000)
+    : probeStatus(`${adminUrl(home)}/api/status`, opts.timeoutMs ?? 3_000, home);
   if (status === null) return { state: "absent", pid: null };
   const pid = Number(status.pid);
   const answeredPid = Number.isSafeInteger(pid) && pid > 0 ? pid : null;

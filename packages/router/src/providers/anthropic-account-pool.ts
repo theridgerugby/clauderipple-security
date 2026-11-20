@@ -9,6 +9,7 @@ import path from "node:path";
 import type { Logger } from "../log.ts";
 import type { Credential } from "../pool.ts";
 import { redactErrorText } from "../redact.ts";
+import { isEgressPolicyError } from "../egress.ts";
 import {
   isCurrentClaudeAccountPaused,
   markClaudeAccountNeedsReauth,
@@ -114,6 +115,12 @@ export class ClaudeAccountAuthPool {
   }
 
   /** Refresh all due stored accounts, with one network request per account in this process. */
+  setCurrentAuthorization(allow: boolean): void {
+    if (allow) this.current.authorize();
+    else this.current.revoke();
+  }
+
+  /** Refresh all due stored accounts, with one network request per account in this process. */
   async refreshIfNeeded(): Promise<void> {
     const due = readClaudeOAuthAccounts(this.home).filter((account) =>
       !account.needsReauth && this.now() >= account.expiresAt - CLAUDE_OAUTH.refreshLeadMs,
@@ -135,6 +142,7 @@ export class ClaudeAccountAuthPool {
         }
       },
       (error: Error) => {
+        if (isEgressPolicyError(error)) throw error;
         // Only a definitive refresh-token rejection asks the user to sign in again. Network and 5xx
         // failures leave the account recoverable; if its access token expires it simply drops out.
         if (error instanceof ClaudeOAuthTokenError && error.needsReauth) {

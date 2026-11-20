@@ -17,6 +17,7 @@ import { GROK_AUTH_HINT, GrokAuth, GrokAuthError, grokHome, sharedGrokAuth } fro
 import { GROK_DEFAULT_URL, GROK_EFFORT_LEVELS } from "./catalog.ts";
 import { GrokUsage, type GrokWindow } from "./usage.ts";
 import type { RequestKind } from "../../routing.ts";
+import { isEgressPolicyError } from "../../egress.ts";
 
 /**
  * Facts only, returned by the probe in a `warning` field like the Antigravity one. Nothing published
@@ -92,7 +93,7 @@ export class GrokAdapter {
       const token = await this.auth.token();
       const { "x-grok-model-override": _model, ...headers } = grokHeaders(token.key, "", await this.auth.clientVersion(this.clientVersion));
       return headers;
-    }).catch(() => []);
+    }).catch((error: unknown) => { if (isEgressPolicyError(error)) throw error; return []; });
   }
 
   async handle(req: http.IncomingMessage, res: http.ServerResponse, path: string, json: AnthropicRequest, model: string, effort: string | undefined, options?: { kind?: RequestKind }): Promise<OpenAiOutcome> {

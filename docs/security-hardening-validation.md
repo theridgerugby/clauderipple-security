@@ -1,0 +1,280 @@
+# Security hardening validation
+
+Original upstream review base: `PBJ-2/clauderipple` v0.12.36,
+`e7420ab5dc14c9569fed3439bc43e68a989c7055`.
+Integrated upstream revision: `7fe108c847428694e6fd05f5991c7a37c3c992fb`.
+Original local validation checkpoint: `f3057ccadf4afcccd53ea37610fc9da559420e1a`.
+Latest recorded hosted checkpoint: `30b6af2604766e44517a3d0c126d836388f38ac5`,
+tree `d91211d43c2316f078ea33e1b89b4cea38623349`.
+Validation date: 2026-11-16 (America/Toronto).
+Environment: Linux cloud workspace, Node 24.22.1, npm 11.9.0.
+
+## Decision and scope
+
+The local port-impersonation fixes and their executable regression tests are
+implemented. Hosted native execution found an additional child-frame authority
+defect; the subsequent IPC fix passed the real macOS and Windows harnesses at the
+recorded checkpoint. Linux native execution and genuine signed release
+acceptance remain unverified. The writable fork is
+`theridgerugby/clauderipple-security`; hosted evidence below is tied to its exact
+checkpoint and does not certify later changes. No signed
+application release or installation on the user's machine was performed. This
+work does not establish a Google security certification.
+
+See [security-acceptance.md](security-acceptance.md) for the release gates and
+[native-release-validation.md](native-release-validation.md) for the exact native
+handoff. A test that runs only through a command mock is not evidence of native
+Windows/macOS execution.
+
+## Hosted validation and resulting fixes
+
+### Complete Windows run and platform-specific follow-up
+
+Run [44028779467](https://github.com/theridgerugby/clauderipple-security/actions/runs/44028779467)
+used `30b6af26`. Its completed results:
+
+| Job | Observed result |
+| --- | --- |
+| Ubuntu full suite | 4,077 tests: 4,046 passed, 31 skipped, zero failures/cancellations; audit, typecheck, mod check and build passed |
+| macOS full suite | 4,077 tests: 4,052 passed, 25 skipped, zero failures/cancellations; audit, typecheck, mod check and build passed |
+| Windows full suite | 4,077 tests: 3,944 passed, 30 failed, 4 cancelled, 99 skipped; audit, typecheck and mod check passed; build was not reached |
+| macOS/Windows Electron harness | Passed, including parent-bridge borrowing and exact-port wrong-certificate takeover |
+| Additional Windows ACL/control gate | 66 tests: 65 passed, one POSIX-only test skipped, zero failures/cancellations; real four-file strict ACL batch used one process and measured 336 ms in this run |
+| Ubuntu Electron harness | Failed before app initialization on the same protected-sandbox-helper prerequisite described below |
+
+The full Windows run exposed a release-source root-path string comparison defect
+(16 failures), a test credential-reader guard that also rejected the legitimate
+private-file ACL helper (12 failures), and forecast/proxy timing fixtures (two
+failures and four cancellations). The real Windows ACL and Remote generation,
+deadline, phone and receipt cases passed. Failures and cancellations are retained;
+the next candidate must pass the affected tests and the full suite.
+
+The follow-up checks compare physical Git-root directory identity without
+case-folding path names, preserve the test prohibition on OS credential readers
+while allowing only the fixed ACL helper in temporary fixtures, and separate
+native fixture preparation from request/profile timing. A dedicated Windows
+quick gate runs these regressions in addition to the unchanged complete matrix.
+No production network deadline, ACL requirement or sandbox prerequisite is relaxed.
+
+The follow-up candidate's local combined run recorded 4,092 tests: 4,060 passed,
+31 explicit platform skips, the same retained cloud loopback failure, and zero
+cancellations. Typecheck, mod check, generated transport/ACL parity, build and a
+fresh npm audit (zero reported vulnerabilities) passed. Release-source tests
+passed 25/25; request-log tests passed 34/34, including seven request-only timeout
+subtests that retain their 5,000 ms bound. The unanswered-profile test retains its
+1,000 ms bound after a real verified TLS warm-up with zero model requests/log rows.
+These local results do not replace the follow-up candidate's hosted Windows run.
+
+An additional read-only agent review of the IPC/TLS boundary reran 57 local tests
+with zero failures or skips and found no new blocking defect in that scope. This
+does not substitute for independent external assessment or signed-artifact testing.
+
+### IPC repair checkpoint
+
+Run [44027136750](https://github.com/theridgerugby/clauderipple-security/actions/runs/44027136750)
+used `9f79dee`. Its recorded results:
+
+| Job | Observed result |
+| --- | --- |
+| Ubuntu full suite | 4,038 tests: 4,008 passed, 30 skipped, zero failures/cancellations; audit, typecheck, mod check and build passed |
+| macOS full suite | 4,038 tests: 4,014 passed, 24 skipped, zero failures/cancellations; audit, typecheck, mod check and build passed |
+| Windows full suite | Still running when this evidence was recorded; no success claimed |
+| macOS Electron harness | Passed on macOS 26 arm64, Electron 45.3.3 and Node 24.22.2 |
+| Windows Electron harness | Passed on Windows Server 2025, Electron 45.3.3 and Node 24.22.2 |
+| Ubuntu Electron harness | Failed before app initialization: root-owned sandbox helper was a regular, non-symlink, single-link file with mode `0777`; it did not meet the protected mode-`04755` prerequisite |
+
+Both successful native harnesses checked renderer sandbox/context isolation,
+Node isolation, typed owner IPC over pinned TLS, static-only custom protocol,
+CSP and permission denials, real child-frame requests, parent-bridge borrowing,
+sticky refusal after child removal/reload, fresh-window recovery, unowned windows,
+and external/browser requests. An exact-port wrong-certificate impostor received
+zero authenticated HTTP requests; the client returned a closed failure. These
+are real Electron processes using fixture windows/preloads and synthetic secrets,
+not signed installer or complete installed-application acceptance tests.
+
+The Linux failure is a protected runner prerequisite. No system permission,
+AppArmor, namespace or sandbox setting was changed. Do not promote the observed
+world-writable helper to setuid; a runner administrator must provide trustworthy
+verified helper bytes and the required protected execution environment.
+
+### Earlier run that exposed the authority defect
+
+Run [44024775833](https://github.com/theridgerugby/clauderipple-security/actions/runs/44024775833)
+used `cf742f3062ffdee8d19c209674eeb3652c83c13e`, tree
+`51c5a38925d573a48c4350f2e35a85cea28c9cef`. Its results:
+
+| Job | Observed result |
+| --- | --- |
+| Ubuntu full suite | 4,022 tests: 3,992 passed, 30 skipped, zero failures/cancellations; audit, typecheck, mod check and build passed |
+| macOS full suite | 4,022 tests: 3,998 passed, 24 skipped, zero failures/cancellations; audit, typecheck, mod check and build passed |
+| Windows full suite | Cancelled by the next candidate; logs contained a Remote shutdown generation fixture failure; no success claimed |
+| macOS/Windows Electron harness | Failed: real child-frame fetch reached the administrative protocol handler and returned 200 |
+| Ubuntu Electron harness | Failed before app initialization: the preinstalled sandbox helper did not meet the protected root-owned mode-4755 prerequisite |
+
+The child-frame fixture used `WebFrameMain.executeJavaScript` and verified that it
+was not executing in the top frame. Instrumented `webRequest` metadata nevertheless
+identified the request as the main frame. This is a genuine authority-boundary
+failure. The revised design removes all administrative protocol handling, uses
+typed IPC with actual sender-frame validation, and refuses privileged IPC after
+any child frame is created, including parent-bridge borrowing. Those changes were
+evaluated by the `9f79dee` macOS/Windows native run above. The Linux preflight reports
+safe ownership/mode metadata for an authorized runner administrator; it does not
+alter system permissions, AppArmor or sandbox flags.
+
+The same checkpoint's local `npm run test:ci` produced 4,022 tests: 3,991 passed,
+30 skipped, one retained Undici loopback failure and no cancellations. That test
+passed on both hosted Ubuntu and macOS above. Earlier Linux worker-lock and
+fixture-cleanup defects were fixed before this hosted checkpoint; an old failing
+run is not evidence against the later patch, and a later green run does not erase
+the earlier findings.
+
+### Async control and release-source changes exercised by the next run
+
+Combined local regression after these changes: 4,077 tests, 4,045 passed,
+31 explicit platform skips, the one retained cloud loopback failure below, and
+zero cancellations. Typecheck, mod check, generated transport/ACL parity and build
+passed. The independent Remote/phone/lifecycle subset passed 58/58. The subsequent
+`30b6af26` hosted results above show which native checks passed and which further
+Windows fixes were required.
+
+- Remote verifies endpoint, TLS identity, capability and host configuration in one
+  fresh four-file asynchronous Windows ACL process per attempt. All descriptors
+  stay open while verifying, and pathname/descriptor metadata is checked before
+  reading and after the complete batch. The fixed helper receives paths only.
+- The 500 ms network poll budget starts after permission validation. A separate
+  monotonic whole-operation deadline covers validation, network calls, retries
+  and the final shutdown receipt. Cancellation closes pipes and descriptors and
+  requests process-tree termination. Windows `taskkill` is asynchronous; rejection
+  alone does not prove that every descendant has already been reaped.
+- Real Windows tests now cover batch acceptance and rejection after an Everyone
+  Read ACE is added, with unchanged exposed SDDL. The lifecycle ACL-refusal and
+  deliberately slow/hung-helper tests use a mocked command boundary with real TLS.
+  Their scope is distinct from the real DACL test.
+- The generation-race fixture prepares the next private endpoint before serving
+  the status request, then atomically renames it in the handler. Permission setup
+  no longer consumes that fixture's network budget. Production limits are retained.
+- Full-suite integration initially caught nine phone-proxy fixture failures: the
+  fixture created `host.json` with public-read permissions. It now uses the same
+  private writer as production and retains its routing/status/default-port assertions.
+  A new missing-configuration test confirms no TLS dispatch, no file recreation,
+  and closed failure when discovery survives a deleted host configuration.
+- Signed-build preparation requires clean tracked, staged and untracked source,
+  including hidden index flags and build-consumed ignored files. It records source
+  commit/tree and lockfile digest, then rechecks before receipt promotion. Production
+  uses committed icon assets. These fields do not establish hermetic building,
+  review approval, CI success or SLSA provenance. No genuine signer was exercised.
+
+## Original local checks
+
+| Check | Result |
+| --- | --- |
+| `npm run typecheck` | Passed, including Remote web and relay configurations |
+| `npm run check:mod` | Passed: 46 source files parse and 327 relative imports resolve |
+| `npm run build` | Passed, including Electron TypeScript and npm distribution generation |
+| `GITHUB_EVENT_NAME=pull_request npm test` | 4,007 tests: 3,976 passed, 30 skipped, 1 failed; exit code 1 |
+| `npm audit --audit-level=low` | 0 reported vulnerabilities in the full dependency graph at this scan |
+| `npm ls --all` | Passed; no invalid dependency tree reported |
+| `node scripts/release-artifact.mjs <empty-directory>` | Passed; packed once with lifecycle scripts disabled, inspected actual archive paths/runtime files/manifest and exact bundled installer bytes |
+| `git diff --check` | Passed |
+| `npm run test:native --workspace @clauderipple/app` | Attempted; Electron exited before app initialization because this cloud has no working X display/D-Bus access |
+
+The retained full-suite failure and platform skips are not counted as passes.
+The dependency scan is a point-in-time known-vulnerability check, not proof that
+every dependency is free of vulnerabilities. No audit threshold was lowered.
+
+The inspected archive from the original local checkpoint has SHA-256
+`8fac46e9a64627474bed74ee1bb563963b6e32f95f962088e1210e3274cdbd42`.
+It was not published and is not a signed/native application distribution.
+
+## Security regression evidence
+
+- Real loopback TLS servers test a wrong CA, a replacement leaf issued by the
+  same CA, wrong IP SAN, expired certificate, plaintext port impostor and redirect.
+  The native clients reject these before disclosing the admin capability or body.
+- Client cancellation, abort before/after body chunks, connect/idle deadlines,
+  request limits and declared/chunked response limits have executable regressions.
+  Cancelled or refused responses close their sockets.
+- Router and Remote use separate private TLS identities, capabilities and instance
+  generations. Tests reject stale generation state and prevent an old shutdown
+  operation from being redirected to a replacement host.
+- Stalled TLS handshakes and rejected requests with unfinished bodies cannot keep
+  Remote shutdown open indefinitely. An independent real-socket repeat observed
+  refusal closure within 100 ms and the bounded shutdown at approximately 251 ms.
+- Legacy public Remote WebSockets receive 410. Browser tests reject direct/HTTP
+  pairings without creating a socket. Existing messaging/clipboard/diff tests
+  retain their business assertions while using the production E2EE handshake.
+- Legacy phone-token migration is atomic and one-time. A real encrypted relay
+  fixture rejects the old token and accepts the replacement. Tests cover stale
+  token writes, explicit rotation compare-and-swap, exposed migrated state,
+  failed persistence and failed listener binding without credential mutation.
+- The retired `--new-token` flag is rejected before state or service mutations.
+  Subprocess tests cover both fresh and existing state and alternate CLI entries.
+- Linux tests exercise owner/mode/link/inode/size checks and atomic writes. Windows
+  command-boundary tests verify safe fixed PowerShell invocation and refusal before
+  writing any secret into an unprotected temporary file, including new admin
+  capabilities. Additional regressions reject pathname/descriptor swaps during
+  ACL operations, hard-link insertion, wrong owners and replacement during
+  publication retries. Real Windows DACL assertions remain platform-specific tests.
+- Renderer fixtures follow the typed native preload/IPC contract. They
+  assert no browser admin fetch, no renderer bearer, bounded text bodies and
+  allowlisted representation headers while
+  preserving existing save/revision/concurrency assertions.
+- Release tests reject absent/wrong signers, mixed notarization modes, unsigned
+  output, altered fuse policy, unexpected artifacts and credential-bearing package
+  paths. Positive signature checks in these unit tests use synthetic fixtures.
+  They do not establish that a real signed/notarized artifact exists.
+- Twelve resource-closure tests use the pinned builder's real file copier/config
+  validation, inspect the copied dependency and source tree, and launch its CLI
+  and Remote help through Node from an isolated directory with an empty home.
+  They also cover missing target binaries, injected state, ABI addons, legitimate
+  dependency assets, staging reservations and safe cleanup. This did not build
+  or execute a native Electron package or exercise a signing service.
+- The fork integration retains all 13 additional upstream commits and their
+  catalogue, mapping-effort and request-purpose UI behavior. The merged provider
+  probe keeps saved-secret lookup and the configured provider's catalogue selection.
+- Eight new cache regressions cover bounded regular-file reads, deeply nested JSON,
+  byte/value/provider limits, normalized carried-through records, long explicitly
+  configured host pins, serialization failure containment, future-format retention
+  and link rejection. The focused Google suites passed 73/73. A malformed local
+  cache no longer rejects `fetchModels()` with an uncaught serialization error;
+  unreadable/oversized files are left untouched.
+- A PR-environment regression checks that production signing refusal precedes
+  credential validation on both supported native hosts. The separate missing-key
+  subprocess fixture clears the inherited event only within that fixture; the
+  production PR-signing prohibition is unchanged.
+
+## Retained loopback failure
+
+`packages/remote/test/local-control.test.ts`:
+`a specific interface bind adds only local control on IPv4 loopback` fails with
+Node's built-in Undici `UND_ERR_SOCKET`.
+
+A separate process importing only `node:http`, with no repository modules or
+patched npm dependencies, reproduced the request-path issue: its IPv4 loopback
+server returned 200, while its IPv6 loopback server bound successfully but received
+zero requests before ordinary `fetch` timed out. No proxy setting, sandbox or
+network restriction was bypassed. This supports an environment-path explanation;
+the original test remains mandatory. It subsequently passed in the recorded
+hosted Ubuntu and macOS full suites.
+
+## External acceptance still required
+
+- A protected Linux native sandbox environment, plus complete installed-app and
+  installer tests on supported platforms. The macOS/Windows boundary harness above
+  does not establish certificate trust/install/removal or exact-artifact update/rollback.
+- Positive Developer ID signing/notarization or Windows Authenticode signing with
+  the authorized publisher identity, plus independent verification of the actual
+  distributed artifact. No real signing credential was available here.
+- `claude plugin test packages/mod`, which requires the proprietary engine. Parser
+  and native-helper tests do not substitute for that integration test.
+- Explicitly authorized disposable provider accounts for subscription/API end-to-end
+  checks. No live provider request, user token rotation, trust-store modification,
+  actual update installation or release publication was performed.
+- A successful complete hosted CI matrix for the final reviewed revision,
+  recording the source, operating system, architecture and each job result.
+  The real-process Electron harness uses
+  fixture windows/preloads and synthetic credentials; passing it alone does not
+  establish production-application installation or signed-artifact acceptance.
+
+Keep production rollout blocked until these gates have recorded successful
+evidence against the exact reviewed source and release artifacts.

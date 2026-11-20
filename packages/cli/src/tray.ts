@@ -16,7 +16,7 @@ import { bundleIdOf, findIcon } from "./launcher.ts";
 import { runtime } from "./runtime.ts";
 
 /** Electron version to fetch on request. Kept in step with the one the app is developed against. */
-const ELECTRON_RANGE = "^38.1.0";
+export const ELECTRON_VERSION = "45.3.3";
 
 /**
  * Where Electron is fetched to: ClaudeRipple's home, not the package. Until 0.6 it went into the
@@ -39,9 +39,9 @@ function resolveElectron(from: string): string | null {
 }
 
 /** The Electron executable to run the tray with, or null when none has been fetched. */
-export function electronPath(): string | null {
+export function electronPath(home: string = homeDir()): string | null {
   // A checkout or an install from before 0.6 resolves it next to us.
-  return resolveElectron(path.join(trayRuntimeDir(), "package.json")) ?? resolveElectron(import.meta.url);
+  return resolveElectron(path.join(home, "tray-runtime", "package.json")) ?? resolveElectron(import.meta.url);
 }
 
 /** Our own name, identifier and icon for the tray's bundle. */
@@ -187,15 +187,6 @@ export function ensureTrayBundle(
   return (opts.build ?? buildTrayBundle)({ electron, app, icon });
 }
 
-/** A line in the tray's log; failing to write it never keeps the tray from starting. */
-function logTrayLine(line: string): void {
-  const log = trayLogPath();
-  try {
-    fs.mkdirSync(path.dirname(log), { recursive: true });
-    fs.appendFileSync(log, `${line}\n`);
-  } catch { /* the tray can start without a log */ }
-}
-
 export type TrayStart = { ok: boolean; message: string };
 
 /**
@@ -207,7 +198,10 @@ export type TrayStart = { ok: boolean; message: string };
  */
 export function trayEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const out = { ...env };
-  for (const name of Object.keys(out)) if (name.toUpperCase() === "ELECTRON_RUN_AS_NODE") delete out[name];
+  // Neither inherited Electron logging nor Chromium's SSL-key log belongs in a personal
+  // dashboard. Clearing the child's copy leaves the caller's environment unchanged.
+  const removed = new Set(["ELECTRON_RUN_AS_NODE", "ELECTRON_ENABLE_LOGGING", "ELECTRON_LOG_FILE", "SSLKEYLOGFILE"]);
+  for (const name of Object.keys(out)) if (removed.has(name.toUpperCase())) delete out[name];
   return out;
 }
 
@@ -217,10 +211,11 @@ export function trayEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv
  * form instead.
  */
 export async function startTray(options: { detached?: boolean; atLogin?: boolean } = {}): Promise<TrayStart> {
+  // Compatibility callers can still request the old login launch. This personal setup window
+  // is strictly on demand; do not even locate or spawn Electron for a background login request.
+  if (options.atLogin) return { ok: true, message: "✓ personal setup opens on demand; no login window started" };
   const current = runtime();
-  // Started by hand (the app icon, `clauderipple tray`), the window opens; started by the logon
-  // supervisor in the foreground, or by the macOS tray agent at login, it stays in the tray.
-  const env = { ...trayEnv(), ...((options.detached ?? true) && !options.atLogin ? { CLAUDERIPPLE_APP_SHOW: "1" } : {}) };
+  const env = { ...trayEnv(), CLAUDERIPPLE_APP_SHOW: "1" };
   if (current.packaged) {
     // The packaged app IS the tray: relaunching its own binary with no script is what opens it.
     // Our own CLI runs under ELECTRON_RUN_AS_NODE here, and inheriting it would relaunch Node.
@@ -243,22 +238,17 @@ export async function startTray(options: { detached?: boolean; atLogin?: boolean
   // tray has started (see the bundle block above). Everywhere else, and for a checkout's Electron,
   // this is null and the fetched binary runs as it always has.
   const bundle = ensureTrayBundle(electron);
-  if (bundle && !bundle.ok) logTrayLine(`the tray starts as plain Electron: ${bundle.message}`);
   const executable = bundle?.ok ? bundle.executable : electron;
-  // Electron's own output goes to a file. With it discarded, a tray that died at launch still
-  // printed "✓ tray started" and left nothing to go on (issue #50).
-  const log = trayLogPath();
-  fs.mkdirSync(path.dirname(log), { recursive: true });
-  const out = fs.openSync(log, "a");
+  // Native/renderer errors may reflect private content. Do not persist raw Electron output or
+  // read historical logs back into a launch failure. Exit status remains an explicit signal.
   const child = spawn(executable, [main], {
     detached: options.detached ?? true,
-    stdio: ["ignore", out, out],
+    stdio: "ignore",
     // Electron would otherwise re-enter as a plain Node process, since that is how the CLI runs.
     env,
   });
-  fs.closeSync(out);
   if (options.detached ?? true) child.unref();
-  return earlyExit(child, log);
+  return earlyExit(child, null);
 }
 
 export function trayLogPath(): string {
@@ -266,15 +256,19 @@ export function trayLogPath(): string {
 }
 
 /** A tray that is still running after a moment has started; one that exits before then has not. */
-export function earlyExit(child: ChildProcess, log: string, waitMs = 2_000): Promise<TrayStart> {
+export function earlyExit(child: ChildProcess, log: string | null, waitMs = 2_000): Promise<TrayStart> {
   return new Promise((resolve) => {
     // Not unref'd: the command has to stay up long enough to see the exit it is waiting for.
     const timer = setTimeout(() => resolve({ ok: true, message: "✓ tray started" }), waitMs);
     const failed = (detail: string) => {
       clearTimeout(timer);
       let tail = "";
-      try { tail = fs.readFileSync(log, "utf8").trim().split(/\r?\n/).slice(-8).join("\n"); } catch { /* nothing logged */ }
-      resolve({ ok: false, message: `the tray exited at once (${detail}). Its output is in ${log}${tail ? `:\n${tail}` : ""}` });
+      if (log !== null) {
+        try { tail = fs.readFileSync(log, "utf8").trim().split(/\r?\n/).slice(-8).join("\n"); } catch { /* nothing logged */ }
+      }
+      resolve({ ok: false, message: log === null
+        ? `the setup window exited at once (${detail}). Raw output was not saved. Run doctor --json from the reviewed checkout for recovery status.`
+        : `the tray exited at once (${detail}). Its output is in ${log}${tail ? `:\n${tail}` : ""}` });
     };
     child.once("error", (error) => failed(error.message));
     child.once("exit", (code, signal) => {
@@ -329,7 +323,7 @@ export function trayRuntimeRange(dir = trayRuntimeDir()): string | null {
  * never updated by `npm install` of ClaudeRipple itself: the runtime lives in the home folder, not
  * in the package (B15). A copy without the record cannot be proved current, so it is replaced.
  */
-export function trayRuntimeMatches(range = ELECTRON_RANGE, dir = trayRuntimeDir()): boolean {
+export function trayRuntimeMatches(range = ELECTRON_VERSION, dir = trayRuntimeDir()): boolean {
   return trayRuntimeRange(dir) === range;
 }
 
@@ -385,13 +379,25 @@ export type TrayInstallDeps = {
   platform?: NodeJS.Platform;
 };
 
+type ElectronInstaller = (program: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; stdio: "inherit" }) => { status: number | null };
+
+/** Fetch a version pin without dependency lifecycle hooks, then run only Electron's downloader. */
+export function installElectronPackage(staging: string, npm: string, run: ElectronInstaller = spawnSync): number | null {
+  const options = { cwd: staging, env: npmEnv(), stdio: "inherit" as const };
+  const installed = run(process.execPath, [npm, "install", "--prefix", staging, "--no-package-lock", "--save-exact", "--registry", "https://registry.npmjs.org", "--ignore-scripts", "--loglevel", "error", `electron@${ELECTRON_VERSION}`], options);
+  if (installed.status !== 0) return installed.status;
+  // install.js is the explicitly reviewed entry point from this exact Electron package. npm's
+  // other hooks, including transitive postinstall scripts, are never enabled for this fetch.
+  return run(process.execPath, [path.join(staging, "node_modules", "electron", "install.js")], options).status;
+}
+
 /** Fetches Electron into this installation so the tray can run. Prints npm's own progress. */
 export function installTrayRuntime(options: { refresh?: boolean } & TrayInstallDeps = {}): TrayStart {
   const target = options.target ?? trayRuntimeDir();
   // A refresh replaces a runtime an older ClaudeRipple fetched; without one, an existing copy is
   // what the tray runs and is left alone.
   const existing = options.existing === undefined ? electronPath() : options.existing;
-  if (existing && (!options.refresh || trayRuntimeMatches(ELECTRON_RANGE, target))) return { ok: true, message: "✓ Electron is already installed" };
+  if (existing && (!options.refresh || trayRuntimeMatches(ELECTRON_VERSION, target))) return { ok: true, message: "✓ Electron is already installed" };
   const cli = npmCli();
   if (!cli && !options.install) return { ok: false, message: `found no npm next to ${process.execPath}; install Electron yourself: npm install electron` };
   // Into a copy of its own first: npm failing (offline, a locked file) must leave the tray runnable.
@@ -401,11 +407,7 @@ export function installTrayRuntime(options: { refresh?: boolean } & TrayInstallD
   fs.mkdirSync(staging, { recursive: true });
   const status = options.install
     ? options.install(staging)
-    : spawnSync(process.execPath, [cli!, "install", "--prefix", staging, "--no-package-lock", "--loglevel", "error", `electron@${ELECTRON_RANGE}`], {
-      cwd: staging,
-      env: npmEnv(),
-      stdio: "inherit",
-    }).status;
+    : installElectronPackage(staging, cli!);
   if (status !== 0) {
     try { fs.rmSync(staging, { recursive: true, force: true }); } catch { /* left for the next run */ }
     return { ok: false, message: `npm could not install Electron into ${staging}` };

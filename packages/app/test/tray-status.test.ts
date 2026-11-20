@@ -7,6 +7,8 @@ import ts from "typescript";
 import * as failureModel from "../src/failure-model.ts";
 import * as statusModel from "../src/status-model.ts";
 import * as updateModel from "../src/update-model.ts";
+import * as security from "../src/security.ts";
+import * as adminWindow from "../src/admin-window.ts";
 
 // Evaluate the real main module with startup held at Electron's readiness boundary. No CLI,
 // filesystem, network, native window, login item or updater can run in this harness.
@@ -41,7 +43,7 @@ function harness() {
   };
   const modules: Record<string, object> = {
     electron: {
-      app: { requestSingleInstanceLock: () => true, on() {}, whenReady: () => ({ then() {} }), isPackaged: true, getLoginItemSettings: () => ({ openAtLogin: false }), getPreferredSystemLanguages: () => ["ko"], getSystemLocale: () => "ko", getLocale: () => "ko" },
+      app: { enableSandbox() {}, getPath: () => "/tmp/unused-app-data", setPath() {}, requestSingleInstanceLock: () => true, on() {}, whenReady: () => ({ then() {} }), isPackaged: true, getLoginItemSettings: () => ({ openAtLogin: false }), getPreferredSystemLanguages: () => ["ko"], getSystemLocale: () => "ko", getLocale: () => "ko" },
       Menu: { buildFromTemplate: (items: object[]) => items },
       nativeImage: { createFromPath: (file: string) => ({ file, setTemplateImage() {} }) },
       // Copied out of the module's realm, whose arrays deepEqual would not take for this realm's.
@@ -50,6 +52,11 @@ function harness() {
     },
     "node:child_process": { execFile: forbidden }, "node:fs": new Proxy({}, { get: () => forbidden }),
     "node:os": { homedir: forbidden }, "node:path": path,
+    "./admin-auth": { fetchAdmin: forbidden },
+    "./bounded-exec": { execBounded: forbidden },
+    "./admin-ipc": { createAdminRequestHandler: forbidden, ADMIN_IPC_CHANNEL: "ripple-app:admin-request" },
+    "./admin-window": { ...adminWindow, prepareAdminUserDataPath: (directory: string) => directory },
+    "./security": security,
     "./claude-desktop": { claudeStartedAt: forbidden, reopenClaude: forbidden },
     "./update-model": updateModel, "./status-model": statusModel, "./failure-model": failureModel,
     "./protocol": { registerScheme() {}, ORIGIN: "ripple://app" },

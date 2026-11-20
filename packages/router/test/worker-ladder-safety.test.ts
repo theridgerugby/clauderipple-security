@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { readPrivateFile } from "../src/private-file.ts";
 import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
@@ -116,7 +117,7 @@ for (const store of ['missing', 'corrupt', 'removed-rung', 'disabled', 'unticked
       if (store === 'missing') fs.unlinkSync(file);
       else if (store === 'corrupt') fs.writeFileSync(file, '{');
       else {
-        const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+        const saved = JSON.parse(readPrivateFile(file).toString('utf8'));
         if (store === 'removed-rung') saved.settings.rules.general.rungs.standard = [];
         if (store === 'disabled') saved.settings.providers.q = false;
         if (store === 'unticked') { saved.settings.allow = ['primary']; saved.settings.allowKnown = ['primary', 'approved']; }

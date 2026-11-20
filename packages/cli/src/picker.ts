@@ -15,6 +15,7 @@ import crypto, { X509Certificate } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { execBounded } from "./bounded-exec.ts";
 import { windowsPowerShellEnv } from "./windows-powershell.ts";
 import { homeDir } from "../../router/src/config.ts";
@@ -154,14 +155,15 @@ function powershell(script: string, opts: { stdio?: "ignore" | "inherit" | "pipe
  * Measured on Windows 11 (2026-09-14) as a standard user: the import succeeded with no UAC prompt,
  * only that dialog. Removal shows a second confirmation, so `picker off` prompts the user too.
  */
-export function caTrusted(caPem: string, opts: { platform?: NodeJS.Platform; run?: (command: string, args: string[]) => string } = {}): boolean {
+export function caTrusted(caPem: string, opts: { platform?: NodeJS.Platform; run?: (command: string, args: string[]) => string; strict?: boolean } = {}): boolean {
   const platform = opts.platform ?? process.platform;
   if (platform === "linux") return nssTrusted(caPem);
-  const run = opts.run ?? ((command, args) => execFileSync(command, args, { env: windowsPowerShellEnv(), stdio: ["ignore", "pipe", "ignore"], windowsHide: true }).toString());
+  const run = opts.run ?? ((command, args) => execFileSync(command, args, { env: windowsPowerShellEnv(), stdio: ["ignore", "pipe", "ignore"], windowsHide: true, timeout: 20_000 }).toString());
   try {
     const fingerprint = new X509Certificate(fs.readFileSync(caPem)).fingerprint.replace(/:/g, "");
     if (platform === "win32") {
-      const out = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `@(Get-ChildItem Cert:\\CurrentUser\\Root | Where-Object { $_.Thumbprint -eq '${fingerprint}' }).Count`]);
+      const out = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `${opts.strict ? "$ErrorActionPreference = 'Stop'; " : ""}@(Get-ChildItem Cert:\\CurrentUser\\Root | Where-Object { $_.Thumbprint -eq '${fingerprint}' }).Count`]);
+      if (opts.strict && !/^\d+$/.test(out.trim())) throw new Error("Unrecognized certificate-store result");
       return Number(out.trim()) > 0;
     }
     // User trust settings are keyed by the certificate's SHA-1, not its non-unique subject.
@@ -178,6 +180,7 @@ export function caTrusted(caPem: string, opts: { platform?: NodeJS.Platform; run
     run("security", ["verify-cert", "-c", caPem, "-p", "basic", "-k", loginKeychain()]);
     return true;
   } catch {
+    if (opts.strict) throw new Error("The current-user CA trust state could not be read; no trust change is safe");
     return false;
   }
 }
@@ -349,7 +352,7 @@ export function untrustCa(caPem: string, opts: { sweep?: boolean; platform?: Nod
   }
 }
 
-type Meta = { appliedId?: string; clauderipple?: { ourId?: string; previousAppliedId?: string | null; installationHome?: string } } & Record<string, unknown>;
+type Meta = { appliedId?: string; clauderipple?: { ourId?: string; previousAppliedId?: string | null; installationHome?: string; preservesNativeSettings?: boolean } } & Record<string, unknown>;
 
 function readMeta(): Meta {
   let text: string;
@@ -366,12 +369,49 @@ function readMeta(): Meta {
 
 const ENTRY_MARK = "clauderipple";
 
+function entryPath(id: string): string {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(id)) throw new Error("Desktop configuration entry id is invalid; left untouched");
+  return path.join(configLibraryDir(), `${id}.json`);
+}
+
+function readEntry(id: string): Record<string, unknown> {
+  const file = entryPath(id);
+  const stat = fs.lstatSync(file);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 1024 * 1024) {
+    throw new Error("Desktop configuration entry is aliased or oversized; left untouched");
+  }
+  const entry: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error("Desktop configuration entry is invalid; left untouched");
+  return entry as Record<string, unknown>;
+}
+
+/** Includes unrelated settings: an in-flight activation must never erase a concurrent edit. */
+export function appProxyFingerprint(): string {
+  const meta = readMeta();
+  const entry = typeof meta.appliedId === "string" ? readEntry(meta.appliedId) : null;
+  return crypto.createHash("sha256").update(JSON.stringify({ meta, entry })).digest("hex");
+}
+
+/** No writes or trust prompts. Existing corporate/PAC configuration needs separate review. */
+export function checkAppProxyActivation(proxyUrl: string, installationHome = homeDir()): void {
+  const current = currentAppProxy();
+  const entry = current.appliedId ? readEntry(current.appliedId) : {};
+  if (entry.egressProxyPacUrl !== undefined) throw new Error("Claude Desktop already has a PAC configuration; it was left unchanged");
+  if (current.ours) {
+    if (appProxyOwner(current, installationHome) !== "ours" || current.egressProxyUrl !== proxyUrl) {
+      throw new Error("Claude Desktop proxy ownership or port does not match this installation; it was left unchanged");
+    }
+  } else if (entry.egressProxyUrl !== undefined) {
+    throw new Error("Claude Desktop already has a separate proxy configuration; it was left unchanged");
+  }
+}
+
 export function currentAppProxy(): { appliedId: string | null; egressProxyUrl: string | null; ours: boolean; installationHome?: string | undefined; previousAppliedId?: string | null | undefined } {
   const meta = readMeta();
   const id = typeof meta.appliedId === "string" ? meta.appliedId : null;
   if (!id) return { appliedId: null, egressProxyUrl: null, ours: false };
   try {
-    const entry = JSON.parse(fs.readFileSync(path.join(configLibraryDir(), `${id}.json`), "utf8")) as Record<string, unknown>;
+    const entry = readEntry(id);
     return { appliedId: id, egressProxyUrl: typeof entry.egressProxyUrl === "string" ? entry.egressProxyUrl : null, ours: meta[ENTRY_MARK]?.ourId === id, installationHome: meta.clauderipple?.installationHome, previousAppliedId: meta.clauderipple?.previousAppliedId };
   } catch (error) {
     throw new Error(`Desktop proxy entry ${id} could not be read; left untouched`, { cause: error });
@@ -411,8 +451,11 @@ function migrateLegacyAppProxyLocked(proxyUrl: string, installationHome: string,
 }
 
 /** Writes our Config Library entry and applies it. Remembers what was applied before so `off` can restore it. */
-export function applyAppProxy(proxyUrl: string, installationHome = homeDir(), expected?: ReturnType<typeof currentAppProxy>, deps: DesktopServiceDeps = {}): { id: string; replaced: string | null } {
-  return withFileLock(path.join(configLibraryDir(), "_meta.json"), () => applyAppProxyLocked(proxyUrl, installationHome, expected, deps));
+export function applyAppProxy(proxyUrl: string, installationHome = homeDir(), expected?: ReturnType<typeof currentAppProxy>, deps: DesktopServiceDeps = {}, expectedFingerprint?: string): { id: string; replaced: string | null } {
+  return withFileLock(path.join(configLibraryDir(), "_meta.json"), () => {
+    if (expectedFingerprint !== undefined && appProxyFingerprint() !== expectedFingerprint) throw new Error("Desktop configuration changed during activation; left untouched");
+    return applyAppProxyLocked(proxyUrl, installationHome, expected, deps);
+  });
 }
 
 function applyAppProxyLocked(proxyUrl: string, installationHome: string, expected: ReturnType<typeof currentAppProxy> | undefined, deps: DesktopServiceDeps): { id: string; replaced: string | null } {
@@ -420,13 +463,16 @@ function applyAppProxyLocked(proxyUrl: string, installationHome: string, expecte
   fs.mkdirSync(dir, { recursive: true });
   const meta = readMeta();
   const cur = currentAppProxy();
+  const previousEntry = cur.appliedId ? readEntry(cur.appliedId) : {};
+  if (previousEntry.egressProxyPacUrl !== undefined) throw new Error("Claude Desktop already has a PAC configuration; it was left unchanged");
+  if (!cur.ours && previousEntry.egressProxyUrl !== undefined) throw new Error("Claude Desktop already has a separate proxy configuration; it was left unchanged");
   if (expected && JSON.stringify(cur) !== JSON.stringify(expected)) throw new Error("Desktop proxy changed before restoration; left untouched");
   if (cur.ours && cur.appliedId) {
     let owner = appProxyOwner(cur, installationHome, proxyUrl);
     if (owner === "unknown" && migrateLegacyAppProxyLocked(proxyUrl, installationHome, deps)) owner = "ours";
     if (owner === "other") throw new Error("Desktop proxy ownership is unknown or belongs to another installation; left untouched");
     if (owner === "unknown") throw new Error("Desktop proxy ownership is unknown; left untouched");
-    writeJsonAtomic(path.join(dir, `${cur.appliedId}.json`), { egressProxyUrl: proxyUrl });
+    writeJsonAtomic(entryPath(cur.appliedId), { ...previousEntry, egressProxyUrl: proxyUrl });
     // Take over an entry an older version applied without recording a home: from here on its
     // ownership is evidenced like any other (D3).
     if (cur.installationHome === undefined || !sameHome(cur.installationHome, installationHome)) {
@@ -437,10 +483,25 @@ function applyAppProxyLocked(proxyUrl: string, installationHome: string, expecte
   }
   const id = crypto.randomUUID();
   // Only recognized keys in the entry: the app warns about and ignores unknown ones. Ownership lives in _meta.
-  writeJsonAtomic(path.join(dir, `${id}.json`), { egressProxyUrl: proxyUrl });
+  const nextEntry = { ...previousEntry, egressProxyUrl: proxyUrl };
   const previous = typeof meta.appliedId === "string" ? meta.appliedId : null;
-  const next: Meta = { ...meta, appliedId: id, clauderipple: { ourId: id, previousAppliedId: previous, installationHome: normalizeHome(installationHome) } };
-  writeJsonAtomic(path.join(dir, "_meta.json"), next);
+  const next: Meta = { ...meta, appliedId: id, clauderipple: { ourId: id, previousAppliedId: previous, installationHome: normalizeHome(installationHome), preservesNativeSettings: true } };
+  try {
+    writeJsonAtomic(entryPath(id), nextEntry);
+    writeJsonAtomic(path.join(dir, "_meta.json"), next);
+  } catch (error) {
+    // A failed atomic write may have published before its final durability check. Restore only
+    // the exact state this operation wrote, never a later Desktop/user edit.
+    try {
+      const current = readMeta();
+      if (JSON.stringify(current) === JSON.stringify(next)) writeJsonAtomic(path.join(dir, "_meta.json"), meta);
+      if (JSON.stringify(readMeta()) === JSON.stringify(meta) && fs.existsSync(entryPath(id)) &&
+          JSON.stringify(readEntry(id)) === JSON.stringify(nextEntry)) fs.rmSync(entryPath(id));
+    } catch {
+      throw new Error("Desktop proxy activation failed and restoration needs review; use the owned direct-connection recovery after checking Desktop configuration", { cause: error });
+    }
+    throw error;
+  }
   return { id, replaced: previous };
 }
 
@@ -451,16 +512,74 @@ export function removeAppProxy(proxyUrl?: string, installationHome = homeDir()):
 
 function removeAppProxyLocked(proxyUrl: string | undefined, installationHome: string): boolean {
   const dir = configLibraryDir();
+  const metaFile = path.join(dir, "_meta.json");
   const meta = readMeta();
   const cur = currentAppProxy();
   if (!cur.appliedId || appProxyOwner(cur, installationHome, proxyUrl) !== "ours") return false;
   if (proxyUrl !== undefined && cur.egressProxyUrl !== proxyUrl) return false;
+  const ownedFile = entryPath(cur.appliedId);
+  const active = readEntry(cur.appliedId);
+  if (active.egressProxyPacUrl !== undefined) throw new Error("Claude Desktop's active configuration now contains a PAC proxy; it was left unchanged");
+  const clean = { ...active };
+  delete clean.egressProxyUrl;
   const previous = meta.clauderipple?.previousAppliedId ?? null;
+  let previousEntry: Record<string, unknown> = {};
+  if (previous !== null) {
+    if (typeof previous !== "string" || previous === cur.appliedId) throw new Error("The previous Desktop configuration entry is invalid; left untouched");
+    // Never publish a missing, unsafe or self-referential restoration target.
+    previousEntry = readEntry(previous);
+  }
+  // Old releases wrote a proxy-only entry and kept native settings solely in `previous`.
+  // Modern entries explicitly copy the active native settings, so even deleting every native
+  // field while enabled is a user edit to preserve. No merge into an inactive entry is guessed.
+  const carriesNative = meta.clauderipple?.preservesNativeSettings === true || Object.keys(clean).length > 0;
+  const preservedId = carriesNative && !isDeepStrictEqual(clean, previousEntry) ? crypto.randomUUID() : null;
+  const preservedFile = preservedId ? entryPath(preservedId) : null;
+  if (preservedFile && fs.existsSync(preservedFile)) throw new Error("The preservation entry already exists; Desktop configuration was left untouched");
+  const preservedRaw = JSON.stringify(clean, null, 2) + "\n";
+  const metaRaw = fs.readFileSync(metaFile, "utf8");
+  const activeRaw = fs.readFileSync(ownedFile, "utf8");
+  const previousFile = previous ? entryPath(previous) : null;
+  const previousRaw = previousFile ? fs.readFileSync(previousFile, "utf8") : null;
+  const conflict = (): Error => new Error("Desktop configuration changed during proxy removal; native settings were preserved and restoration needs review");
+  if (!isDeepStrictEqual(JSON.parse(metaRaw), meta) || !isDeepStrictEqual(JSON.parse(activeRaw), active)
+    || previousRaw !== null && !isDeepStrictEqual(JSON.parse(previousRaw), previousEntry)) throw conflict();
+  const entriesUnchanged = (): boolean => fs.readFileSync(ownedFile, "utf8") === activeRaw
+    && (!previousFile || fs.readFileSync(previousFile, "utf8") === previousRaw);
   const next: Meta = { ...meta };
   delete next.clauderipple;
-  if (previous) next.appliedId = previous;
+  if (preservedId) next.appliedId = preservedId;
+  else if (previous) next.appliedId = previous;
   else delete next.appliedId;
-  writeJsonAtomic(path.join(dir, "_meta.json"), next);
-  fs.rmSync(path.join(dir, `${cur.appliedId}.json`), { force: true });
+  try {
+    // Publish an unowned/native copy before selecting it. The previous native document remains
+    // byte-for-byte intact, including any edits made to that inactive entry while picker was on.
+    if (preservedFile) writeJsonAtomic(preservedFile, clean);
+    if (fs.readFileSync(metaFile, "utf8") !== metaRaw || !entriesUnchanged()
+      || preservedFile && fs.readFileSync(preservedFile, "utf8") !== preservedRaw) throw conflict();
+    writeJsonAtomic(metaFile, next);
+    if (!isDeepStrictEqual(readMeta(), next) || !entriesUnchanged()
+      || preservedFile && fs.readFileSync(preservedFile, "utf8") !== preservedRaw) throw conflict();
+  } catch (error) {
+    try {
+      // A failed publication can already have renamed the metadata. Undo only our exact write;
+      // never overwrite concurrent metadata edits or delete an externally edited native copy.
+      if (isDeepStrictEqual(readMeta(), next)) {
+        readEntry(cur.appliedId);
+        writeJsonAtomic(metaFile, meta);
+      }
+      if (!isDeepStrictEqual(readMeta(), meta)) throw conflict();
+      if (preservedFile && fs.existsSync(preservedFile)) {
+        if (fs.readFileSync(preservedFile, "utf8") !== preservedRaw) throw conflict();
+        fs.rmSync(preservedFile);
+      }
+    } catch {
+      throw new Error("Desktop proxy removal could not be fully rolled back; native settings were preserved. Review Desktop configuration before continuing", { cause: error });
+    }
+    throw error;
+  }
+  // The active document is now a native one. An inactive owned copy is removable only while its
+  // exact bytes still match our snapshot. Failed cleanup must not undo a successful disconnect.
+  try { if (fs.readFileSync(ownedFile, "utf8") === activeRaw) fs.rmSync(ownedFile); } catch { /* leave the inactive copy recoverable */ }
   return true;
 }

@@ -6,15 +6,17 @@
 // traffic goes through ClaudeRipple, we add our entries to the Code surface here.
 //
 // We do not know every field of a model entry, so we clone an existing enabled Claude
-// entry as a template and override the identifying fields. Surfaces are matched by id
-// heuristically (anything that is not the claude.ai chat surface); the ids we saw are
-// logged once so the heuristic can be tightened.
+// entry as a template and override the identifying fields. Only explicitly recognised
+// surfaces are edited. Personal Desktop use is restricted further to Code surfaces;
+// Chat, Cowork and any new/unknown surface retain the server's own model list.
 
-import type { CliModel, Config } from "./config.ts";
+import { providerFor, type CliModel, type Config } from "./config.ts";
 import { resolve } from "./routing.ts";
 import { clampEffort } from "./compat.ts";
 import { isJudgeOnlyModel } from "./model-policy.ts";
 import { chatgptModelWindow } from "./providers/chatgpt/windows.ts";
+import { assertApprovedDestination, personalMode } from "./personal-policy.ts";
+import { isNativeDesktopModel } from "./desktop-policy.ts";
 
 export const BOOTSTRAP_PATHS = ["/edge-api/bootstrap", "/api/bootstrap"];
 
@@ -25,17 +27,51 @@ export function isBootstrapPath(path: string): boolean {
 type ModelEntry = Record<string, unknown> & { id?: string };
 type Surface = Record<string, unknown> & { id?: string; models?: ModelEntry[] };
 
-// Surfaces whose sessions run through the Claude Code CLI (and therefore through the router).
-// Measured 2026-09-13: app_start had chat, code, ccr, ccd, cowork, design, office_agent, chrome, voice,
-// claude_science; the Code tab list matched code/ccd/ccr (9 entries). Chat & co. never reach the CLI.
+function isModelEntry(value: unknown): value is ModelEntry {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+// Generic mode keeps its existing CLI-backed surfaces. The author's 2026-09-13 Desktop
+// capture identifies ccd as the menu and code as its available IDs, effort and saved state;
+// ccr belongs to web Code. Personal Desktop mode changes only those two measured surfaces.
 const CLI_SURFACES = new Set(["code", "ccd", "ccr", "cowork"]);
+const CODE_SURFACES = new Set(["code", "ccd"]);
+
+export type DesktopCodeSurface = "code" | "ccd";
+export const DESKTOP_PICKER_ROW_LIMIT = 128;
+const DESKTOP_PICKER_MODEL_ID_LIMIT = 256;
+export function isDesktopCodeSurface(value: unknown): value is DesktopCodeSurface {
+  return value === "code" || value === "ccd";
+}
+export function isDesktopPickerModelId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= DESKTOP_PICKER_MODEL_ID_LIMIT && !/[\s\x00-\x1f\x7f]/.test(value);
+}
 
 function isClaudeEntry(m: ModelEntry): boolean {
   return typeof m.id === "string" && m.id.startsWith("claude-");
 }
 
-function pickTemplate(models: ModelEntry[]): ModelEntry | null {
+function pickTemplate(models: readonly ModelEntry[]): ModelEntry | null {
   return models.find((m) => isClaudeEntry(m) && !m.disabled && m.section !== "deprecated" && m.section !== "legacy") ?? models.find(isClaudeEntry) ?? null;
+}
+
+/** The exact personal extras displayable within the bounded native menu, in configured order. */
+export function personalSurfaceExtraModels(models: readonly ModelEntry[], extras: readonly CliModel[]): CliModel[] {
+  if (models.length > DESKTOP_PICKER_ROW_LIMIT) return [];
+  const existing = new Set(models.map(model => model.id));
+  const selected = new Set<string>();
+  const result: CliModel[] = [];
+  let remaining = pickTemplate(models) ? DESKTOP_PICKER_ROW_LIMIT - models.length : 0;
+  for (const extra of extras) {
+    if (!isDesktopPickerModelId(extra.model) || isJudgeOnlyModel(extra.model) || selected.has(extra.model)) continue;
+    if (!existing.has(extra.model)) {
+      if (remaining === 0) continue;
+      remaining--;
+    }
+    selected.add(extra.model);
+    result.push(extra);
+  }
+  return result;
 }
 
 /**
@@ -53,7 +89,7 @@ function pickTemplate(models: ModelEntry[]): ModelEntry | null {
 function narrowThinking(entry: ModelEntry, levels: string[]): void {
   const thinking = entry.thinking as { effort_options?: { id?: unknown; recommended?: unknown }[] } | undefined;
   if (!thinking || !Array.isArray(thinking.effort_options)) return;
-  const kept = thinking.effort_options.filter((option) => typeof option.id === "string" && levels.includes(option.id));
+  const kept = thinking.effort_options.filter((option) => option !== null && typeof option === "object" && typeof option.id === "string" && levels.includes(option.id));
   if (kept.length === 0) {
     delete entry.thinking;
     return;
@@ -62,10 +98,41 @@ function narrowThinking(entry: ModelEntry, levels: string[]): void {
   entry.thinking = { ...thinking, effort_options: kept.map(({ recommended: _recommended, ...option }) => (option.id === preferred ? { ...option, recommended: true } : option)) };
 }
 
+/**
+ * A config-only eligibility check shared by picker activation and list injection. No network,
+ * filesystem or credential-store reads occur here. It proves a selected extra has one explicit
+ * usable route and an approved destination, not that its key, paid tier or remote model is live.
+ * Native Claude IDs always retain their server-provided picker entry in personal mode.
+ */
+export function personalPickerModelProblem(cfg: Config, model: string): string | null {
+  if (!personalMode(cfg)) return null;
+  if (isNativeDesktopModel(model)) return "Native Claude picker entries must remain unchanged";
+  const target = resolve(model, {}, cfg);
+  if (!target) return "The extra model has no unique routable provider";
+  if (isJudgeOnlyModel(model) || isJudgeOnlyModel(target.model)) return "Judge-only models cannot be added to the Code picker";
+  const configured = cfg.providers[target.provider];
+  if (!configured) return "The extra model's provider is missing";
+  const provider = providerFor(configured, target.model);
+  if (provider.type === "grok" || (provider.type === "google" && provider.auth !== "api-key")) {
+    return "This provider's sign-in mode is unavailable in personal mode";
+  }
+  if ("credentials" in provider && provider.credentials?.length && provider.credentials.every(credential => credential.paused)) {
+    return "All configured provider credentials are paused";
+  }
+  const endpoint = provider.type === "google" ? provider.url?.trim() || "https://generativelanguage.googleapis.com"
+    : provider.type === "chatgpt" ? provider.url || "https://chatgpt.com"
+    : provider.type === "anthropic" ? "https://api.anthropic.com"
+    : provider.url;
+  try { assertApprovedDestination(endpoint, cfg.security!); }
+  catch { return "The extra model's HTTPS destination is not approved"; }
+  return null;
+}
+
 /** Resolve aliases/routes before advertising an entry; a chat-looking alias can target a judge. */
 export function chatPickerModels(cfg: Config): CliModel[] {
   return cfg.cli.extraModels
     .filter(entry => !isJudgeOnlyModel(entry.model) && !isJudgeOnlyModel(resolve(entry.model, {}, cfg)?.model ?? cfg.aliases[entry.model.split("@")[0]!] ?? ""))
+    .filter(entry => personalPickerModelProblem(cfg, entry.model) === null)
     .map(entry => {
       // A window the operator set on this entry is the one the router advertises, catalogue or not
       // (`pickerWindowOverride`, §4 2026-10-30).
@@ -143,13 +210,14 @@ export type InjectResult = { injected: number; surfaces: { id: string; models: s
  * Mutates `json` in place; returns what was done for logging. `effortFor` names the levels a model
  * takes (by its id without an `@effort` suffix); undefined leaves the template's menu as it is.
  */
-export function injectPickerModels(json: Record<string, unknown>, extra: CliModel[], contextWindow?: number, effortFor?: (model: string) => string[] | undefined): InjectResult {
+export function injectPickerModels(json: Record<string, unknown>, extra: CliModel[], contextWindow?: number, effortFor?: (model: string) => string[] | undefined, options: { codeOnly?: boolean; compatibleCodeSurfaces?: readonly DesktopCodeSurface[] } = {}): InjectResult {
   const result: InjectResult = { injected: 0, surfaces: [] };
   extra = extra.filter(e => !isJudgeOnlyModel(e.model));
   const msc = json.model_selector_config;
   if (!Array.isArray(msc) || extra.length === 0) return result;
   for (const surface of msc as Surface[]) {
-    if (!surface || typeof surface !== "object" || !Array.isArray(surface.models)) continue;
+    // A changed/malformed native schema must remain a passthrough, not break Desktop's boot.
+    if (!surface || typeof surface !== "object" || !Array.isArray(surface.models) || !surface.models.every(isModelEntry)) continue;
     const id = String(surface.id ?? "");
     result.surfaces.push({
       id,
@@ -157,11 +225,15 @@ export function injectPickerModels(json: Record<string, unknown>, extra: CliMode
       entries: surface.models.map((m) => ({ id: String(m.id ?? "?"), name: typeof m.name === "string" ? m.name : String(m.id ?? "?") })),
       injected: [],
     });
-    if (!CLI_SURFACES.has(id)) continue;
+    if (!(options.codeOnly ? CODE_SURFACES : CLI_SURFACES).has(id)) continue;
+    // Personal mode needs the native selection contract as well as a recognizable menu.
+    // An updated/ambiguous selector must not expose an extra the local overlay cannot select.
+    if (options.codeOnly && !options.compatibleCodeSurfaces?.some(surface => surface === id)) continue;
     const template = pickTemplate(surface.models);
     if (!template) continue;
     const existing = new Set(surface.models.map((m) => m.id));
-    for (const e of extra) {
+    const added: CliModel[] = [];
+    for (const e of options.codeOnly ? personalSurfaceExtraModels(surface.models, extra) : extra) {
       if (existing.has(e.model)) continue;
       const entry: ModelEntry = { ...structuredClone(template), id: e.model, name: e.name };
       const w = e.contextWindow ?? contextWindow;
@@ -172,18 +244,23 @@ export function injectPickerModels(json: Record<string, unknown>, extra: CliMode
       for (const k of ["disabled", "disabled_reason", "notice", "selection_notice", "badge", "badge_tooltip", "tooltip", "minimum_tier", "is_default"]) delete entry[k];
       entry.section = "main";
       const levels = effortFor?.(e.model.split("@")[0]!);
-      if (levels) narrowThinking(entry, levels);
+      if (options.codeOnly && (!levels || levels.length === 0)) delete entry.thinking;
+      else if (levels) narrowThinking(entry, levels);
       surface.models.push(entry);
       // The dashboard writes each id once, but a hand-edited list can repeat one: it is still one row.
       existing.add(e.model);
+      added.push(e);
       result.surfaces[result.surfaces.length - 1]!.injected.push(e.model);
       result.injected++;
     }
     // Per-entry window first: routed models do not share one, and `contextWindow` is only the fallback.
     for (const key of ["context_window_by_model", "contextWindowByModel"]) {
       const map = surface[key];
-      if (!map || typeof map !== "object") continue;
-      for (const e of extra) {
+      if (!map || typeof map !== "object" || Array.isArray(map)) continue;
+      // Never rewrite capacity metadata for a server-provided/native entry, even when a
+      // hand-edited extraModels list names that id with a different window. Repeated calls
+      // likewise retain the first entry and its matching metadata together.
+      for (const e of added) {
         const w = e.contextWindow ?? contextWindow;
         if (w) (map as Record<string, number>)[e.model] = w;
       }

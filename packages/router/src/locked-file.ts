@@ -6,10 +6,19 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { lockSync } from "proper-lockfile";
+import { applyWindowsPrivateAcl, assertPrivateTarget, ensurePrivateDirectory, ensureStorageDirectory, notePrivateDirectoryMutation, readPrivateFileStored, rememberPrivateFileCreated } from "./private-file.ts";
+import { hasNativeSecretProtection, isSealedSecret, sealSecretBytes, secretStoredBytesLimit, unsealSecretBytes, type SecretProtector } from "./secret-storage.ts";
 
-const LOCK_STALE_MS = 30_000;
+// These are synchronous critical sections. While a caller holds one, its event loop cannot
+// run proper-lockfile's periodic mtime refresh. The stale threshold must outlive the longest
+// permitted contender wait, or a second process can steal an active lock on a busy Windows PC.
+const LOCK_STALE_MS = 120_000;
 const LOCK_WAIT_MS = 100;
-const LOCK_TIMEOUT_MS = 2_000;
+const LOCK_TIMEOUT_MS = process.platform === "win32" ? 10_000 : 2_000;
+// Windows DPAPI and ACL work is slow enough that eight legitimate account writers can take more
+// than ten seconds to drain. Give *account stores* a longer bounded wait; unrelated agent/config
+// mutations must still refuse a busy lock promptly.
+const ACCOUNT_LOCK_TIMEOUT_MS = process.platform === "win32" ? 30_000 : 2_000;
 
 /**
  * Whether taking the lock failed only because another writer holds it or is letting it go. On
@@ -20,11 +29,9 @@ const LOCK_TIMEOUT_MS = 2_000;
 export function lockBusy(code: string | undefined, platform: NodeJS.Platform = process.platform): boolean {
   return code === "ELOCKED" || (platform === "win32" && (code === "EPERM" || code === "EACCES" || code === "EBUSY"));
 }
-
-/** Run `mutate` while holding the lock for `file`. Waits up to two seconds for another writer. */
-export function withFileLock<T>(file: string, mutate: () => T): T {
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+function withTimedFileLock<T>(file: string, mutate: () => T, timeoutMs: number): T {
+  ensureStorageDirectory(path.dirname(file));
+  const deadline = Date.now() + timeoutMs;
   let release: () => void;
   for (;;) {
     try {
@@ -39,7 +46,18 @@ export function withFileLock<T>(file: string, mutate: () => T): T {
     return mutate();
   } finally {
     release!();
+    notePrivateDirectoryMutation(path.dirname(file));
   }
+}
+
+/** Normal mutations wait at most two seconds (ten on Windows), then refuse contention. */
+export function withFileLock<T>(file: string, mutate: () => T): T {
+  return withTimedFileLock(file, mutate, LOCK_TIMEOUT_MS);
+}
+
+/** Windows credential-store writers may queue for 30 seconds behind DPAPI-protected peers. */
+export function withAccountFileLock<T>(file: string, mutate: () => T): T {
+  return withTimedFileLock(file, mutate, ACCOUNT_LOCK_TIMEOUT_MS);
 }
 
 const RENAME_RETRY_BUDGET_MS = 2_000;
@@ -86,18 +104,105 @@ export function renameWithRetry(
  * caller retiring an older copy of the same secret needs to know which it got.
  */
 export function writeJsonAtomic(file: string, value: unknown): { directoryDurable: boolean } {
+  // Also used for user-selected Claude/Codex settings paths. Protect the file without taking
+  // ownership of the surrounding workspace's directory permissions.
+  return writePrivateFileAtomic(file, JSON.stringify(value, null, 2) + "\n", false);
+}
+
+/** Opt-in for project-owned secrets only, never third-party settings or externally read PEMs. */
+export function writeSecretJsonAtomic(file: string, value: unknown, options: { protector?: SecretProtector } = {}): { directoryDurable: boolean } {
+  return writeSecretFileAtomic(file, JSON.stringify(value, null, 2) + "\n", options);
+}
+
+/** Encrypt before creating the temporary file: even incomplete atomic writes contain ciphertext. */
+export function writeSecretFileAtomic(file: string, value: string | Buffer, options: { protector?: SecretProtector } = {}): { directoryDurable: boolean } {
+  const bytes = typeof value === "string" ? Buffer.from(value, "utf8") : value;
+  return writePrivateFileAtomic(file, sealSecretBytes(file, bytes, options.protector));
+}
+
+/**
+ * Idempotent upgrade of a specifically identified, project-owned legacy secret. Call at startup
+ * before using that store. A failure is fatal to migration, never a reason to write plaintext or
+ * reset the account. No backup copy is created; only the encrypted temporary file reaches disk.
+ */
+export function migrateSecretFile(file: string, options: { protector?: SecretProtector } = {}): boolean {
+  if (!options.protector && !hasNativeSecretProtection()) return false;
+  let existing: Buffer;
+  try { existing = readPrivateFileStored(file, secretStoredBytesLimit(8 * 1024 * 1024)); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+  // The normal already-migrated path remains read-only and does not contend with account refresh.
+  if (isSealedSecret(existing)) { unsealSecretBytes(file, existing, 8 * 1024 * 1024, options.protector); return false; }
+  return withFileLock(file, () => {
+    const bytes = readPrivateFileStored(file, secretStoredBytesLimit(8 * 1024 * 1024));
+    if (isSealedSecret(bytes)) { unsealSecretBytes(file, bytes, 8 * 1024 * 1024, options.protector); return false; }
+    writeSecretFileAtomic(file, bytes, options);
+    return true;
+  });
+}
+
+function assertPrivateTemporary(stat: fs.Stats): void {
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+    throw new Error("Private temporary storage must be a regular, unlinked file");
+  }
+  if (process.platform !== "win32") {
+    if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+      throw new Error("Private temporary storage must belong to the current user");
+    }
+    if ((stat.mode & 0o077) !== 0) throw new Error("Private temporary storage permissions must be owner-only");
+  }
+}
+
+/** Bind pathname-based ACL operations and publication to the descriptor opened exclusively. */
+function assertTemporaryBinding(file: string, expected: fs.Stats, fd?: number): void {
+  const current = fs.lstatSync(file);
+  const opened = fd === undefined ? expected : fs.fstatSync(fd);
+  assertPrivateTemporary(current);
+  assertPrivateTemporary(opened);
+  if (current.dev !== expected.dev || current.ino !== expected.ino ||
+      opened.dev !== expected.dev || opened.ino !== expected.ino) {
+    throw new Error("Private temporary storage changed while writing it");
+  }
+}
+
+/**
+ * Atomic private bytes, shared by JSON credential stores and PEM private keys. Storage paths
+ * still require trusted ancestors. In particular, preserving a generic parent's permissions
+ * does not make an attacker-writable directory safe: pathname checks cannot prevent every race
+ * between a check and a filesystem operation, or an attacker moving the same entry away/back.
+ */
+export function writePrivateFileAtomic(file: string, value: string | Buffer, privateDirectory = true): { directoryDurable: boolean } {
   const dirName = path.dirname(file);
-  fs.mkdirSync(dirName, { recursive: true, mode: 0o700 });
+  if (privateDirectory) ensurePrivateDirectory(dirName);
+  else ensureStorageDirectory(dirName);
+  assertPrivateTarget(file);
   const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
   try {
     const fd = fs.openSync(tmp, "wx", 0o600);
+    let created: fs.Stats;
     try {
-      fs.writeFileSync(fd, JSON.stringify(value, null, 2) + "\n", "utf8");
+      created = fs.fstatSync(fd);
+      assertTemporaryBinding(tmp, created, fd);
+      // An elevated Windows process can create Administrators-owned files even inside a private
+      // parent. Set the actual file owner and DACL while it is still empty; inherited grants
+      // alone cannot establish the identity required by verify-only credential readers. The ACL
+      // helper checks Windows ownership; bind its path to this descriptor again before writing.
+      if (process.platform === "win32") applyWindowsPrivateAcl(tmp, false);
+      assertTemporaryBinding(tmp, created, fd);
+      fs.writeFileSync(fd, value, "utf8");
       fs.fsyncSync(fd);
+      assertTemporaryBinding(tmp, created, fd);
     } finally {
       fs.closeSync(fd);
     }
-    renameWithRetry(tmp, file);
+    // Close before rename for Windows compatibility, but check the original identity on every
+    // retry too: waiting for another process to release the destination must not accept a swap.
+    renameWithRetry(tmp, file, process.platform, (from, to) => {
+      assertPrivateTarget(to);
+      assertTemporaryBinding(from, created);
+      fs.renameSync(from, to);
+    });
+    assertTemporaryBinding(file, created);
+    rememberPrivateFileCreated(file);
     let directoryDurable = false;
     try {
       const dir = fs.openSync(dirName, "r");
@@ -112,20 +217,6 @@ export function writeJsonAtomic(file: string, value: unknown): { directoryDurabl
     try { fs.unlinkSync(tmp); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
-  }
-}
-
-/**
- * A secret-bearing file written before writeJsonAtomic, or replaced by an editor under a 022 umask,
- * can sit at 0644 until its next save. A load that sees group or other bits on it tightens it to
- * 0600. It only ever tightens, and does nothing on Windows, which has no owner-only POSIX mode. A
- * file another user owns refuses the chmod; the load carries on as before, since it never needed it.
- */
-export function tightenToOwnerOnly(file: string, mode: number): void {
-  if (process.platform === "win32" || (mode & 0o077) === 0) return;
-  try {
-    fs.chmodSync(file, 0o600);
-  } catch {
-    /* not ours to change: the file is read as it was before this check */
+    notePrivateDirectoryMutation(dirName);
   }
 }

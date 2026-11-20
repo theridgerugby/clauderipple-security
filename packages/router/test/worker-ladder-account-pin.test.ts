@@ -31,10 +31,17 @@ import { workerLadderLine } from "../../mod/hooks/ladder.ts";
 import { normalizeSettings } from "../../mod/hooks/settings.ts";
 
 type NativeSeen = { authorization?: string; body: Record<string, unknown> };
+type UpstreamServer = http.Server | https.Server;
+type FixtureContext = { after(cleanup: () => Promise<void>): void };
+type FixtureOptions = {
+  agentFiles?: boolean;
+  onUpstreamsReady?: (home: string, servers: readonly UpstreamServer[]) => void;
+};
 
 function freePort(): Promise<number> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const probe = net.createServer();
+    probe.once("error", reject);
     probe.listen(0, "127.0.0.1", () => {
       const { port } = (probe.address() as net.AddressInfo);
       probe.close(() => resolve(port));
@@ -49,8 +56,33 @@ const BILLING_EXHAUSTED = JSON.stringify({ error: { type: "RESOURCE_EXHAUSTED", 
  * A worker spawned on `p/primary`, answered 429-with-spending-cap the first turn. The ladder's one
  * fallback is a pinned Claude worker. The native upstream records which account each turn ran on.
  */
-async function fixture() {
+async function fixture(t: FixtureContext, options: FixtureOptions = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-ladder-pin-"));
+  const upstreams: UpstreamServer[] = [];
+  let activeProxy: Proxy | undefined;
+  let stopping: Promise<void> | undefined;
+  // Register before setup can fail. A missing generated worker used to reject fixture() before
+  // the caller obtained rig.stop(), leaving all three upstream listeners alive indefinitely.
+  const stop = (): Promise<void> => stopping ??= (async () => {
+    const failures: unknown[] = [];
+    try { activeProxy?.close(); } catch (error) { failures.push(error); }
+    for (const server of upstreams) {
+      try {
+        server.closeAllConnections();
+        if (server.listening) await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+      } catch (error) { failures.push(error); }
+    }
+    try { fs.rmSync(home, { recursive: true, force: true }); } catch (error) { failures.push(error); }
+    if (failures.length) throw new AggregateError(failures, "ladder pin fixture cleanup failed");
+  })();
+  t.after(stop);
+  const listen = async (server: UpstreamServer): Promise<void> => {
+    upstreams.push(server);
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => { server.removeListener("error", reject); resolve(); });
+    });
+  };
   const agentDir = path.join(home, "agents");
   const ca = createCa({ cn: "clauderipple ladder pin test" });
   const leaf = createLeaf({ host: "localhost", caCertPem: ca.certPem, caKeyPem: ca.keyPem });
@@ -71,7 +103,7 @@ async function fixture() {
       res.end(JSON.stringify({ id: "msg_ok", type: "message", role: "assistant", model: body.model, content: [], usage: {} }));
     });
   });
-  await new Promise<void>((resolve) => native.listen(0, "127.0.0.1", resolve));
+  await listen(native);
   const nativePort = (native.address() as net.AddressInfo).port;
 
   const primarySeen: Record<string, unknown>[] = [];
@@ -84,7 +116,7 @@ async function fixture() {
       res.end(BILLING_EXHAUSTED);
     });
   });
-  await new Promise<void>((resolve) => primary.listen(0, "127.0.0.1", resolve));
+  await listen(primary);
   const primaryPort = (primary.address() as net.AddressInfo).port;
 
   // Google's model-capacity answer is unwritten: the proxy may hand the turn to one route fallback
@@ -98,8 +130,9 @@ async function fixture() {
       res.end(JSON.stringify({ error: { code: 503, status: "UNAVAILABLE", message: "No capacity available for model gemini-test on the server", details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "MODEL_CAPACITY_EXHAUSTED", domain: "cloudcode-pa.googleapis.com", metadata: { model: "gemini-test" } }] } }));
     });
   });
-  await new Promise<void>((resolve) => google.listen(0, "127.0.0.1", resolve));
+  await listen(google);
   const googlePort = (google.address() as net.AddressInfo).port;
+  options.onUpstreamsReady?.(home, upstreams);
 
   const observed = new ObservedClaudeCodeAuth();
   observed.observe([
@@ -121,6 +154,7 @@ async function fixture() {
 
   const cfg: Config = {
     ...DEFAULTS,
+    cli: { ...DEFAULTS.cli, ...(options.agentFiles === undefined ? {} : { agentFiles: options.agentFiles }) },
     upstream: "localhost",
     listen: { host: "127.0.0.1", port: await freePort() },
     providers: {
@@ -166,6 +200,7 @@ async function fixture() {
     upstreamPort: nativePort,
     upstreamAgent: new https.Agent({ ca: ca.certPem }),
   });
+  activeProxy = proxy;
   await proxy.listen();
 
   const send = async (prompt: string, model = "primary@high"): Promise<number> => {
@@ -204,18 +239,29 @@ async function fixture() {
     googleSeen,
     nativeSeen,
     send,
-    stop: async () => {
-      proxy.close();
-      await new Promise<void>((resolve) => native.close(() => resolve()));
-      await new Promise<void>((resolve) => primary.close(() => resolve()));
-      await new Promise<void>((resolve) => google.close(() => resolve()));
-      fs.rmSync(home, { recursive: true, force: true });
-    },
+    stop,
   };
 }
 
-test("a ladder failover to a pinned Claude worker runs on that account", async () => {
-  const rig = await fixture();
+test("a failed worker-generation fixture closes every listener and can be cleaned twice", async t => {
+  const cleanups: (() => Promise<void>)[] = [];
+  let state: { home: string; servers: readonly UpstreamServer[] } | undefined;
+  await assert.rejects(fixture({ after(cleanup) { cleanups.push(cleanup); t.after(cleanup); } }, {
+    agentFiles: false,
+    onUpstreamsReady(home, servers) { state = { home, servers: [...servers] }; },
+  }), /the stored account has a pinned worker to name/);
+  assert.ok(state);
+  assert.equal(state.servers.length, 3, "the real upstream listeners were opened before generation failed");
+  assert.ok(state.servers.every(server => server.listening));
+  assert.equal(cleanups.length, 1, "cleanup was registered before fixture could reject");
+  await cleanups[0]!();
+  assert.ok(state.servers.every(server => !server.listening && server.address() === null));
+  assert.equal(fs.existsSync(state.home), false);
+  await cleanups[0]!();
+});
+
+test("a ladder failover to a pinned Claude worker runs on that account", async t => {
+  const rig = await fixture(t);
   try {
     const line = workerLadderLine({ pick: "pick-a", model: "primary@high", fallbacks: [`anthropic#${rig.pin}:claude-opus-5@high`] });
     assert.equal(await rig.send(`${line}\nTask`), 429, "the primary's spending-cap 429 reaches the client first");
@@ -238,8 +284,8 @@ test("a ladder failover to a pinned Claude worker runs on that account", async (
   }
 });
 
-test("an unwritten capacity fallback to a pinned Claude worker runs on that account", async () => {
-  const rig = await fixture();
+test("an unwritten capacity fallback to a pinned Claude worker runs on that account", async t => {
+  const rig = await fixture(t);
   try {
     const line = workerLadderLine({ pick: "pick-b", model: "gemini-test@high", fallbacks: [`anthropic#${rig.pin}:claude-opus-5@high`] });
     assert.equal(await rig.send(`${line}\nTask`, "gemini-test@high"), 200, "the capacity refusal falls over inside the turn");

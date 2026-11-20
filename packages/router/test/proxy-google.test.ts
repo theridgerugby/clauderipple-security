@@ -287,6 +287,24 @@ for (const provider of ["google", "opencode"] as const) {
   });
 }
 
+test("Gemini 4 Carbon explicit effort reaches GenerateContent over TLS and an omitted effort keeps Google's default", async () => {
+  const model = "gemini-4-carbon";
+  const r = await rig({ provider: url => ({ type: "google", auth: "api-key", apiKey: "test-key", url, models: [{ id: model, effortLevels: ["low", "medium", "high"] }] }) });
+  try {
+    for (const effort of ["low", "medium", "high", undefined]) {
+      const response = await r.send({ model, max_tokens: 16, stream: true, messages: [{ role: "user", content: "hi" }], ...(effort ? { output_config: { effort } } : {}) });
+      assert.equal(response.status, 200, effort ?? "default");
+      const sent = r.seen.at(-1)!;
+      assert.equal(sent.path, `/v1beta/models/${model}:streamGenerateContent?alt=sse`);
+      assert.deepEqual(sent.body.generationConfig, { maxOutputTokens: 16, ...(effort ? { thinkingConfig: { thinkingLevel: effort } } : {}) });
+      assert.equal(sent.body.reasoning_effort, undefined);
+      assert.equal(sent.headers["x-goog-api-key"], "test-key");
+      assert.equal(sent.headers.authorization, undefined, "native credentials do not reach Google");
+    }
+    assert.equal(r.seen.length, 4, "one Google request per turn, no inference probe");
+  } finally { await r.stop(); }
+});
+
 test("a spent key on the google wire retries the next key before anything is written (#112)", async () => {
   // OpenCode Go answers a Gemini model on its own go/google path, keyed per workspace. Its keys share
   // one provider, so the google wire must use that provider's pool the way every other wire does:

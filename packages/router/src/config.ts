@@ -8,10 +8,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { CompatibleCaps } from "./compat.ts";
-import { tightenToOwnerOnly } from "./locked-file.ts";
+import { readPrivateFile } from "./private-file.ts";
+import { migrateSecretFile } from "./locked-file.ts";
 import { PRESETS } from "./presets.ts";
 import { hostProblem, portProblem } from "./remote-host.ts";
 import { ingressOnly } from "./targets.ts";
+import { PERSONAL_SECURITY_DEFAULTS, personalPolicyProblems, personalProviderHeaderProblem, type PersonalSecurityPolicy } from "./personal-policy.ts";
 
 export type ProcessPriority = "below-normal" | "normal" | "above-normal" | "high";
 export const PROCESS_PRIORITIES: readonly ProcessPriority[] = ["below-normal", "normal", "above-normal", "high"];
@@ -475,7 +477,9 @@ export function webSearchNative(cfg: Pick<Config, "webSearch">): boolean {
 }
 
 export type Config = {
-  /** Install new versions while idle. Omitted means enabled; hot-reloaded. */
+  /** Mandatory on normalized production configs; external destinations need separate approval. */
+  security?: PersonalSecurityPolicy;
+  /** Install new versions while idle only after explicit opt-in; hot-reloaded. */
   autoUpdate?: boolean;
   /**
    * Windows only. Absent means "normal". "below-normal" is what Task Scheduler gave the router
@@ -832,8 +836,40 @@ function foldSplitProviders(c: Config): Config {
   };
 }
 
+/** The effective config shape used by both live readers and revision-bound admin snapshots. */
+export function normalizeConfig(parsed: Partial<Config>): Config {
+  return foldSplitProviders(merge(DEFAULTS, {
+    ...parsed,
+    security: parsed.security ?? { ...PERSONAL_SECURITY_DEFAULTS, approvedOrigins: [] },
+  }));
+}
+
 export function validate(c: Config): string[] {
   const errors: string[] = [];
+  if (c.security !== undefined) {
+    errors.push(...personalPolicyProblems(c.security));
+    if (c.autoUpdate === true) errors.push("personal mode requires autoUpdate to remain disabled");
+    if (c.upstream !== "api.anthropic.com") errors.push("personal mode pins native Claude traffic to api.anthropic.com");
+    if (!["127.0.0.1", "::1"].includes(c.listen.host)) errors.push("personal mode requires a loopback listen address");
+    if (c.remote?.hosts?.length) errors.push("remote hosts are disabled in personal mode");
+    for (const [name, provider] of Object.entries(c.providers)) {
+      if (provider.type === "chatgpt" && provider.debugDump) errors.push(`provider ${name}: request-body debug dumps are disabled in personal mode`);
+      if (provider.type === "grok") errors.push(`provider ${name}: external Grok CLI credential reuse is disabled in personal mode; use a direct HTTPS API provider`);
+      if (provider.type === "google" && provider.auth === "antigravity") errors.push(`provider ${name}: personal mode supports the Google API-key path; subscription-token reuse is disabled`);
+      if (provider.type === "chatgpt" && provider.url) {
+        try { if (new URL(provider.url).origin !== "https://chatgpt.com") errors.push(`provider ${name}: ChatGPT account credentials must stay on https://chatgpt.com`); }
+        catch { errors.push(`provider ${name}: invalid ChatGPT account destination`); }
+      }
+      const base = "url" in provider ? provider.url : undefined;
+      for (const model of provider.models ?? []) {
+        if (!model.url) continue;
+        try {
+          const expected = base ?? (provider.type === "google" ? "https://generativelanguage.googleapis.com" : provider.type === "chatgpt" ? "https://chatgpt.com" : "https://api.anthropic.com");
+          if (new URL(model.url).origin !== new URL(expected).origin) errors.push(`provider ${name}: model destination must share its credential's base origin`);
+        } catch { errors.push(`provider ${name}: invalid model destination`); }
+      }
+    }
+  }
   if (c.autoUpdate !== undefined && typeof c.autoUpdate !== "boolean") errors.push("autoUpdate must be true or false");
   if (c.processPriority !== undefined && !PROCESS_PRIORITIES.includes(c.processPriority as ProcessPriority)) {
     errors.push('processPriority must be "below-normal", "normal", "above-normal" or "high"');
@@ -898,6 +934,25 @@ export function validate(c: Config): string[] {
     if (!c.providers[d.provider]) errors.push(`direct ${d.prefix}: unknown provider "${d.provider}"`);
   }
   for (const [name, p] of Object.entries(c.providers)) {
+    if (c.security) {
+      const headers = (p as { headers?: unknown }).headers;
+      if (headers !== undefined && (!headers || typeof headers !== "object" || Array.isArray(headers) ||
+        Object.values(headers).some(value => typeof value !== "string"))) {
+        errors.push(`provider ${name}: personal provider headers must be a string record`);
+      } else if (headers && typeof headers === "object") {
+        for (const [header, value] of Object.entries(headers as Record<string, string>)) {
+          const problem = personalProviderHeaderProblem(header) ?? headerValueProblem(value);
+          if (problem) errors.push(`provider ${name}: header "${header}": ${problem}`);
+        }
+      }
+      const sessionHeader = (p as { sessionHeader?: unknown }).sessionHeader;
+      if (sessionHeader !== undefined) {
+        const problem = personalProviderHeaderProblem(sessionHeader);
+        if (problem || (typeof sessionHeader === "string" && ["authorization", "x-api-key"].includes(sessionHeader.toLowerCase()))) {
+          errors.push(`provider ${name}: invalid or credential-conflicting session header`);
+        }
+      }
+    }
     // Carried by every provider that puts together a system prompt, so checked once for all of them.
     const shared = p as { identity?: unknown; instructionsAppend?: unknown; limits?: unknown; label?: unknown };
     if (shared.identity !== undefined && typeof shared.identity !== "boolean") errors.push(`provider ${name}: identity must be true or false`);
@@ -926,7 +981,7 @@ export function validate(c: Config): string[] {
             errors.push(`provider ${name}: credential ${i} headers must be a string record`);
           } else {
             for (const [header, value] of Object.entries(cred.headers as Record<string, string>)) {
-              const problem = headerValueProblem(value);
+              const problem = (c.security ? personalProviderHeaderProblem(header) : null) ?? headerValueProblem(value);
               if (problem) errors.push(`provider ${name}: credential ${i} header "${header}": ${problem}`);
             }
           }
@@ -1058,8 +1113,8 @@ export function validate(c: Config): string[] {
 }
 
 export class ConfigStore {
-  private current: Config = DEFAULTS;
-  private mtimeMs = -1;
+  private current: Config = normalizeConfig({});
+  private fingerprint = "";
   private readonly file: string;
   private readonly onChange: ((c: Config, errors: string[]) => void) | undefined;
 
@@ -1078,27 +1133,39 @@ export class ConfigStore {
   private reload(initial: boolean): void {
     let st: fs.Stats;
     try {
-      st = fs.statSync(this.file);
+      st = fs.lstatSync(this.file);
     } catch {
-      if (initial) this.onChange?.(this.current, [`no config at ${this.file}; using defaults`]);
-      this.mtimeMs = -1;
+      const changed = initial || this.fingerprint !== "";
+      this.current = normalizeConfig({});
+      if (changed) this.onChange?.(this.current, ["config is missing or inaccessible; external data requests are blocked"]);
+      this.fingerprint = "";
       return;
     }
-    // Before the mtime check: a chmod leaves the mtime alone, so a looser mode is seen on every read.
-    tightenToOwnerOnly(this.file, st.mode);
-    if (st.mtimeMs === this.mtimeMs) return;
+    // Include identity and metadata: replacing a file or weakening its mode must not reuse a
+    // snapshot solely because an editor preserved mtime. The private reader fails closed.
+    const fingerprint = [st.dev, st.ino, st.ctimeMs, st.mtimeMs, st.size, st.mode].join(":");
+    if (fingerprint === this.fingerprint) return;
     try {
-      const parsed = JSON.parse(fs.readFileSync(this.file, "utf8")) as Partial<Config>;
+      // A Windows legacy plaintext file is sealed before its secrets become active. Migration
+      // uses the same private reader and lock as writes, and creates no plaintext backup.
+      migrateSecretFile(this.file);
+      const activeStat = fs.lstatSync(this.file);
+      const activeFingerprint = [activeStat.dev, activeStat.ino, activeStat.ctimeMs, activeStat.mtimeMs, activeStat.size, activeStat.mode].join(":");
+      const parsed = JSON.parse(readPrivateFile(this.file).toString("utf8")) as Partial<Config>;
       // Folded before validation, because the old three-provider shape is what is on disk and the
       // references it carries have to be the ones that get checked.
-      const next = foldSplitProviders(merge(DEFAULTS, parsed));
+      const next = normalizeConfig(parsed);
       const errors = validate(next);
-      if (errors.length === 0 || initial) this.current = next;
-      this.mtimeMs = st.mtimeMs;
+      // Invalid disk input must not activate partially valid routes or retain an old approval
+      // after the user attempted to revoke it. An empty personal policy refuses external data.
+      this.current = errors.length === 0 ? next : normalizeConfig({});
+      this.fingerprint = activeFingerprint;
       this.onChange?.(this.current, errors);
-    } catch (e) {
-      this.mtimeMs = st.mtimeMs; // do not re-parse a broken file on every request
-      this.onChange?.(this.current, [`config parse error: ${(e as Error).message}`]);
+    } catch {
+      this.fingerprint = fingerprint; // do not re-parse a broken file on every request
+      this.current = normalizeConfig({});
+      // JSON.parse diagnostics may quote a provider key from malformed input.
+      this.onChange?.(this.current, ["config is unreadable, insecure, or invalid JSON; external data requests are blocked"]);
     }
   }
 }

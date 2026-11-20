@@ -10,10 +10,12 @@
 // <home>/claude-accounts.json pool and never logged or returned by the admin API.
 
 import crypto from "node:crypto";
+import { guardEgressFetch, isEgressPolicyError } from "../egress.ts";
 import http from "node:http";
 import net from "node:net";
 import { redactErrorText } from "../redact.ts";
 import { saveClaudeOAuthAccount, type ClaudeAccountSummary } from "./anthropic-accounts.ts";
+import { readClaudeLocalAuthState, withClaudeLocalAuthGeneration } from "./anthropic-local-auth.ts";
 
 // Endpoints, scopes and body shapes are what Claude Code 2.1.271 sends (read from its binary on
 // 2026-09-16): the claude.ai login is `claude.com/cai/oauth/authorize`, tokens come from
@@ -88,13 +90,14 @@ export class ClaudeOAuthTokenError extends Error {
 async function postToken(fetchImpl: FetchLike, body: Record<string, string>): Promise<TokenReply> {
   let response: Response;
   try {
-    response = await fetchImpl(CLAUDE_OAUTH.tokenUrl, {
+    response = await guardEgressFetch(fetchImpl)(CLAUDE_OAUTH.tokenUrl, {
       method: "POST",
       headers: { "content-type": "application/json", accept: "application/json" },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(30_000),
     });
   } catch (error) {
+    if (isEgressPolicyError(error)) throw error;
     const raw = error instanceof Error ? error.message : String(error);
     throw new Error(`Claude token endpoint request failed: ${redactErrorText(raw, Object.values(body), 300)}`);
   }
@@ -174,15 +177,21 @@ export class ClaudeOAuthSession {
   private timer: NodeJS.Timeout | null = null;
   private exchanging = false;
   private finished = false;
+  private locallyRevoked = false;
+  private readonly consentGeneration: string;
   private stateSnapshot: ClaudeOAuthState = { running: false, url: null, manual: false, startedAt: null, finishedAt: null, ok: null, error: null, account: null };
 
   constructor(options: ClaudeOAuthOptions) {
     this.options = options;
+    this.consentGeneration = readClaudeLocalAuthState(options.home).generation;
     this.grant = new Promise<ClaudeOAuthGrant>((resolve, reject) => {
       this.settle = { resolve, reject };
     });
     this.result = this.grant.then((grant) => {
-      const account = saveClaudeOAuthAccount(options.home, grant, undefined, options.replaceId ? { replaceId: options.replaceId } : {});
+      if (this.locallyRevoked) throw new Error("Claude sign-in was revoked locally; start a new sign-in to authorize it");
+      const account = withClaudeLocalAuthGeneration(options.home, this.consentGeneration, () =>
+        saveClaudeOAuthAccount(options.home, grant, undefined, options.replaceId ? { replaceId: options.replaceId } : {}));
+      if (!account) throw new Error("Claude sign-in was revoked locally; start a new sign-in to authorize it");
       this.stateSnapshot = { ...this.stateSnapshot, running: false, finishedAt: new Date().toISOString(), ok: true, account };
     }).catch((error: Error) => {
       // Saving can fail after a successful exchange; that failure must finish the polled state too.
@@ -202,6 +211,7 @@ export class ClaudeOAuthSession {
 
   /** Starts the loopback listener when possible and returns the URL to open. */
   async start(): Promise<{ url: string; manual: boolean }> {
+    if (this.finished || this.locallyRevoked) throw new Error("Claude sign-in is no longer active; start a new sign-in");
     const manual = this.options.manual ? true : !(await this.listen(this.options.port ?? CLAUDE_OAUTH.port)) && !(await this.listen(0));
     this.redirectUri = manual ? CLAUDE_OAUTH.manualRedirectUri : `http://localhost:${this.port}${CLAUDE_OAUTH.callbackPath}`;
     const url = new URL(CLAUDE_OAUTH.authorizeUrl);
@@ -256,6 +266,12 @@ export class ClaudeOAuthSession {
   cancel(): void {
     if (this.exchanging) return;
     this.fail(new Error("Claude sign-in cancelled"));
+  }
+
+  /** Explicit local logout overrides even an already-exchanging code; dialog close stays cancel(). */
+  revokeLocalAuthorization(): void {
+    this.locallyRevoked = true;
+    this.fail(new Error("Claude sign-in was revoked locally; start a new sign-in to authorize it"));
   }
 
   private listen(port: number): Promise<boolean> {
@@ -318,6 +334,7 @@ export class ClaudeOAuthSession {
         code_verifier: this.verifier,
       });
       const grant = grantFrom(reply, (this.options.now ?? Date.now)());
+      if (this.locallyRevoked) return;
       this.finish();
       this.settle.resolve(grant);
     } catch (error) {

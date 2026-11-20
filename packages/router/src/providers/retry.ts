@@ -28,6 +28,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { Agent, setGlobalDispatcher } from "undici";
 
 import { classify } from "../pool.ts";
+import { egressFetch, isEgressPolicyError } from "../egress.ts";
 
 /**
  * How long a translated provider's response may stay silent. Node's `fetch` gives up after 300s
@@ -96,8 +97,9 @@ export async function fetchWithRetry(
   for (let n = 1; n <= attempts; n++) {
     let res: Response;
     try {
-      res = await fetch(url, init);
+      res = await egressFetch(url, init);
     } catch (e) {
+      if (isEgressPolicyError(e)) throw e;
       // An abort is the client going away, not the provider: retrying it would keep working on a
       // turn nobody is waiting for.
       if (init.signal?.aborted) throw e;

@@ -11,6 +11,8 @@ import path from "node:path";
 import { CLAUDE_OAUTH, ClaudeOAuthSession, refreshClaudeOAuth } from "../src/providers/claude-oauth.ts";
 import { claudeAccountsPath, readClaudeAccountsFile } from "../src/providers/anthropic-accounts.ts";
 import { readClaudeAuthFile, saveClaudeOAuthFile } from "../src/providers/anthropic-token-file.ts";
+import { readPrivateFile } from "../src/private-file.ts";
+import { authorizeClaudeLocalAuth, revokeClaudeLocalAuth } from "../src/providers/anthropic-local-auth.ts";
 import { ClaudeCodeAuthStore, ClaudeCodeCredentialStore } from "../src/providers/anthropic.ts";
 import { posixModes } from "../../../test/capabilities.ts";
 
@@ -229,7 +231,7 @@ test("a successful exchange whose account save fails finishes the attempt as fai
   assert.doesNotMatch(JSON.stringify(session.snapshot), /at-1|rt-1/);
   session.cancel();
   assert.equal(session.snapshot.running, false, "the already settled grant cannot be cancelled again");
-  assert.equal(fs.readFileSync(claudeAccountsPath(home), "utf8"), "not JSON");
+  assert.equal(readPrivateFile(claudeAccountsPath(home)).toString("utf8"), "not JSON");
 });
 
 test("token endpoint errors cannot echo authorization or refresh secrets", async () => {
@@ -287,4 +289,42 @@ test("refreshClaudeOAuth keeps the previous refresh token when the reply omits o
   const endpoint = tokenEndpoint({ access_token: "at-2", expires_in: 100 });
   const grant = await refreshClaudeOAuth("rt-keep", { fetch: endpoint.fetchImpl, now: () => 5 });
   assert.deepEqual(grant, { accessToken: "at-2", refreshToken: "rt-keep", expiresAt: 5 + 100_000 });
+});
+
+test("explicit local logout refuses an OAuth grant whose code exchange was already running", async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-claude-force-logout-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const pending = Promise.withResolvers<Response>();
+  let calls = 0;
+  const session = new ClaudeOAuthSession({ home, manual: true, fetch: async () => { calls++; return pending.promise; } });
+  t.after(() => session.revokeLocalAuthorization());
+  await session.start();
+  const submitted = session.submitCode("synthetic-authorization-code");
+  assert.equal(calls, 1);
+  session.revokeLocalAuthorization();
+  await assert.rejects(session.result, /revoked locally/);
+  pending.resolve(Response.json({ access_token: "synthetic-revoked-access", refresh_token: "synthetic-revoked-refresh", expires_in: 3600 }));
+  await submitted;
+  assert.equal(session.snapshot.ok, false);
+  assert.equal(session.snapshot.running, false);
+  assert.deepEqual(readClaudeAccountsFile(home), []);
+  assert.equal(fs.existsSync(claudeAccountsPath(home)), false);
+  assert.equal(calls, 1, "no upstream account-revocation operation was sent");
+});
+
+test("an external logout/reconnect between code exchange and save invalidates the OAuth consent generation", async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-claude-epoch-logout-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const pending = Promise.withResolvers<Response>();
+  const session = new ClaudeOAuthSession({ home, manual: true, fetch: async () => pending.promise });
+  t.after(() => session.revokeLocalAuthorization());
+  await session.start();
+  const submitted = session.submitCode("synthetic-code");
+  revokeClaudeLocalAuth(home);
+  authorizeClaudeLocalAuth(home);
+  pending.resolve(Response.json({ access_token: "synthetic-old-attempt", refresh_token: "synthetic-old-refresh", expires_in: 3600 }));
+  await submitted;
+  await assert.rejects(session.result, /revoked locally/);
+  assert.deepEqual(readClaudeAccountsFile(home), []);
+  assert.equal(fs.existsSync(claudeAccountsPath(home)), false);
 });

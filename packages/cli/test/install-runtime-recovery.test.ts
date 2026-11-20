@@ -8,10 +8,10 @@ import { spawnSync, execFileSync } from "node:child_process";
 
 const installer = path.resolve(import.meta.dirname, "../../../scripts/install.sh");
 
-function fixture(t: { after(fn: () => void): void }) {
+function fixture(t: { after(fn: () => void): void }, prefixName = "prefix") {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cr-sh-runtime-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const prefix = path.join(root, "prefix");
+  const prefix = path.join(root, prefixName);
   const bin = path.join(root, "tools");
   const payload = path.join(root, "payload", "node-test");
   const archive = path.join(root, "download", "node.tar.gz");
@@ -21,7 +21,7 @@ function fixture(t: { after(fn: () => void): void }) {
   script(path.join(prefix, "runtime/bin/node"), 'case "$1" in -e) printf 1;; -v) printf old;; *) exit 70;; esac');
   fs.writeFileSync(path.join(prefix, "runtime/identity"), "previous-runtime");
   script(path.join(bin, "node"), "printf 0");
-  script(path.join(payload, "bin/node"), 'case "$1" in -e) case "$2" in *process.versions*) printf 24;; *) /usr/bin/touch "$TEST_PREFIX/clauderipple-install.json";; esac;; -v) printf v24.0.0;; *) exec /bin/sh "$@";; esac');
+  script(path.join(payload, "bin/node"), 'case "$1" in -e) case "$2" in *process.versions*) printf 24;; *) /usr/bin/touch "$TEST_PREFIX/clauderipple-install.json";; esac;; -v) printf v24.0.0;; */clauderipple.js) printf "%s\\n" "$@" > "$TEST_PREFIX/wrapper-args";; *) exec /bin/sh "$@";; esac');
   script(path.join(payload, "lib/node_modules/npm/bin/npm-cli.js"), 'if [ "$FAIL_POINT" = npm ]; then exit 74; fi\nmkdir -p "$TEST_PREFIX/bin" "$TEST_PREFIX/lib/node_modules/clauderipple/bin"\nprintf "#!/bin/sh\\nexit 99\\n" > "$TEST_PREFIX/bin/clauderipple"\nchmod +x "$TEST_PREFIX/bin/clauderipple"\ntouch "$TEST_PREFIX/lib/node_modules/clauderipple/bin/clauderipple.js"');
   execFileSync("/usr/bin/tar", ["-czf", archive, "-C", path.dirname(payload), path.basename(payload)]);
   const checksum = crypto.createHash("sha256").update(fs.readFileSync(archive)).digest("hex");
@@ -32,14 +32,35 @@ function fixture(t: { after(fn: () => void): void }) {
   const osName = process.platform === "darwin" ? "darwin" : "linux";
   const arch = process.arch === "arm64" ? "arm64" : "x64";
   const env = { HOME: home, SHELL: "/bin/sh", PATH: `${bin}:/usr/bin:/bin`, CLAUDERIPPLE_HOME: prefix, CLAUDERIPPLE_PREFIX: prefix, CLAUDE_CONFIG_DIR: path.join(root, "claude"), TMPDIR: path.join(root, "tmp"), CLAUDERIPPLE_NO_SETUP: "1", CLAUDERIPPLE_NO_TRAY: "1", TEST_PREFIX: prefix, TEST_ARCHIVE: archive, TEST_CHECKSUM: checksum, TEST_OS: osName, TEST_ARCH: arch };
-  const run = (point: string) => spawnSync("/bin/sh", [installer], { env: { ...env, FAIL_POINT: point }, encoding: "utf8" });
+  // Keep exercising the dormant upstream recovery library in an isolated copy. The shipping
+  // entry point is fail-closed and has its own no-side-effects test; there is no runtime flag
+  // that bypasses its personal-fork guard.
+  const source = fs.readFileSync(installer, "utf8");
+  const marker = "# LEGACY_INSTALLER_BODY: retained for isolated regression fixtures; unreachable in this fork.";
+  assert.equal(source.split(marker).length, 2);
+  const legacyFixture = path.join(root, "legacy-installer-fixture.sh");
+  fs.writeFileSync(legacyFixture, source.slice(source.indexOf(marker) + marker.length));
+  const run = (point: string) => spawnSync("/bin/sh", [legacyFixture], { env: { ...env, FAIL_POINT: point }, encoding: "utf8" });
   const preserved = () => {
     assert.equal(fs.readFileSync(path.join(prefix, "runtime/identity"), "utf8"), "previous-runtime");
     assert.equal(fs.existsSync(path.join(prefix, "runtime/bin/node")), true);
     assert.deepEqual(fs.readdirSync(prefix).filter(name => /^runtime\.(old|new)\./.test(name)), []);
   };
-  return { root, prefix, home, run, preserved };
+  return { root, prefix, home, run, preserved, env };
 }
+
+test("install.sh shims and profile treat shell metacharacters in paths literally", { skip: process.platform === "win32" }, t => {
+  const f = fixture(t, 'prefix \' " $HOME `touch INJECTED` $(touch INJECTED) !');
+  const installed = f.run("none");
+  assert.equal(installed.status, 0, installed.stdout + installed.stderr);
+  const invocation = spawnSync("/bin/sh", [path.join(f.prefix, "bin/clauderipple"), "one literal argument", "$(touch INJECTED)"], { env: f.env, cwd: f.root, encoding: "utf8" });
+  assert.equal(invocation.status, 0, invocation.stdout + invocation.stderr);
+  assert.deepEqual(fs.readFileSync(path.join(f.prefix, "wrapper-args"), "utf8").trimEnd().split("\n"), [path.join(f.prefix, "lib/node_modules/clauderipple/bin/clauderipple.js"), "one literal argument", "$(touch INJECTED)"]);
+  const profile = spawnSync("/bin/sh", ["-c", '. "$1"; printf "%s" "$PATH"', "sh", path.join(f.home, ".profile")], { env: f.env, cwd: f.root, encoding: "utf8" });
+  assert.equal(profile.status, 0, profile.stderr);
+  assert.equal(profile.stdout, `${f.prefix}/bin:${f.env.PATH}`);
+  assert.equal(fs.existsSync(path.join(f.root, "INJECTED")), false);
+});
 
 test("install.sh keeps the committed runtime after partial backup cleanup fails", { skip: process.platform === "win32" }, t => {
   const f = fixture(t);

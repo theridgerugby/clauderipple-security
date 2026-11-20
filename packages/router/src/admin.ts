@@ -1,7 +1,7 @@
 // Local admin API + static GUI. Binds 127.0.0.1 only, never touches the proxy port.
 //
 //   GET  /api/status   snapshot for the Health screen
-//   GET  /api/config    raw config.json
+//   GET  /api/config    config.json with write-only credential placeholders
 //   PUT  /api/config    validate + atomically save config.json (router picks it up via mtime)
 //   GET  /api/logs?n=   tail of router.log
 //   POST /api/chatgpt-login  begin ChatGPT browser login (adds an account) without holding the request open
@@ -28,13 +28,23 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import https from "node:https";
 import { runCli, startCliDetached, parseUpdateCheck, type DetachedCli } from "./cli-control.ts";
-import { AutoUpdater } from "./autoupdate.ts";
+import { AutoUpdater, autoUpdateEnabled } from "./autoupdate.ts";
+import { ADMIN_TOKEN_HEADER, ADMIN_INSTANCE_HEADER, ensureAdminToken, validAdminToken } from "./admin-auth.ts";
+import { ensureAdminTlsIdentity, removeAdminEndpoint, writeAdminEndpoint } from "./admin-transport-state.ts";
+import { redactConfigSecrets, restoreConfigSecrets, restoreProbeSecrets } from "./admin-config-secrets.ts";
+import { MAX_PROBE_ERROR_BYTES, MAX_PROBE_JSON_BYTES, parseAdminJson, readProbeJson, readProbeText } from "./admin-input.ts";
 export { parseUpdateCheck, type UpdateCheck } from "./cli-control.ts";
 import { fileURLToPath } from "node:url";
 import type { Config, Provider, ProviderCredential, ProviderModel } from "./config.ts";
-import { withFileLock, writeJsonAtomic } from "./locked-file.ts";
-import { adminPort, headerValueProblem, homeDir, searchProviderFor, ssidProblem, validate } from "./config.ts";
+import { withFileLock, writeJsonAtomic, writeSecretJsonAtomic } from "./locked-file.ts";
+import { readPrivateFile } from "./private-file.ts";
+import { approvedOrigin, personalMode } from "./personal-policy.ts";
+import { personalDesktopProblems } from "./desktop-policy.ts";
+import type { RouterCodeIdentity } from "../../cli/src/install-runtime.ts";
+import { EgressPolicyError, egressFetch, guardEgressFetch, isEgressPolicyError } from "./egress.ts";
+import { adminPort, headerValueProblem, homeDir, normalizeConfig, searchProviderFor, ssidProblem, validate } from "./config.ts";
 export { adminPort } from "./config.ts";
 import { accountDisplayName, agentRenames, generatedAgents } from "./agents.ts";
 import { isJudgeOnlyModel } from "./model-policy.ts";
@@ -53,7 +63,7 @@ import type { RequestLog, RequestRecord } from "./requestlog.ts";
 import { PRESETS, type ProviderPreset } from "./presets.ts";
 import { answersWebSearch, effortLevels, targetWarnings } from "./targets.ts";
 export { effortLevels } from "./targets.ts";
-import { redactErrorText } from "./redact.ts";
+import { credentialHeaderValues, redactErrorText } from "./redact.ts";
 import { CHATGPT_FALLBACK_MODELS } from "./providers/chatgpt/catalog.ts";
 import { contextWindowSnapshot, syncContextWindows } from "./context-windows.ts";
 import { measureModel, ollamaApiBase, ollamaModelFacts, refusedByPlan, type Measured, type WireCandidate } from "./capabilities.ts";
@@ -78,6 +88,7 @@ import { storedAccountsFor } from "./pinned-accounts.ts";
 import { CODEX_LOGIN_ID, readChatGptAccounts, removeChatGptAccount, summarize as summarizeChatGptAccount, updateChatGptAccount } from "./providers/chatgpt/accounts.ts";
 import { exhaustedForMs, IMAGE_ASPECTS, IMAGE_BACKGROUNDS, IMAGE_FORMATS, type ChatGptAccountStatus, type ImageRequest, type ImageResult } from "./providers/chatgpt/index.ts";
 import type { GoogleAccountStatus } from "./providers/google/index.ts";
+import { googleThinkingFamily } from "./providers/google/translate.ts";
 import { googleWindowsFromGroups, type QuotaGroup } from "./providers/google/usage.ts";
 import { isOpenCodeGo, type OpenCodeWindow } from "./providers/opencode-usage.ts";
 import { isMiniMaxPlan, type MiniMaxWindow } from "./providers/minimax-usage.ts";
@@ -132,6 +143,7 @@ export type AdminDeps = {
   providerHealth?: () => Record<string, ProviderExhaustion>;
   modelHealth?: ModelHealth["snapshot"];
   version: string;
+  codeIdentity?: RouterCodeIdentity;
   /**
    * The installation identity this process captured at start: its home's opaque id (immutable for
    * this process, even if the file changes) and its own pid. Status reports both, and a shutdown
@@ -185,9 +197,11 @@ export type AdminDeps = {
   clearCredentialCooldown?: (provider: string, id: string) => void;
   claudeClearCooldown?: (id: string) => void;
   /** Optional: picker-mode state and the last bootstrap injection. */
-  picker?: () => { enabled: boolean; hosts: string[]; last: unknown };
+  picker?: () => { enabled: boolean; hosts: string[]; last: unknown; blockedOrigins?: string[] };
   /** Optional: observed CLI credentials held by the live proxy, never serialized directly. */
   observedClaudeCodeAuth?: ObservedClaudeCodeAuth;
+  /** Invalidate every live current-login cache and in-flight refresh generation together. */
+  claudeLocalAuthorization?: (allow: boolean) => void;
   /** Test seam for Claude Code's keychain and credential-file readers. */
   claudeCodeCredentialReaders?: ClaudeCodeCredentialReaders;
   /** Test seam for the local CLI side effects. Production uses the installed CLI runtime. */
@@ -267,6 +281,7 @@ function previewAccounts<T extends { id: string; paused: boolean; preferred: boo
  */
 function requestAccountNames(deps: AdminDeps): (record: RequestRecord) => string | undefined {
   const cfg = deps.config();
+  if (personalMode(cfg)) return () => undefined;
   const claude = listClaudeAccounts(homeDir());
   const chatgpt = deps.chatgpt?.().accounts?.() ?? {};
   const google = deps.google?.().accounts() ?? {};
@@ -299,7 +314,7 @@ function requestAccountNames(deps: AdminDeps): (record: RequestRecord) => string
 
 /** Claude usage is looked up only where a Claude subscription provider is configured. */
 function hasClaudeSubscription(cfg: Config): boolean {
-  return Object.values(cfg.providers).some((p) => p.type === "anthropic" && p.auth === "claude-code");
+  return !personalMode(cfg) && Object.values(cfg.providers).some((p) => p.type === "anthropic" && p.auth === "claude-code");
 }
 
 /**
@@ -308,6 +323,7 @@ function hasClaudeSubscription(cfg: Config): boolean {
  * declared pool is read from the stored accounts the same way `/api/claude-accounts` does.
  */
 function claudePoolReports(deps: AdminDeps, name: string | undefined): CredentialRow[] {
+  if (personalMode(deps.config())) return [];
   const live = name ? deps.credentials?.()[name] : undefined;
   if (live) return live;
   const projection = new ClaudeAccountAuthPool({ home: homeDir(), current: claudeAuthStore(deps), log: deps.log }).peekCredentials();
@@ -320,6 +336,7 @@ function claudePoolReports(deps: AdminDeps, name: string | undefined): Credentia
  * stored accounts prefer.
  */
 function claudeInUseId(deps: AdminDeps, name: string | undefined): string | undefined {
+  if (personalMode(deps.config())) return undefined;
   const provider = name ? deps.config().providers[name] : undefined;
   if (provider?.type === "anthropic" && provider.accountPool !== true) return isCurrentClaudeAccountPaused(homeDir()) ? undefined : "current";
   try {
@@ -349,12 +366,14 @@ function firstClaudeProvider(cfg: Config): string | undefined {
  * figures, so no reader can take what the cache kept from before the pause for a current reading.
  */
 async function claudeAccountUsage(deps: AdminDeps): Promise<{ id: string; label: string; quota: Record<string, unknown>; inUse?: boolean; paused?: true }[]> {
+  if (personalMode(deps.config())) return [];
   let usage: Record<string, Record<string, unknown>>;
   try {
     usage = (await deps.claudeUsage?.()) ?? {};
   } catch {
     return [];
   }
+  if (personalMode(deps.config())) return [];
   const inUse = claudeInUseId(deps, firstClaudeProvider(deps.config()));
   const rows: { id: string; label: string; quota: Record<string, unknown>; inUse?: boolean; paused?: true }[] = [];
   // The account in use is listed even while its usage is unknown, with no windows, so no reader
@@ -476,12 +495,14 @@ function isSameAsCurrentLogin(account: { subjectHash?: string | undefined; email
  * for the one that is actually spending.
  */
 async function anthropicLimitAccounts(deps: AdminDeps, name: string): Promise<LimitsAccount[]> {
+  if (personalMode(deps.config())) return [];
   let usage: Record<string, Record<string, unknown>>;
   try {
     usage = (await deps.claudeUsage?.()) ?? {};
   } catch {
     return [];
   }
+  if (personalMode(deps.config())) return [];
   const owners = claudeNumberedAccounts();
   // Only a known current login can name itself or point out a stored copy of itself; when the
   // lookup fails or the login is unreadable the rows stay exactly as they were.
@@ -648,8 +669,13 @@ export function effortLevelsForModel(cfg: Config, modelId: string): string[] | u
   const base = modelId.split("@")[0]!;
   const target = resolve(base, {}, cfg) ?? resolve(cfg.aliases[base] ?? base, {}, cfg);
   if (!target) return undefined;
+  const provider = cfg.providers[target.provider];
+  const model = provider?.models?.find(m => m.id === target.model || m.id.replace(/-\d{8}$/, "") === target.model.replace(/-\d{8}$/, ""));
+  // Personal Google entries cannot inherit another Gemini model's effort ladder. The
+  // selection adapter enforces this same per-model evidence; no ladder means no effort menu.
+  if (personalMode(cfg) && provider?.type === "google") return model?.effortLevels ?? [];
   const own = effortLevels(cfg).providers[target.provider];
-  const id = cfg.providers[target.provider]?.models?.find(m => m.id === target.model || m.id.replace(/-\d{8}$/, "") === target.model.replace(/-\d{8}$/, ""))?.id ?? target.model;
+  const id = model?.id ?? target.model;
   return own?.models?.[id] ?? own?.default;
 }
 
@@ -673,7 +699,11 @@ const CLAUDE_MODEL_FALLBACK: { id: string; name: string }[] = [
 
 /** The account's Claude models, or the table above when Anthropic's list cannot be had. */
 async function claudeModelList(deps: AdminDeps): Promise<(ModelEntry & { name: string })[]> {
+  // Personal Desktop already supplies its own native picker catalogue. Never borrow a login
+  // merely to populate a legacy admin selector or context-window label.
+  if (personalMode(deps.config())) return CLAUDE_MODEL_FALLBACK;
   const live = await deps.claudeModels?.().catch(() => null);
+  if (personalMode(deps.config())) return CLAUDE_MODEL_FALLBACK;
   return live?.length ? live.map(({ line: _line, createdAt: _createdAt, ...model }) => ({ ...model, name: model.name ?? model.id })) : CLAUDE_MODEL_FALLBACK;
 }
 
@@ -1139,9 +1169,9 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
         ...(p.type === "google" && p.auth === "antigravity" ? googleHealth(deps.google?.().accounts?.()[name] ?? []) : {}),
         ...(p.type === "anthropic"
           ? {
-              authSource: p.auth === "claude-code" ? claudeAuthStore(deps).describeSource() : null,
-              signedIn: p.auth === "claude-code" ? (listClaudeAccounts(homeDir()).length > 0 ? "oauth" : readClaudeAuthFile(homeDir())?.source ?? null) : null,
-              accountCount: p.auth === "claude-code" ? listClaudeAccounts(homeDir()).length : 0,
+              authSource: p.auth === "claude-code" && !personalMode(deps.config()) ? claudeAuthStore(deps).describeSource() : null,
+              signedIn: p.auth === "claude-code" && !personalMode(deps.config()) ? (listClaudeAccounts(homeDir()).length > 0 ? "oauth" : readClaudeAuthFile(homeDir())?.source ?? null) : null,
+              accountCount: p.auth === "claude-code" && !personalMode(deps.config()) ? listClaudeAccounts(homeDir()).length : 0,
             }
           : {}),
       }] as const;
@@ -1163,6 +1193,7 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
   if (env.HTTPS_PROXY !== wantProxy) problems.push("settings");
   if (deps.health() > 0) problems.push("upstream");
   if (picker.enabled) {
+    if (personalMode(cfg) && !cfg.security!.approvedOrigins.includes("https://claude.ai")) problems.push("picker-origin");
     const trust = pickerTrust();
     // null: the certificate has not been checked yet (the first check runs in the background); that
     // is not a problem to report.
@@ -1172,7 +1203,7 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
   for (const [name, p] of Object.entries(providers)) if (p.reachable === false) problems.push(`provider:${name}`);
   return {
     version: deps.version,
-    autoUpdate: deps.autoUpdater?.status() ?? { enabled: cfg.autoUpdate !== false, running: false },
+    autoUpdate: personalMode(cfg) ? { enabled: false, running: false } : deps.autoUpdater?.status() ?? { enabled: autoUpdateEnabled(cfg), running: false },
     processPriority: deps.processPriority?.() ?? processPriorityState(cfg.processPriority),
     readiness: { ready: problems.length === 0, problems },
     // The errors themselves, so a reader can name the line to fix rather than only "config".
@@ -1184,7 +1215,7 @@ async function buildStatus(deps: AdminDeps, opts: { refresh?: boolean } = {}): P
     envProxy: { set: ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NODE_USE_ENV_PROXY"].filter((name) => (process.env[name] ?? "") !== "") },
     // Which files this process is running, so the app can tell an old router from its own after
     // an update: a zip unpacked next to the previous install left the old one serving (2026-09-15).
-    runtime: { node: process.execPath, router: process.argv[1] ?? null, startedAt: STARTED_AT },
+    runtime: { node: process.execPath, router: process.argv[1] ?? null, startedAt: STARTED_AT, codeIdentity: deps.codeIdentity ?? null },
     home: homeDir(),
     // The identity captured when this process started: a caller accepts this status as its own only
     // when both the installation id and the pid match what it would act on. A file changed while
@@ -1318,26 +1349,23 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
   res.end(out);
 }
 
-/** Write the config file atomically under its lock. The one save path: the GUI's PUT, the
- * capability measurements and the CLI's picker toggle all go through it or take the same lock, so
- * the router never picks up a half-written file and two writers never replace it mid-change. */
-function writeConfigFile(configFile: string, config: Config): void {
-  withFileLock(configFile, () => writeConfigFileLocked(configFile, config));
-}
-
+/** Call only while holding the lock for the entire config read/modify/write transaction. */
 function writeConfigFileLocked(configFile: string, config: Config): void {
-  writeJsonAtomic(configFile, config);
+  writeSecretJsonAtomic(configFile, config);
 }
 
 /** The disk fingerprint also detects CLI edits and background measurements, without persisting API metadata. */
 function configSnapshot(deps: AdminDeps): { config: Config; configRevision: string } {
   let text: string;
-  try { text = fs.readFileSync(deps.configFile, "utf8"); }
+  try { text = readPrivateFile(deps.configFile).toString("utf8"); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     text = JSON.stringify(deps.config());
   }
-  return { config: JSON.parse(text) as Config, configRevision: crypto.createHash("sha256").update(text).digest("hex") };
+  let parsed: Partial<Config>;
+  try { parsed = parseAdminJson(text) as Partial<Config>; }
+  catch { throw new Error("saved config is not valid JSON"); }
+  return { config: normalizeConfig(parsed), configRevision: crypto.createHash("sha256").update(text).digest("hex") };
 }
 
 function headerValue(headers: Record<string, string> | undefined): { name: string; value: string } | null {
@@ -1389,23 +1417,29 @@ function claudeAuthStore(deps: AdminDeps): ClaudeCodeAuthStore {
 
 async function probeAnthropicApiKey(apiKey: string, probeFetch: (url: string, init: RequestInit) => Promise<Response> = fetchWithTimeout): Promise<{ ok: boolean; auth: ProbeAuth; models: ModelEntry[]; error?: string }> {
   // The key's own model list where it answers; a key that cannot list is still tested below.
-  const listed = await fetchClaudeModels("https://api.anthropic.com", { "x-api-key": apiKey }, probeFetch).catch(() => []);
+  const listed = await fetchClaudeModels("https://api.anthropic.com", { "x-api-key": apiKey }, async (url, init) => {
+    const response = await probeFetch(url, { ...init, redirect: "error" });
+    if (!response.ok) { await response.body?.cancel().catch(() => {}); return response; }
+    return Response.json(await readProbeJson(response));
+  }).catch((error: unknown) => { if (isEgressPolicyError(error)) throw error; return []; });
   const models: ModelEntry[] = listed.length ? listed.map(({ line: _line, createdAt: _createdAt, ...model }) => model) : CLAUDE_MODEL_FALLBACK;
   const label = "messages endpoint";
   try {
     const response = await probeFetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
+      redirect: "error",
       headers: { "content-type": "application/json", ...nativeAnthropicHeaders({ type: "anthropic", auth: "api-key", apiKey }) },
       body: JSON.stringify({ model: models[0]!.id, max_tokens: 1, messages: [{ role: "user", content: "hi" }] }),
     });
-    if (response.status === 401 || response.status === 403) return { ok: false, auth: "bad-key", models, error: `${label} returned ${response.status}: ${snippet(await response.text())}` };
-    if (response.ok) return { ok: true, auth: "ok", models };
-    const detail = snippet(await response.text());
+    if (response.status === 401 || response.status === 403) return { ok: false, auth: "bad-key", models, error: `${label} returned ${response.status}: ${redactErrorText(await readProbeText(response), [apiKey])}` };
+    if (response.ok) { await response.body?.cancel().catch(() => {}); return { ok: true, auth: "ok", models }; }
+    const detail = redactErrorText(await readProbeText(response), [apiKey]);
     if (refusedForModel(response.status, detail)) return { ok: true, auth: "ok", models };
     if (response.status === 402 || /insufficient|balance|credit|quota|billing/i.test(detail)) return { ok: true, auth: "ok", models, error: `no-credits: ${response.status} ${detail}` };
     return { ok: false, auth: response.status >= 500 ? "unreachable" : "unknown", models, error: `${label} returned ${response.status}: ${detail}` };
   } catch (e) {
-    return { ok: false, auth: "unreachable", models, error: `${label}: ${errorText(e)}` };
+    if (isEgressPolicyError(e)) throw e;
+    return { ok: false, auth: "unreachable", models, error: `${label}: ${redactErrorText(errorText(e), [apiKey])}` };
   }
 }
 
@@ -1420,12 +1454,17 @@ async function probeClaudeCodeAuth(deps: AdminDeps): Promise<{ ok: boolean; auth
   return { ok: currentUsable || hasUsableAccount, auth: currentUsable || hasUsableAccount ? "ok" : "missing", source, signedIn, accountCount: accounts.length, models: await claudeModelList(deps) };
 }
 
-/** The reasoning levels a `GET /v1beta/models` entry says the model takes, or none to offer. */
-function googleEffortLevels(entry: { thinking?: unknown; id?: unknown }): string[] {
-  // `thinking: true` is the listing's own flag that a model reasons. The Generative Language API
-  // documents no per-model effort ladder, so a thinking model is offered the Gemini-3 levels this
-  // router maps onto (translate.ts): a model that only knows a subset clamps server-side.
-  return entry.thinking === true ? ["minimal", "low", "medium", "high"] : [];
+/** The supported ladder for a recognized thinking model from `GET /v1beta/models`. */
+function googleEffortLevels(id: string, thinking: unknown): string[] {
+  if (thinking !== true) return [];
+  // A thinking flag alone says nothing about the accepted levels. Keep discovery aligned with
+  // the translator: Carbon/Argon cannot disable thinking, and an unknown family gets no ladder.
+  switch (googleThinkingFamily(id)) {
+    case "gemini4": return ["low", "medium", "high"];
+    case "gemini3":
+    case "gemini25": return ["minimal", "low", "medium", "high"];
+    default: return [];
+  }
 }
 
 /**
@@ -1435,24 +1474,35 @@ function googleEffortLevels(entry: { thinking?: unknown; id?: unknown }): string
  * 401/403), so there is no separate one-token request to make.
  */
 async function probeGoogle(body: { apiKey?: unknown; url?: unknown }, probeFetch: (url: string, init: RequestInit) => Promise<Response> = fetchWithTimeout): Promise<{ ok: boolean; auth: ProbeAuth; models: ModelEntry[]; error?: string }> {
-  const apiKey = typeof body.apiKey === "string" && body.apiKey.length > 0 ? body.apiKey : (process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY);
-  if (!apiKey) return { ok: false, auth: "missing", models: [], error: "no API key; set one or GEMINI_API_KEY" };
   const base = (typeof body.url === "string" && body.url ? body.url : "https://generativelanguage.googleapis.com").replace(/\/+$/, "");
+  let endpoint: URL;
+  try { endpoint = new URL(base); } catch { return { ok: false, auth: "unknown", models: [], error: "invalid Google API base URL" }; }
+  if (!["https:", "http:"].includes(endpoint.protocol) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+    return { ok: false, auth: "unknown", models: [], error: "invalid Google API base URL" };
+  }
+  const explicitKey = typeof body.apiKey === "string" && body.apiKey.length > 0 ? body.apiKey : undefined;
+  // Ambient credentials belong to Google's official service. A custom endpoint must be paired
+  // with its own explicitly supplied key, never inherit a secret from the router's environment.
+  if (!explicitKey && endpoint.origin !== "https://generativelanguage.googleapis.com") {
+    return { ok: false, auth: "missing", models: [], error: "an explicit API key is required for a custom Google endpoint" };
+  }
+  const apiKey = explicitKey ?? (process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY);
+  if (!apiKey) return { ok: false, auth: "missing", models: [], error: "no API key; set one or GEMINI_API_KEY" };
   const models: ModelEntry[] = [];
   let pageToken: string | undefined;
   try {
     // Bounded: a catalogue that keeps handing back a token must not spin the admin request forever.
     for (let page = 0; page < 20; page++) {
       const url = `${base}/v1beta/models?pageSize=1000${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ""}`;
-      const response = await probeFetch(url, { headers: { "x-goog-api-key": apiKey } });
-      if (response.status === 401 || response.status === 403) return { ok: false, auth: "bad-key", models: [], error: `models endpoint returned ${response.status}` };
+      const response = await probeFetch(url, { headers: { "x-goog-api-key": apiKey }, redirect: "error" });
+      if (response.status === 401 || response.status === 403) { await response.body?.cancel().catch(() => {}); return { ok: false, auth: "bad-key", models: [], error: `models endpoint returned ${response.status}` }; }
       if (!response.ok) {
-        const detail = snippet(await response.text());
+        const detail = redactErrorText(await readProbeText(response), [apiKey]);
         // A wrong key comes back 400 with `status: API_KEY_INVALID`; that is a bad key, not a bad base.
         const badKey = /API_KEY_INVALID|API key not valid|invalid api key/i.test(detail);
         return { ok: false, auth: badKey ? "bad-key" : response.status >= 500 ? "unreachable" : "unknown", models: [], error: `models endpoint returned ${response.status}: ${detail}` };
       }
-      const parsed = await response.json() as { models?: unknown; nextPageToken?: unknown };
+      const parsed = await readProbeJson(response) as { models?: unknown; nextPageToken?: unknown };
       for (const raw of Array.isArray(parsed.models) ? parsed.models : []) {
         if (!raw || typeof raw !== "object") continue;
         const entry = raw as { name?: unknown; displayName?: unknown; inputTokenLimit?: unknown; supportedGenerationMethods?: unknown; thinking?: unknown };
@@ -1462,7 +1512,7 @@ async function probeGoogle(body: { apiKey?: unknown; url?: unknown }, probeFetch
         // prediction models share the catalogue but cannot serve a turn.
         const methods = Array.isArray(entry.supportedGenerationMethods) ? entry.supportedGenerationMethods : [];
         if (!methods.some((method) => method === "generateContent")) continue;
-        const levels = googleEffortLevels(entry);
+        const levels = googleEffortLevels(id, entry.thinking);
         models.push({
           id,
           ...(typeof entry.displayName === "string" ? { name: entry.displayName } : {}),
@@ -1476,7 +1526,8 @@ async function probeGoogle(body: { apiKey?: unknown; url?: unknown }, probeFetch
     if (models.length === 0) return { ok: true, auth: "ok", models, error: "no generateContent models listed" };
     return { ok: true, auth: "ok", models };
   } catch (e) {
-    return { ok: false, auth: "unreachable", models, error: `models endpoint: ${errorText(e)}` };
+    if (isEgressPolicyError(e)) throw e;
+    return { ok: false, auth: "unreachable", models, error: `models endpoint: ${redactErrorText(errorText(e), [apiKey])}` };
   }
 }
 
@@ -1498,7 +1549,7 @@ async function probeGoogleAntigravity(deps: AdminDeps, probe: { name?: unknown; 
   const antigravity = Object.entries(deps.config().providers).filter(([, p]) => p.type === "google" && p.auth === "antigravity") as [string, { url?: string }][];
   const pin = (url: unknown): string => (typeof url === "string" ? url.trim().replace(/\/+$/, "") : "");
   const named = antigravity.find(([name]) => name === probe.name)?.[0] ?? antigravity.find(([, p]) => pin(p.url) === pin(probe.url))?.[0];
-  const models = named ? await deps.google?.().models?.(named).catch(() => null) ?? null : null;
+  const models = named ? await deps.google?.().models?.(named).catch((error: unknown) => { if (isEgressPolicyError(error)) throw error; return null; }) ?? null : null;
   return { ok: true, auth: "ok", models: models ?? staticAntigravityModels() };
 }
 
@@ -1511,9 +1562,10 @@ type GrokProbeResult = { ok: boolean; auth: ProbeAuth; models: ModelEntry[]; mod
  * test that presents another auth set certifies a path nobody uses (§5).
  */
 async function probeGrok(
-  body: { home?: unknown; cli?: unknown; url?: unknown; clientVersion?: unknown },
+  body: { name?: unknown; home?: unknown; cli?: unknown; url?: unknown; clientVersion?: unknown },
   log: Logger,
   probeFetch: (url: string, init: RequestInit) => Promise<Response> = fetchWithTimeout,
+  providers: Record<string, Provider> = {},
 ): Promise<GrokProbeResult> {
   const text = (value: unknown): string | undefined => typeof value === "string" && value ? value : undefined;
   const home = text(body.home) ?? grokHome();
@@ -1521,6 +1573,18 @@ async function probeGrok(
   const clientVersion = text(body.clientVersion);
   const fallback = (result: Omit<GrokProbeResult, "models" | "modelsSource" | "warning">): GrokProbeResult =>
     ({ ...result, models: GROK_FALLBACK_MODELS, modelsSource: "fallback", warning: GROK_WARNING });
+  const base = (text(body.url) ?? GROK_DEFAULT_URL).replace(/\/+$/, "");
+  let destination: URL;
+  try { destination = new URL(base); } catch { return fallback({ ok: false, auth: "unknown", error: "invalid Grok API base URL" }); }
+  if (!["https:", "http:"].includes(destination.protocol) || destination.username || destination.password || destination.search || destination.hash) {
+    return fallback({ ok: false, auth: "unknown", error: "invalid Grok API base URL" });
+  }
+  const saved = typeof body.name === "string" && Object.hasOwn(providers, body.name) ? providers[body.name] : undefined;
+  const savedDestination = saved?.type === "grok" && (saved.url ?? GROK_DEFAULT_URL).replace(/\/+$/, "") === base &&
+    (saved.home ?? grokHome()) === home && saved.cli === cli && saved.clientVersion === clientVersion;
+  if (destination.origin !== new URL(GROK_DEFAULT_URL).origin && !savedDestination) {
+    return fallback({ ok: false, auth: "missing", error: "a saved Grok provider with an unchanged endpoint and credential source is required for a custom endpoint" });
+  }
   const versionProblem = clientVersion ? headerValueProblem(clientVersion) : null;
   if (versionProblem) return fallback({ ok: false, auth: "unknown", error: `clientVersion cannot be sent as a header: ${versionProblem}` });
   // The adapter's own instance for this session, so a probe joins a refresh a turn started (and the
@@ -1530,25 +1594,27 @@ async function probeGrok(
   try {
     token = await auth.token();
   } catch (error) {
+    if (isEgressPolicyError(error)) throw error;
     return fallback({ ok: false, auth: "missing", error: errorText(error) });
   }
-  const base = (text(body.url) ?? GROK_DEFAULT_URL).replace(/\/+$/, "");
   const { "x-grok-model-override": _route, ...headers } = grokHeaders(token.key, "", await auth.clientVersion(clientVersion));
   let response: Response;
   try {
-    response = await probeFetch(`${base}/models`, { headers });
+    response = await probeFetch(`${base}/models`, { headers, redirect: "error" });
   } catch (error) {
+    if (isEgressPolicyError(error)) throw error;
     // fetch quotes a header value it refuses, which here is the session token.
     return fallback({ ok: false, auth: "unreachable", error: redactErrorText(errorText(error), [token.key]) });
   }
   if (response.status === 401 || response.status === 403) {
+    await response.body?.cancel().catch(() => {});
     return fallback({ ok: false, auth: "bad-key", error: `the proxy refused the Grok session (HTTP ${response.status}): ${GROK_AUTH_HINT}` });
   }
   if (!response.ok) {
-    const detail = redactErrorText(await response.text().catch(() => ""), [token.key]);
+    const detail = redactErrorText(await readProbeText(response).catch(() => ""), [token.key]);
     return fallback({ ok: false, auth: "unknown", error: `HTTP ${response.status}${detail ? `: ${detail.slice(0, 300)}` : ""}` });
   }
-  const models = grokModelsFromListing(await response.json().catch(() => null));
+  const models = grokModelsFromListing(await readProbeJson(response).catch(() => null));
   return models.length
     ? { ok: true, auth: "ok", models, modelsSource: "catalog", warning: GROK_WARNING }
     : fallback({ ok: true, auth: "ok" });
@@ -1589,10 +1655,6 @@ function parsedModels(value: unknown): ModelEntry[] {
   });
 }
 
-function snippet(text: string): string {
-  return text.replace(/\s+/g, " ").trim().slice(0, 200);
-}
-
 /**
  * Whether a refused test request was refused for its model alone, which still shows the endpoint is
  * right and the key was accepted. Anthropic's own wire says so with 404 not_found_error rather than
@@ -1629,7 +1691,31 @@ function withPresetOverrides(models: ModelEntry[], presetId: string | undefined)
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
-  return fetch(url, { ...init, signal: AbortSignal.timeout(8_000) });
+  const timeout = AbortSignal.timeout(8_000);
+  return egressFetch(url, { ...init, signal: init.signal ? AbortSignal.any([init.signal, timeout]) : timeout });
+}
+
+/**
+ * Origin approval permits a destination to receive its own credentials; it does not permit a
+ * preset or catalogue URL to move another provider's key there. Capture the credential's original
+ * base before deriving probe candidates, then check every attempt against that origin. Draft
+ * providers use the URL the operator entered, so custom compatible APIs remain supported.
+ */
+function credentialOriginFetch(
+  credentialBase: string,
+  transport: (url: string, init: RequestInit) => Promise<Response>,
+  config: () => Config,
+): (url: string, init: RequestInit) => Promise<Response> {
+  let origin: string | undefined;
+  try {
+    const base = new URL(credentialBase);
+    if (base.protocol === "https:" && !base.username && !base.password) origin = base.origin;
+  } catch { /* A malformed credential base is refused before transport in personal mode. */ }
+  return guardEgressFetch(transport, (url) => {
+    if (personalMode(config()) && (origin === undefined || url.origin !== origin)) {
+      throw new EgressPolicyError("destination");
+    }
+  });
 }
 
 /**
@@ -1653,16 +1739,18 @@ function presetProbeModel(presetId: string | undefined): string | undefined {
 
 async function probeProvider(body: ProbeRequest, probeFetch: (url: string, init: RequestInit) => Promise<Response> = fetchWithTimeout): Promise<{ ok: boolean; auth: ProbeAuth; models: ModelEntry[]; error?: string }> {
   const source = headerValue(body.headers);
+  const secrets = credentialHeaderValues(Object.entries(body.headers ?? {}));
   let models: ModelEntry[] = [];
   let modelsError: string | undefined;
   if (body.modelsUrl) {
     try {
-      const response = await probeFetch(body.modelsUrl, { headers: authHeaders(source, body.modelsAuthHeader) });
-      if (response.status === 401 || response.status === 403) return { ok: false, auth: "bad-key", models: [], error: `models endpoint returned ${response.status}` };
-      if (response.ok) models = withPresetOverrides(parsedModels(await response.json()), body.preset);
-      else modelsError = `models endpoint returned ${response.status}`;
+      const response = await probeFetch(body.modelsUrl, { headers: authHeaders(source, body.modelsAuthHeader), redirect: "error" });
+      if (response.status === 401 || response.status === 403) { await response.body?.cancel().catch(() => {}); return { ok: false, auth: "bad-key", models: [], error: `models endpoint returned ${response.status}` }; }
+      if (response.ok) models = withPresetOverrides(parsedModels(await readProbeJson(response)), body.preset);
+      else { await response.body?.cancel().catch(() => {}); modelsError = `models endpoint returned ${response.status}`; }
     } catch (e) {
-      modelsError = `models endpoint: ${errorText(e)}`;
+      if (isEgressPolicyError(e)) throw e;
+      modelsError = `models endpoint: ${redactErrorText(errorText(e), secrets)}`;
     }
   }
 
@@ -1696,6 +1784,7 @@ async function probeProvider(body: ProbeRequest, probeFetch: (url: string, init:
   try {
     const response = await probeFetch(checkUrl, {
       method: "POST",
+      redirect: "error",
       headers: {
         "content-type": "application/json",
         ...(body.sessionHeader ? { [body.sessionHeader]: `probe-${crypto.randomBytes(8).toString("hex")}` } : {}),
@@ -1704,7 +1793,7 @@ async function probeProvider(body: ProbeRequest, probeFetch: (url: string, init:
       body: JSON.stringify(checkBody),
     });
     if (response.status === 401 || response.status === 403) {
-      const refusal = snippet(await response.text());
+      const refusal = redactErrorText(await readProbeText(response), secrets);
       const auth: ProbeAuth = response.status === 403 && refusedByPlan(refusal) ? "not-entitled" : "bad-key";
       return { ok: false, auth, models, error: `${label} returned ${response.status}: ${refusal}` };
     }
@@ -1712,7 +1801,7 @@ async function probeProvider(body: ProbeRequest, probeFetch: (url: string, init:
       await response.body?.cancel().catch(() => {});
       return { ok: true, auth: "ok", models, ...(modelsError ? { error: modelsError } : {}) };
     }
-    const detail = snippet(await response.text());
+    const detail = redactErrorText(await readProbeText(response), secrets);
     // A model-validation refusal still demonstrates that the endpoint reached the provider and the key was accepted.
     if (refusedForModel(response.status, detail)) {
       return { ok: true, auth: "ok", models, ...(modelsError ? { error: modelsError } : {}) };
@@ -1723,7 +1812,8 @@ async function probeProvider(body: ProbeRequest, probeFetch: (url: string, init:
     }
     return { ok: false, auth: response.status >= 500 ? "unreachable" : "unknown", models, error: `${label} returned ${response.status}: ${detail}` };
   } catch (e) {
-    const message = `${label}: ${errorText(e)}`;
+    if (isEgressPolicyError(e)) throw e;
+    const message = `${label}: ${redactErrorText(errorText(e), secrets)}`;
     return { ok: false, auth: "unreachable", models, error: modelsError ? `${modelsError}; ${message}` : message };
   }
 }
@@ -1738,8 +1828,11 @@ async function probeProvider(body: ProbeRequest, probeFetch: (url: string, init:
  * the only source is a real request. A measurement sends several small ones, so it runs detached
  * and the caller polls the job instead of holding a request open for it.
  */
-type MeasureJob = { state: "running" | "done" | "failed"; done: number; total: number; results: Measured[]; error?: string; /** Epoch ms the job finished, for the TTL sweep. Internal: not part of the polled shape. */ finishedAt?: number };
+type MeasureJob = { state: "running" | "done" | "failed"; done: number; total: number; results: Measured[]; error?: string; /** Internal bookkeeping, never part of the polled shape. */ scope: string; finishedAt?: number };
 const MEASURE_JOBS = new Map<string, MeasureJob>();
+const MAX_MEASURE_MODELS = 1000;
+const MAX_RUNNING_MEASURE_JOBS = 8;
+const MAX_RETAINED_MEASURE_JOBS = 128;
 /** Measured capability does not change minute to minute, so a finished job is served for a while
  * and then dropped: a test or a GUI that polls late should re-measure rather than hold the result
  * (and its error strings) in memory for the life of the process. */
@@ -1749,7 +1842,8 @@ const MEASURE_TIMEOUT_MS = 20_000;
 const MEASURE_CONCURRENCY = 4;
 
 async function measureFetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
-  return fetch(url, { ...init, signal: AbortSignal.timeout(MEASURE_TIMEOUT_MS) });
+  const timeout = AbortSignal.timeout(MEASURE_TIMEOUT_MS);
+  return egressFetch(url, { ...init, signal: init.signal ? AbortSignal.any([init.signal, timeout]) : timeout });
 }
 
 /** Drop finished jobs past their TTL. Run on each measure request, so no timer keeps the process up. */
@@ -1865,39 +1959,54 @@ function ollamaBase(p: Provider): string | null {
  * edit is refused rather than written.
  */
 function applyMeasurements(configFile: string, providerName: string, results: Measured[], options: { replaceEmptyEffort?: boolean } = {}): { applied: number } | { error: string } {
-  let current: Config;
-  try {
-    current = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
-  } catch (e) {
-    return { error: `could not re-read config: ${errorText(e)}` };
-  }
-  const provider = current.providers[providerName];
-  if (!provider?.models) return { applied: 0 };
-  let applied = 0;
-  for (const result of results) {
-    if (result.error || !result.wire) continue;
-    const model = provider.models.find((entry) => entry.id === result.id);
-    if (!model) continue;
-    const before = `${model.wire ?? ""}|${model.effortLevels ? model.effortLevels.join(",") : "∅"}|${model.contextWindow ?? "∅"}`;
-    if (model.wire === undefined) model.wire = result.wire;
-    const blankEffort = model.effortLevels === undefined || (options.replaceEmptyEffort === true && model.effortLevels.length === 0);
-    if (blankEffort && result.effortLevels !== undefined) model.effortLevels = result.effortLevels;
-    if (model.contextWindow == null && result.contextWindow !== undefined) model.contextWindow = result.contextWindow;
-    if (`${model.wire ?? ""}|${model.effortLevels ? model.effortLevels.join(",") : "∅"}|${model.contextWindow ?? "∅"}` !== before) applied++;
-  }
-  const errors = validate(current);
-  if (errors.length > 0) return { error: `measured config did not validate: ${errors[0]}` };
-  writeConfigFile(configFile, current);
-  return { applied };
+  return withFileLock(configFile, () => {
+    let current: Config;
+    try {
+      current = JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config;
+    } catch {
+      return { error: "could not safely re-read config" };
+    }
+    const provider = current.providers[providerName];
+    if (!provider?.models) return { applied: 0 };
+    let applied = 0;
+    for (const result of results) {
+      if (result.error || !result.wire) continue;
+      const model = provider.models.find((entry) => entry.id === result.id);
+      if (!model) continue;
+      const before = `${model.wire ?? ""}|${model.effortLevels ? model.effortLevels.join(",") : "∅"}|${model.contextWindow ?? "∅"}`;
+      if (model.wire === undefined) model.wire = result.wire;
+      const blankEffort = model.effortLevels === undefined || (options.replaceEmptyEffort === true && model.effortLevels.length === 0);
+      if (blankEffort && result.effortLevels !== undefined) model.effortLevels = result.effortLevels;
+      if (model.contextWindow == null && result.contextWindow !== undefined) model.contextWindow = result.contextWindow;
+      if (`${model.wire ?? ""}|${model.effortLevels ? model.effortLevels.join(",") : "∅"}|${model.contextWindow ?? "∅"}` !== before) applied++;
+    }
+    const errors = validate(current);
+    if (errors.length > 0) return { error: "measured config did not validate" };
+    writeConfigFileLocked(configFile, current);
+    return { applied };
+  });
 }
 
 /** Register a measurement job and run it detached; returns the id a caller polls. */
-function startMeasureJob(providerName: string, models: string[], deps: AdminDeps): string {
+function startMeasureJob(providerName: string, models: string[], deps: AdminDeps): string | null {
   sweepMeasureJobs();
+  const scope = `${path.resolve(deps.configFile)}\0${providerName}`;
+  const running = [...MEASURE_JOBS.values()].filter(job => job.state === "running");
+  if (models.length < 1 || models.length > MAX_MEASURE_MODELS || running.length >= MAX_RUNNING_MEASURE_JOBS || running.some(job => job.scope === scope)) return null;
+  // Evict oldest completed entries before admitting another job. Running work is never dropped.
+  for (const [id, job] of MEASURE_JOBS) {
+    if (MEASURE_JOBS.size < MAX_RETAINED_MEASURE_JOBS) break;
+    if (job.state !== "running") MEASURE_JOBS.delete(id);
+  }
   const jobId = crypto.randomBytes(12).toString("hex");
-  MEASURE_JOBS.set(jobId, { state: "running", done: 0, total: models.length, results: [] });
+  MEASURE_JOBS.set(jobId, { state: "running", done: 0, total: models.length, results: [], scope });
   deps.log.info(`admin: measuring ${providerName} (${models.length} model(s)) -> ${jobId.slice(0, 8)}`);
-  void runMeasureJob(jobId, providerName, models, deps);
+  void runMeasureJob(jobId, providerName, models, deps).catch((error: unknown) => {
+    const job = MEASURE_JOBS.get(jobId);
+    const policy = isEgressPolicyError(error);
+    if (job) MEASURE_JOBS.set(jobId, { ...job, state: "failed", error: policy ? error.message : "measurement failed", finishedAt: Date.now() });
+    deps.log.warn(policy ? "admin: measurement refused by outbound security policy" : "admin: measurement failed unexpectedly");
+  });
   return jobId;
 }
 
@@ -1921,8 +2030,8 @@ export function measureUnsettledModels(deps: AdminDeps): number {
       .filter((model) => (undeclared && model.effortLevels === undefined) || (ollama && model.effortLevels !== undefined && model.effortLevels.length === 0))
       .map((model) => model.id);
     if (models.length === 0) continue;
-    startMeasureJob(name, models, deps);
-    started++;
+    if (startMeasureJob(name, models, deps)) started++;
+    else deps.log.warn(`admin: measurement for ${name} deferred: job capacity or model count limit; retry from the dashboard`);
   }
   return started;
 }
@@ -1945,35 +2054,37 @@ export async function backfillContextWindows(deps: AdminDeps): Promise<string[]>
     deps.log.warn("admin: context windows not backfilled: the catalogue could not be had");
     return [];
   }
-  let current: Config;
-  try {
-    current = JSON.parse(fs.readFileSync(deps.configFile, "utf8")) as Config;
-  } catch (e) {
-    deps.log.warn(`admin: context windows not backfilled: could not read config: ${errorText(e)}`);
-    return [];
-  }
-  const filled: string[] = [];
-  for (const [name, provider] of Object.entries(current.providers)) {
-    if (!("models" in provider) || !provider.models) continue;
-    const preset = "preset" in provider ? provider.preset : undefined;
-    for (const model of provider.models) {
-      // A saved `null` is as blank as a missing field (configs written by older dashboards carry it).
-      if (model.contextWindow != null) continue;
-      const stated = catalogEntry(catalog, preset, model.id)?.contextWindow ?? catalogueWindow(catalog, model.id);
-      if (stated === undefined) continue;
-      model.contextWindow = stated;
-      filled.push(`${name}/${model.id}`);
-      deps.log.info(`admin: ${name}/${model.id} context window ${stated} (catalogue)`);
+  return withFileLock(deps.configFile, () => {
+    let current: Config;
+    try {
+      current = JSON.parse(readPrivateFile(deps.configFile).toString("utf8")) as Config;
+    } catch {
+      deps.log.warn("admin: context windows not backfilled: could not safely read config");
+      return [];
     }
-  }
-  if (filled.length === 0) return [];
-  const errors = validate(current);
-  if (errors.length > 0) {
-    deps.log.warn(`admin: context windows not backfilled: config did not validate: ${errors[0]}`);
-    return [];
-  }
-  writeConfigFile(deps.configFile, current);
-  return filled;
+    const filled: string[] = [];
+    for (const [name, provider] of Object.entries(current.providers)) {
+      if (!("models" in provider) || !provider.models) continue;
+      const preset = "preset" in provider ? provider.preset : undefined;
+      for (const model of provider.models) {
+        // A saved `null` is as blank as a missing field (configs written by older dashboards carry it).
+        if (model.contextWindow != null) continue;
+        const stated = catalogEntry(catalog, preset, model.id)?.contextWindow ?? catalogueWindow(catalog, model.id);
+        if (stated === undefined) continue;
+        model.contextWindow = stated;
+        filled.push(`${name}/${model.id}`);
+        deps.log.info(`admin: ${name}/${model.id} context window ${stated} (catalogue)`);
+      }
+    }
+    if (filled.length === 0) return [];
+    const errors = validate(current);
+    if (errors.length > 0) {
+      deps.log.warn("admin: context windows not backfilled: config did not validate");
+      return [];
+    }
+    writeConfigFileLocked(deps.configFile, current);
+    return filled;
+  });
 }
 
 /**
@@ -1985,40 +2096,43 @@ export async function backfillContextWindows(deps: AdminDeps): Promise<string[]>
  * Returns the `provider/model` ids it declared.
  */
 export async function adoptNewClaudeModels(deps: AdminDeps): Promise<string[]> {
+  if (personalMode(deps.config())) return [];
   const live = await deps.claudeModels?.().catch(() => null);
-  if (!live?.length) return [];
+  if (!live?.length || personalMode(deps.config())) return [];
   const stateFile = path.join(homeDir(), "claude-models-offered.json");
   let offered = new Set<string>();
   try {
     const saved = JSON.parse(fs.readFileSync(stateFile, "utf8")) as { offered?: unknown };
     if (Array.isArray(saved.offered)) offered = new Set(saved.offered.filter((id): id is string => typeof id === "string"));
   } catch { /* first run: nothing offered yet */ }
-  let current: Config;
-  try {
-    current = JSON.parse(fs.readFileSync(deps.configFile, "utf8")) as Config;
-  } catch (e) {
-    deps.log.warn(`admin: claude models not adopted: could not read config: ${errorText(e)}`);
-    return [];
-  }
-  const added: string[] = [];
-  for (const [name, provider] of Object.entries(current.providers)) {
-    if (provider.type !== "anthropic" || !provider.models?.length) continue;
-    for (const model of newClaudeReleases(live, provider.models.map((entry) => entry.id), offered)) {
-      provider.models.push({ id: model.id, name: model.name ?? model.id });
-      added.push(`${name}/${model.id}`);
-    }
-  }
-  if (added.length) {
-    const errors = validate(current);
-    if (errors.length > 0) {
-      deps.log.warn(`admin: claude models not adopted: config did not validate: ${errors[0]}`);
+  return withFileLock(deps.configFile, () => {
+    let current: Config;
+    try {
+      current = JSON.parse(readPrivateFile(deps.configFile).toString("utf8")) as Config;
+    } catch {
+      deps.log.warn("admin: claude models not adopted: could not safely read config");
       return [];
     }
-    writeConfigFile(deps.configFile, current);
-    deps.log.info(`admin: declared new Claude model(s): ${added.join(", ")}`);
-  }
-  fs.writeFileSync(stateFile, JSON.stringify({ offered: [...new Set([...offered, ...live.map((model) => model.id)])].sort() }, null, 2) + "\n");
-  return added;
+    const added: string[] = [];
+    for (const [name, provider] of Object.entries(current.providers)) {
+      if (provider.type !== "anthropic" || !provider.models?.length) continue;
+      for (const model of newClaudeReleases(live, provider.models.map((entry) => entry.id), offered)) {
+        provider.models.push({ id: model.id, name: model.name ?? model.id });
+        added.push(`${name}/${model.id}`);
+      }
+    }
+    if (added.length) {
+      const errors = validate(current);
+      if (errors.length > 0) {
+        deps.log.warn("admin: claude models not adopted: config did not validate");
+        return [];
+      }
+      writeConfigFileLocked(deps.configFile, current);
+      deps.log.info(`admin: declared new Claude model(s): ${added.join(", ")}`);
+    }
+    writeJsonAtomic(stateFile, { offered: [...new Set([...offered, ...live.map((model) => model.id)])].sort() });
+    return added;
+  });
 }
 
 /** Run one provider measurement job to completion. Detached: the request that started it has already answered. */
@@ -2034,13 +2148,40 @@ async function runMeasureJob(jobId: string, providerName: string, models: string
   // No ladder from the provider, its preset or the config: find out per model whether it takes
   // effort at all (`discoverLadder`), rather than leave it stripped.
   const discover = effortUndeclared(provider);
-  const fetchImpl = deps.measureFetch ?? measureFetchWithTimeout;
   const headers = "headers" in provider ? provider.headers : undefined;
+  const secrets = [...Object.values(headers ?? {}), ...credentialHeaderValues(Object.entries(headers ?? {}))];
+  const upstreamFetch = credentialOriginFetch(provider.url, deps.measureFetch ?? measureFetchWithTimeout, () => deps.config());
+  const abort = new AbortController();
+  let policyFailure: Error | undefined;
+  // capabilities.ts takes short excerpts. Redact the full, bounded response FIRST, otherwise an
+  // excerpt cut halfway through a key no longer matches the known credential and exposes a prefix.
+  const fetchImpl = async (url: string, init: RequestInit): Promise<Response> => {
+    if (policyFailure) throw policyFailure;
+    try {
+      const signal = init.signal ? AbortSignal.any([init.signal, abort.signal]) : abort.signal;
+      const response = await upstreamFetch(url, { ...init, signal });
+      const text = await readProbeText(response, response.ok ? MAX_PROBE_JSON_BYTES : MAX_PROBE_ERROR_BYTES);
+      const body = response.ok ? text : redactErrorText(text, secrets, MAX_PROBE_ERROR_BYTES);
+      return new Response([204, 205, 304].includes(response.status) ? null : body, {
+        status: response.status,
+        headers: { "content-type": response.headers.get("content-type") ?? "text/plain" },
+      });
+    } catch (error) {
+      if (isEgressPolicyError(error)) {
+        policyFailure ??= error;
+        abort.abort(error);
+        throw error;
+      }
+      if (policyFailure) throw policyFailure;
+      throw new Error(redactErrorText(errorText(error), secrets));
+    }
+  };
   const sessionHeader = "sessionHeader" in provider ? provider.sessionHeader : undefined;
   const preset = "preset" in provider ? provider.preset : undefined;
   const ollama = ollamaBase(provider);
   const catalog = deps.modelCatalog ? await deps.modelCatalog().catch(() => undefined) : undefined;
   const measureOne = async (id: string): Promise<void> => {
+    if (policyFailure) throw policyFailure;
     const listed = catalogEntry(catalog, preset, id);
     // Per model, not once per job: the order depends on what the preset recorded for this id.
     const candidates = measureCandidates(provider, id, listed?.wire);
@@ -2053,6 +2194,8 @@ async function runMeasureJob(jobId: string, providerName: string, models: string
     // answers first, and the ladder probing it would only answer wrongly is skipped.
     const facts = ollama ? await ollamaModelFacts(ollama, id, { fetch: fetchImpl, ...(sessionHeader ? { sessionHeader } : {}), ...(headers ? { headers } : {}) }) : undefined;
     const measured = await measureModel(id, candidates, known || facts ? [] : ladder, { fetch: fetchImpl, ...(sessionHeader ? { sessionHeader } : {}), ...(headers ? { headers } : {}) }, { discover: discover && !known && !facts });
+    if (policyFailure) throw policyFailure;
+    if (measured.error) measured.error = redactErrorText(measured.error, secrets);
     if (stated && measured.wire) measured.effortLevels = stated;
     if (facts) {
       // An answer without levels is a model that takes no effort: a fact, not a blank.
@@ -2084,8 +2227,8 @@ async function runMeasureJob(jobId: string, providerName: string, models: string
     }
     deps.log.info(`admin: measurement for ${providerName} applied to ${outcome.applied} model(s)`);
     MEASURE_JOBS.set(jobId, { ...job, state: "done", finishedAt: Date.now() });
-  } catch (e) {
-    MEASURE_JOBS.set(jobId, { ...job, state: "failed", error: errorText(e), finishedAt: Date.now() });
+  } catch {
+    MEASURE_JOBS.set(jobId, { ...job, state: "failed", error: "could not save measured config", finishedAt: Date.now() });
   }
 }
 
@@ -2162,7 +2305,10 @@ function tailLines(file: string, n: number): string {
 }
 
 function safeStaticPath(urlPath: string): string | null {
-  const decoded = decodeURIComponent(urlPath.split("?")[0] ?? "/");
+  let decoded: string;
+  try { decoded = decodeURIComponent(urlPath.split("?")[0] ?? "/"); }
+  catch { return null; }
+  if (decoded.includes("\0")) return null;
   // Clients that ask for /favicon.ico without reading the page's <link rel="icon"> get the PNG;
   // browsers sniff the bytes, so a PNG served for .ico shows.
   const rel = decoded === "/" ? "index.html" : decoded === "/favicon.ico" ? "favicon-32.png" : decoded.replace(/^\/+/, "");
@@ -2209,37 +2355,101 @@ function serveStatic(urlPath: string, res: http.ServerResponse): void {
   });
 }
 
-export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): void }> {
-  // Standalone admin users share the same coordinator, but only the router entry starts scheduling.
-  const updater = deps.autoUpdater ?? new AutoUpdater({
-    home: homeDir(), version: deps.version, enabled: () => deps.config().autoUpdate !== false,
+export function startAdmin(deps: AdminDeps): Promise<{ port: number; tlsPort: number; close(): void }> {
+  deps = {
+    ...deps,
+    ...(deps.probeFetch ? { probeFetch: guardEgressFetch(deps.probeFetch) } : {}),
+    ...(deps.probeModelFetch ? { probeModelFetch: guardEgressFetch(deps.probeModelFetch) } : {}),
+    ...(deps.measureFetch ? { measureFetch: guardEgressFetch(deps.measureFetch) } : {}),
+  };
+  // The instance's configured home, not ambient user state (also keeps test fixtures isolated).
+  const adminHome = path.dirname(path.resolve(deps.configFile));
+  const adminToken = ensureAdminToken(adminHome);
+  const identity = ensureAdminTlsIdentity(adminHome);
+  const instanceId = crypto.randomBytes(16).toString("hex");
+  // Constructing a disabled coordinator can still reconcile and rewrite a legacy update journal.
+  // Personal Desktop never installs updates here, so do not create or read that coordinator.
+  const updater = personalMode(deps.config()) ? undefined : deps.autoUpdater ?? new AutoUpdater({
+    home: adminHome, version: deps.version, enabled: () => autoUpdateEnabled(deps.config()),
     activity: () => ({ inFlight: 0 }), log: deps.log,
     runCli: deps.runCli ?? runCli, startCliDetached: deps.startCliDetached ?? startCliDetached,
   });
-  deps = { ...deps, autoUpdater: updater };
+  if (updater) deps.autoUpdater = updater;
+  else delete deps.autoUpdater;
   // Every dataset the catalog loads or fetches also prices the requests from then on (prices.ts).
   const scores = new ModelScoreCatalog({ home: homeDir(), warn: message => deps.log.warn(message), onDataset: setAaPriceDataset, ...(deps.modelScoresFetch ? { fetch: deps.modelScoresFetch } : {}) });
-  // Set again once the socket is bound (port 0 in tests); the Origin check below compares against it.
-  let boundPort = adminPort(deps.config());
+  // The configured port stays liveness-only for older watchdogs. Privileged requests and the
+  // dashboard are exclusively on the TLS port published to this installation's private state.
+  let boundPublicPort = adminPort(deps.config());
+  let boundPort = 0;
   /** The dashboard's `awake setup` run in progress (or the last one), for GET /api/power/setup. */
   let powerSetup: { running: boolean; startedAt?: string; finishedAt?: string; ok?: boolean; output?: string } = { running: false };
-  const server = http.createServer((req, res) => {
+  const server = https.createServer({
+    key: identity.keyPem, cert: identity.certPem, minVersion: "TLSv1.2", handshakeTimeout: 10_000,
+    maxHeaderSize: 16 * 1024, headersTimeout: 10_000, requestTimeout: 30_000,
+    connectionsCheckingInterval: 1_000,
+  }, (req, res) => {
     void handle(req, res);
   });
+  // These are connection/request-upload bounds, not a response timeout: a legitimate image
+  // generation or model probe may keep its authenticated response open beyond thirty seconds.
+  server.maxConnections = 128;
+  server.keepAliveTimeout = 5_000;
+  server.maxRequestsPerSocket = 100;
+  const publicServer = http.createServer({
+    maxHeaderSize: 16 * 1024, headersTimeout: 10_000, requestTimeout: 30_000,
+    connectionsCheckingInterval: 1_000,
+  }, (req, res) => {
+    res.setHeader("cache-control", "no-store");
+    res.setHeader("x-content-type-options", "nosniff");
+    res.setHeader("content-security-policy", "default-src 'none'; frame-ancestors 'none'");
+    res.setHeader("referrer-policy", "no-referrer");
+    res.setHeader("connection", "close");
+    // Never parse request bodies, accept a capability, redirect, or serve JavaScript here.
+    req.resume();
+    const local = [`127.0.0.1:${boundPublicPort}`, `localhost:${boundPublicPort}`, `[::1]:${boundPublicPort}`].includes(req.headers.host ?? "");
+    if (ambiguousSecurityHeaders(req)) { sendJson(res, 400, { error: "duplicate security header" }); return; }
+    if (!local) { sendJson(res, 403, { error: "local admin host required" }); return; }
+    if (req.url === "/api/ping" && (req.method === "GET" || req.method === "HEAD")) {
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    sendJson(res, 410, { error: "administration requires the authenticated local TLS transport; update the client" });
+  });
+  publicServer.maxConnections = 128;
+  publicServer.keepAliveTimeout = 5_000;
+  publicServer.maxRequestsPerSocket = 100;
 
   /** Binding to loopback alone does not stop DNS rebinding: check Host even on reads. */
   function localHost(req: http.IncomingMessage): boolean {
     return [`127.0.0.1:${boundPort}`, `localhost:${boundPort}`, `[::1]:${boundPort}`].includes(req.headers.host ?? "");
   }
 
+  /** Node discards a second Host while intermediaries may choose it: reject that ambiguity. */
+  function ambiguousSecurityHeaders(req: http.IncomingMessage): boolean {
+    const seen = new Set<string>();
+    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+      const name = req.rawHeaders[i]!.toLowerCase();
+      if (name !== "host" && name !== "origin" && name !== ADMIN_TOKEN_HEADER && name !== ADMIN_INSTANCE_HEADER && name !== "sec-fetch-site") continue;
+      if (seen.has(name)) return true;
+      seen.add(name);
+    }
+    return false;
+  }
+
   /** Cross-site browser writes still act despite CORS. CLI and tray forwarding send no Origin. */
   function crossSiteOrigin(req: http.IncomingMessage): boolean {
     const origin = req.headers.origin;
     if (origin === undefined) return false;
-    return ![`http://127.0.0.1:${boundPort}`, `http://localhost:${boundPort}`, `http://[::1]:${boundPort}`].includes(origin);
+    return ![`https://127.0.0.1:${boundPort}`, `https://localhost:${boundPort}`, `https://[::1]:${boundPort}`].includes(origin);
   }
 
   async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    // Unlike a meta policy, an HTTP policy can prevent another page framing the dashboard.
+    res.setHeader("content-security-policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; frame-src 'none'; frame-ancestors 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'");
+    res.setHeader("x-content-type-options", "nosniff");
+    res.setHeader("referrer-policy", "no-referrer");
+    res.setHeader("x-frame-options", "DENY");
     const url = req.url ?? "/";
     // A HEAD is a GET whose body is discarded, and Node discards it for us: measured 2026-09-22,
     // the response goes out with its `content-length` and no bytes after the headers. Normalising
@@ -2248,6 +2458,10 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
     const method = req.method === "HEAD" ? "GET" : (req.method ?? "GET");
     const pathname = url.split("?")[0] ?? "/";
     try {
+      if (ambiguousSecurityHeaders(req)) {
+        sendJson(res, 400, { error: "duplicate security header" });
+        return;
+      }
       if (!localHost(req)) {
         deps.log.warn(`admin: refused ${method} ${pathname} with non-loopback Host`);
         sendJson(res, 403, { error: "local admin host required" });
@@ -2262,6 +2476,75 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
       // watchdog asks this every 15 s and restarts a router that stops answering (#159).
       if (pathname === "/api/ping" && method === "GET") {
         sendJson(res, 200, { ok: true });
+        return;
+      }
+      if (pathname.startsWith("/api/") || pathname === "/readyz") {
+        res.setHeader("cache-control", "no-store");
+        if (crossSiteOrigin(req) || req.headers["sec-fetch-site"] === "cross-site") {
+          sendJson(res, 403, { error: "cross-site request refused" });
+          return;
+        }
+        // The dedicated TLS leaf authenticates the installation; the private generation ID also
+        // rejects stale endpoint metadata if the OS later reuses this port for a newer instance.
+        if (req.headers[ADMIN_INSTANCE_HEADER] !== instanceId || !validAdminToken(req.headers[ADMIN_TOKEN_HEADER], adminToken)) {
+          sendJson(res, 401, { error: "local admin authentication required" });
+          return;
+        }
+      }
+      if (pathname === "/api/security-policy" && method === "GET") {
+        const cfg = deps.config();
+        const candidates = new Set<string>();
+        const add = (value: string | undefined): void => {
+          if (!value) return;
+          try { const origin = approvedOrigin(new URL(value).origin); if (origin) candidates.add(origin); } catch { /* invalid provider is not an approval */ }
+        };
+        add(`https://${cfg.upstream}`);
+        for (const provider of Object.values(cfg.providers)) {
+          if ("url" in provider) add(provider.url);
+          if (provider.type === "google" && provider.auth === "api-key") add(provider.url ?? "https://generativelanguage.googleapis.com");
+          if (provider.type === "chatgpt") add(provider.url ?? "https://chatgpt.com");
+          if (provider.type === "anthropic") add("https://api.anthropic.com");
+          for (const model of provider.models ?? []) add(model.url);
+        }
+        sendJson(res, 200, {
+          mode: "personal", approvedOrigins: cfg.security?.approvedOrigins ?? [],
+          candidates: [...candidates].sort(), crossProviderFallback: false,
+          bodyDebugDumps: false, remoteAccess: false, persistentDiagnostics: false,
+        });
+        return;
+      }
+      if (pathname === "/api/security-policy" && method === "POST") {
+        let action: unknown;
+        try { action = parseAdminJson((await readBody(req, 4096, new Error("security policy request too large"))).toString("utf8")); }
+        catch { sendJson(res, 400, { error: "invalid security policy request" }); return; }
+        if (!action || typeof action !== "object" || Array.isArray(action)) { sendJson(res, 400, { error: "expected security policy action" }); return; }
+        const request = action as Record<string, unknown>;
+        const origin = approvedOrigin(request.origin);
+        if (!origin || (request.action !== "approve" && request.action !== "revoke") ||
+            (request.action === "approve" && request.acknowledgeDataSharing !== true)) {
+          sendJson(res, 400, { error: "approve an exact HTTPS origin only after acknowledging credential and conversation sharing" }); return;
+        }
+        withFileLock(deps.configFile, () => {
+          const next = configSnapshot(deps).config;
+          const previous = next.security?.approvedOrigins ?? [];
+          const origins = request.action === "approve" ? [...new Set([...previous, origin])] : previous.filter(value => value !== origin);
+          if (origins.length > 32) throw new Error("too many approved origins");
+          next.security = { mode: "personal", approvedOrigins: origins };
+          next.autoUpdate = false;
+          writeConfigFileLocked(deps.configFile, next);
+        });
+        sendJson(res, 200, { ok: true, origin, action: request.action });
+        return;
+      }
+      // The personal fork has one job: Desktop's model picker with explicitly configured API
+      // keys. Hiding legacy controls in the UI does not remove their authenticated capabilities.
+      // Refuse these families before parsing a body, discovering accounts, or invoking a CLI.
+      if (personalMode(deps.config()) && (
+        /^\/api\/(?:update|power|remote|phone|mod|codex|settings-jobs)(?:\/|-|$)/.test(pathname) ||
+        /^\/api\/(?:compact-pick|agent-title|status-mod)(?:\/|$)/.test(pathname) ||
+        /^\/api\/(?:claude|chatgpt|google)-(?:login|logout|oauth|accounts)(?:\/|$)/.test(pathname)
+      )) {
+        sendJson(res, 403, { error: "this capability is disabled in the personal Desktop profile" });
         return;
       }
       if (pathname === "/api/settings-jobs" || pathname === "/api/settings-jobs/claim" || pathname === "/api/settings-jobs/result") {
@@ -2567,16 +2850,27 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         }
         let parsed: unknown;
         try {
-          parsed = JSON.parse(raw.toString("utf8"));
-        } catch {
-          sendJson(res, 400, { error: "invalid JSON" });
+          parsed = parseAdminJson(raw.toString("utf8"));
+        } catch (error) {
+          sendJson(res, 400, { error: (error as Error).message });
           return;
         }
         if (!parsed || typeof parsed !== "object") {
           sendJson(res, 400, { error: "expected provider probe object" });
           return;
         }
-        const probe = parsed as { type?: unknown; name?: unknown; auth?: unknown; apiKey?: unknown; url?: unknown; headers?: unknown; modelsUrl?: unknown; modelsAuthHeader?: unknown; probeModel?: unknown; sessionHeader?: unknown; preset?: unknown; wire?: unknown; home?: unknown; cli?: unknown; clientVersion?: unknown };
+        const requested = parsed as Record<string, unknown>;
+        if (personalMode(deps.config()) && (requested.type === "grok" ||
+            (requested.type === "anthropic" && requested.auth === "claude-code") ||
+            (requested.type === "google" && requested.auth === "antigravity"))) {
+          // Probes run before a provider is saved, so config validation cannot fence their
+          // credential reads or an external CLI refresh. Refuse before restoring any secrets.
+          sendJson(res, 403, { error: "Subscription-token reuse for this provider is disabled in personal mode; use a direct HTTPS API provider" });
+          return;
+        }
+        let probe: { type?: unknown; name?: unknown; auth?: unknown; apiKey?: unknown; url?: unknown; headers?: unknown; modelsUrl?: unknown; modelsAuthHeader?: unknown; probeModel?: unknown; sessionHeader?: unknown; preset?: unknown; wire?: unknown; home?: unknown; cli?: unknown; clientVersion?: unknown };
+        try { probe = restoreProbeSecrets(parsed as Record<string, unknown>, deps.config().providers); }
+        catch (error) { sendJson(res, 400, { error: (error as Error).message }); return; }
         if (probe.type === "anthropic") {
           if (probe.auth === "claude-code") {
             sendJson(res, 200, await probeClaudeCodeAuth(deps));
@@ -2613,7 +2907,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           return;
         }
         if (probe.type === "grok") {
-          sendJson(res, 200, await probeGrok(probe, deps.log, deps.probeFetch));
+          sendJson(res, 200, await probeGrok(probe, deps.log, deps.probeFetch, deps.config().providers));
           return;
         }
         if (probe.type === "google") {
@@ -2645,7 +2939,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           ...(typeof probe.preset === "string" && probe.preset ? { preset: probe.preset } : {}),
           ...(typeof probe.probeModel === "string" ? { probeModel: probe.probeModel } : {}),
           ...(probe.wire === "chat" || probe.wire === "responses" ? { wire: probe.wire } : {}),
-        }, deps.probeModelFetch ?? fetchWithTimeout);
+        }, credentialOriginFetch(probe.url, deps.probeModelFetch ?? fetchWithTimeout, () => deps.config()));
         // A provider being added gets the same blank-only fill as one already saved: Hive's `/models`
         // names its models and nothing else, and the form saves what the probe returns. A window the
         // vendor did report is kept, and one the catalogue cannot match is left blank.
@@ -2667,13 +2961,17 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
       if (pathname === "/api/providers/measure" && method === "POST") {
         let body: { provider?: unknown; models?: unknown };
         try {
-          body = JSON.parse((await readBody(req)).toString("utf8")) as { provider?: unknown; models?: unknown };
+          body = parseAdminJson((await readBody(req)).toString("utf8")) as { provider?: unknown; models?: unknown };
         } catch {
           sendJson(res, 400, { error: "invalid JSON" });
           return;
         }
-        if (typeof body.provider !== "string" || !Array.isArray(body.models) || body.models.some((m) => typeof m !== "string")) {
+        if (!body || typeof body !== "object" || typeof body.provider !== "string" || !Array.isArray(body.models) || body.models.some((m) => typeof m !== "string")) {
           sendJson(res, 400, { error: "expected {provider: string, models: string[]}" });
+          return;
+        }
+        if (body.models.length < 1 || body.models.length > MAX_MEASURE_MODELS || body.models.some(model => !model.trim() || model.length > 1000) || new Set(body.models).size !== body.models.length) {
+          sendJson(res, 400, { error: `expected 1-${MAX_MEASURE_MODELS} distinct model IDs, each at most 1000 characters` });
           return;
         }
         const provider = deps.config().providers[body.provider];
@@ -2682,6 +2980,11 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           return;
         }
         const jobId = startMeasureJob(body.provider, body.models as string[], deps);
+        if (!jobId) {
+          res.setHeader("retry-after", "5");
+          sendJson(res, 429, { error: "measurement capacity reached or this provider already has a running job; retry later" });
+          return;
+        }
         sendJson(res, 202, { jobId, total: body.models.length });
         return;
       }
@@ -2693,14 +2996,14 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           return;
         }
         // The polled shape, without the sweep's own bookkeeping field.
-        const { finishedAt: _finishedAt, ...view } = job;
+        const { finishedAt: _finishedAt, scope: _scope, ...view } = job;
         sendJson(res, 200, view);
         return;
       }
       if (pathname === "/api/config" && method === "GET") {
         res.setHeader("cache-control", "no-store");
-        const { configRevision } = configSnapshot(deps);
-        sendJson(res, 200, { ...deps.config(), configRevision });
+        const { config, configRevision } = configSnapshot(deps);
+        sendJson(res, 200, { ...redactConfigSecrets(config), configRevision });
         return;
       }
       if (pathname === "/api/config" && method === "PUT") {
@@ -2713,40 +3016,59 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         }
         let input: unknown;
         try {
-          input = JSON.parse(body.toString("utf8"));
-        } catch (e) {
-          sendJson(res, 400, { errors: [`invalid JSON: ${(e as Error).message}`] });
+          input = parseAdminJson(body.toString("utf8"));
+        } catch (error) {
+          // Modern JSON.parse errors quote the input, which may include a partial credential.
+          sendJson(res, 400, { errors: [(error as Error).message] });
           return;
         }
         if (!input || typeof input !== "object" || Array.isArray(input)) {
           sendJson(res, 400, { errors: ["config must be a JSON object"] });
           return;
         }
-        const { configRevision, ...parsed } = input as Config & { configRevision?: unknown };
+        const { configRevision, ...incoming } = input as Config & { configRevision?: unknown };
         if (configRevision !== undefined && (typeof configRevision !== "string" || !/^[a-f0-9]{64}$/.test(configRevision))) {
           sendJson(res, 400, { errors: ["configRevision must be a SHA-256 hex string"] });
           return;
         }
-        // No await between comparison and atomic rename: two admin windows cannot both win.
-        const current = configSnapshot(deps);
-        if (configRevision !== undefined && configRevision !== current.configRevision) {
-          sendJson(res, 409, { error: "config revision conflict", ...current });
-          return;
-        }
-        const errors = validate(parsed);
-        if (errors.length > 0) {
-          sendJson(res, 400, { errors });
-          return;
-        }
+        // Compare, restore placeholders and write under ONE cross-process lock. A CLI writer
+        // may finish while this handler waits for the lock, even without a JavaScript await.
+        const saved = withFileLock(deps.configFile, () => {
+          const current = configSnapshot(deps);
+          if (configRevision !== undefined && configRevision !== current.configRevision) {
+            return { status: 409 as const, body: { error: "config revision conflict", config: redactConfigSecrets(current.config), configRevision: current.configRevision } };
+          }
+          let parsed: Config;
+          try { parsed = restoreConfigSecrets(incoming, current.config); }
+          catch (error) { return { status: 400 as const, body: { errors: [(error as Error).message] } }; }
+          if (parsed.security?.approvedOrigins?.some(origin => !current.config.security?.approvedOrigins.includes(origin))) {
+            return { status: 403 as const, body: { errors: ["Approve new destinations through the security policy panel with explicit data-sharing acknowledgement"] } };
+          }
+          const errors = validate(parsed);
+          if (errors.length > 0) return { status: 400 as const, body: { errors } };
+          if (personalMode(current.config) || personalMode(parsed)) {
+            if ((parsed.picker?.enabled === true) !== (current.config.picker?.enabled === true)) {
+              return { status: 403 as const, body: { errors: ["Use the Desktop picker control to change activation; ordinary configuration saves do not change the app connection"] } };
+            }
+            const desktopErrors = personalDesktopProblems(parsed);
+            if (desktopErrors.length) return { status: 400 as const, body: { errors: desktopErrors } };
+          }
+          writeConfigFileLocked(deps.configFile, parsed);
+          return { status: 200 as const, parsed, configRevision: configSnapshot(deps).configRevision };
+        });
+        if (saved.status !== 200) { sendJson(res, saved.status, saved.body); return; }
+        const parsed = saved.parsed;
         if (configRevision === undefined) deps.log.warn("admin: accepting legacy PUT /api/config without configRevision; conflict protection unavailable");
-        writeConfigFile(deps.configFile, parsed);
         deps.log.info(`admin: config saved via GUI (${Object.keys(parsed.routes).length} routes, ${Object.keys(parsed.providers).length} providers)`);
         // `cli.models` cannot take effect through the router at all: Claude Code reads the slots
         // before a request exists. So a GUI save has to write them to settings.json itself;
         // otherwise the Clients screen shows a choice that only a later `install` would honour.
-        const slotWarning = syncModelSlotsForGui(parsed, deps.agentDir);
+        // Personal Desktop setup owns its connection only through explicit activation/recovery.
+        // Saving an API key or the additional-model checklist must never install a proxy, change
+        // native model slots, or rewrite the user's Claude settings as a hidden side effect.
+        const slotWarning = personalMode(parsed) ? null : syncModelSlotsForGui(parsed, deps.agentDir);
         const warnings = [...(slotWarning ? [slotWarning] : []), ...targetWarnings(parsed)];
-        sendJson(res, 200, { ok: true, configRevision: configSnapshot(deps).configRevision, ...(warnings.length ? { warning: warnings.join("\n") } : {}) });
+        sendJson(res, 200, { ok: true, configRevision: saved.configRevision, ...(warnings.length ? { warning: warnings.join("\n") } : {}) });
         return;
       }
       if (pathname === "/api/codex" && method === "GET") {
@@ -3054,6 +3376,8 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           sendJson(res, 400, { error: "invalid JSON" });
           return;
         }
+        claudeAuthStore(deps).authorize();
+        deps.claudeLocalAuthorization?.(true);
         const session = new ClaudeOAuthSession({ home: homeDir(), manual, ...(replaceId ? { replaceId } : {}), ...(deps.claudeOAuthFetch ? { fetch: deps.claudeOAuthFetch } : {}) });
         claudeOAuth = session;
         const { url, manual: needsCode } = await session.start();
@@ -3095,12 +3419,17 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         return;
       }
       if (pathname === "/api/claude-login" && method === "POST") {
+        claudeAuthStore(deps).authorize();
+        deps.claudeLocalAuthorization?.(true);
         const r = await (deps.runCli ?? runCli)(["claude-login"], 200_000);
         deps.log.info(`admin: claude-login via GUI -> ${r.ok ? "ok" : "failed"}`);
         sendJson(res, r.ok ? 200 : 500, { ok: r.ok, output: r.output });
         return;
       }
       if (pathname === "/api/claude-logout" && method === "POST") {
+        claudeOAuth?.revokeLocalAuthorization();
+        claudeAuthStore(deps).revoke();
+        deps.claudeLocalAuthorization?.(false);
         const r = await (deps.runCli ?? runCli)(["claude-logout"]);
         deps.log.info(`admin: claude-logout via GUI -> ${r.ok ? "ok" : "failed"}`);
         if (r.ok) deps.agentsChanged?.();
@@ -3115,6 +3444,10 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         return;
       }
       if (pathname === "/api/google-login" && method === "POST") {
+        if (personalMode(deps.config())) {
+          sendJson(res, 403, { error: "Google subscription sign-in is disabled in personal mode; use the Google API-key provider" });
+          return;
+        }
         if (googleOAuth?.snapshot.running) {
           sendJson(res, 200, googleOAuth.snapshot);
           return;
@@ -3141,6 +3474,10 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         return;
       }
       if (pathname === "/api/google-login/code" && method === "POST") {
+        if (personalMode(deps.config())) {
+          sendJson(res, 403, { error: "Google subscription sign-in is disabled in personal mode; use the Google API-key provider" });
+          return;
+        }
         const session = googleOAuth;
         if (!session?.snapshot.running) {
           sendJson(res, 409, { error: "no Google sign-in is waiting for a code" });
@@ -3257,12 +3594,17 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           sendJson(res, 400, { error: "expected {enabled: boolean}" });
           return;
         }
-        const r = await runCli(["picker", enabled ? "on" : "off"]);
+        const r = await (deps.runCli ?? runCli)(["picker", enabled ? "on" : "off"]);
         deps.log.info(`admin: picker ${enabled ? "on" : "off"} via GUI -> ${r.ok ? "ok" : "failed"}`);
-        sendJson(res, r.ok ? 200 : 500, { ok: r.ok, output: r.output });
+        const output = redactErrorText(r.output, [], 8192);
+        sendJson(res, r.ok ? 200 : 500, { ok: r.ok, output, ...(r.ok ? {} : { error: output || "Desktop picker activation failed" }) });
         return;
       }
       if (pathname === "/api/update" && (method === "GET" || method === "POST")) {
+        if (method === "POST" && personalMode(deps.config())) {
+          sendJson(res, 403, { error: "Executable updates are disabled in personal mode; review and verify a new fork checkout explicitly" });
+          return;
+        }
         // The CLI answers both: it knows how this copy was installed, which decides what an update is
         // (the tray asks it the same way). A POST checks again rather than trusting the page.
         const r = await (deps.runCli ?? runCli)(["update", "--check", "--json"], 30_000);
@@ -3271,10 +3613,14 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
           sendJson(res, 502, { error: "could not check for updates", output: r.output.slice(-2000) });
           return;
         }
-        updater.observe(check);
-        const running = updater.running();
+        updater?.observe(check);
+        const running = updater?.running() ?? false;
         if (method === "GET") {
           sendJson(res, 200, { ...check, running });
+          return;
+        }
+        if (!updater) {
+          sendJson(res, 403, { error: "Executable updates are unavailable in this personal runtime" });
           return;
         }
         if (check.kind !== "script" && check.kind !== "npm") {
@@ -3413,7 +3759,7 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
         const requested = Number(new URL(url, "http://x").searchParams.get("n") ?? 200);
         const n = Number.isFinite(requested) ? Math.min(2000, Math.max(1, Math.floor(requested))) : 200;
         const file = path.join(homeDir(), "logs", "router.log");
-        const text = tailLines(file, n);
+        const text = deps.log.memoryTail(n) ?? tailLines(file, n);
         res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
         res.end(text);
         return;
@@ -3424,29 +3770,54 @@ export function startAdmin(deps: AdminDeps): Promise<{ port: number; close(): vo
       }
       sendJson(res, 404, { error: "not found" });
     } catch (e) {
+      if (isEgressPolicyError(e) && !res.headersSent) {
+        sendJson(res, 403, { error: (e as Error).message });
+        return;
+      }
       if (e instanceof ModSettingsInputError && !res.headersSent) {
         sendJson(res, e.status, { error: e.message });
         return;
       }
-      deps.log.error(`admin error: ${(e as Error).stack ?? e}`);
-      if (!res.headersSent) sendJson(res, 500, { error: (e as Error).message });
+      // Dependencies and JSON parsers can quote credential files in their error message/stack.
+      // Unexpected failures use fixed diagnostics; expected input errors are handled above.
+      deps.log.error("admin: unexpected request failure");
+      if (!res.headersSent) sendJson(res, 500, { error: "internal admin error" });
       else res.destroy();
     }
   }
 
-  const port = boundPort;
-  return new Promise((resolveP, reject) => {
-    server.once("error", reject);
-    server.listen(port, "127.0.0.1", () => {
-      server.off("error", reject);
-      const addr = server.address();
-      boundPort = addr && typeof addr === "object" ? addr.port : port;
-      resolveP({
-        port: boundPort,
-        close(): void {
-          server.close();
-        },
-      });
+  const listen = (listener: http.Server | https.Server, port: number): Promise<number> => new Promise((resolveP, reject) => {
+    listener.once("error", reject);
+    listener.listen(port, "127.0.0.1", () => {
+      listener.off("error", reject);
+      const addr = listener.address();
+      resolveP(addr && typeof addr === "object" ? addr.port : port);
     });
   });
+  return (async () => {
+    try {
+      boundPublicPort = await listen(publicServer, boundPublicPort);
+      boundPort = await listen(server, 0);
+      writeAdminEndpoint(adminHome, { version: 1, instanceId, publicPort: boundPublicPort, tlsPort: boundPort });
+      let closed = false;
+      return {
+        port: boundPublicPort,
+        tlsPort: boundPort,
+        close(): void {
+          if (closed) return;
+          closed = true;
+          publicServer.close();
+          server.close();
+          try { removeAdminEndpoint(adminHome, instanceId); }
+          catch { deps.log.warn("admin: could not retire private endpoint state"); }
+        },
+      };
+    } catch (error) {
+      publicServer.closeAllConnections();
+      server.closeAllConnections();
+      if (publicServer.listening) publicServer.close();
+      if (server.listening) server.close();
+      throw error;
+    }
+  })();
 }

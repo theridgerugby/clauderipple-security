@@ -8,6 +8,10 @@ import type { Activity } from "./awake.ts";
 
 const MINUTE = 60_000;
 export const UPDATE_TIMING = { first: 10 * MINUTE, interval: 12 * 60 * MINUTE, jitter: 30 * MINUTE, idle: 10 * MINUTE, poll: 5 * MINUTE, backoff: 24 * 60 * MINUTE };
+/** Availability checks stay automatic; installing executable code requires an explicit opt-in. */
+export function autoUpdateEnabled(config: { autoUpdate?: boolean }): boolean {
+  return config.autoUpdate === true;
+}
 type Attempt = { from: string; to: string; at: number; pid?: number };
 type Saved = {
   available?: string;

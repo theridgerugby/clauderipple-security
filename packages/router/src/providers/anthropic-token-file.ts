@@ -5,6 +5,8 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { readPrivateFile } from "../private-file.ts";
+import { migrateSecretFile, writeSecretJsonAtomic } from "../locked-file.ts";
 
 export type ClaudeAuthFile =
   | { token: string; createdAt: string; source: "setup-token" }
@@ -23,7 +25,8 @@ export function claudeAuthPath(home: string): string {
 
 export function readClaudeAuthFile(home: string): ClaudeAuthFile | null {
   try {
-    const raw = JSON.parse(fs.readFileSync(claudeAuthPath(home), "utf8")) as Partial<ClaudeAuthFile> & { refreshToken?: unknown; expiresAt?: unknown };
+    migrateSecretFile(claudeAuthPath(home));
+    const raw = JSON.parse(readPrivateFile(claudeAuthPath(home)).toString("utf8")) as Partial<ClaudeAuthFile> & { refreshToken?: unknown; expiresAt?: unknown };
     if (typeof raw.token !== "string" || raw.token.length === 0 || typeof raw.createdAt !== "string") return null;
     if (raw.source === "setup-token") return { token: raw.token, createdAt: raw.createdAt, source: "setup-token" };
     if (raw.source === "oauth" && typeof raw.refreshToken === "string" && raw.refreshToken.length > 0 && typeof raw.expiresAt === "number" && Number.isFinite(raw.expiresAt)) {
@@ -36,10 +39,7 @@ export function readClaudeAuthFile(home: string): ClaudeAuthFile | null {
 }
 
 function writeClaudeAuthFile(home: string, value: ClaudeAuthFile): void {
-  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
-  const file = claudeAuthPath(home);
-  fs.writeFileSync(file, JSON.stringify(value) + "\n", { mode: 0o600 });
-  fs.chmodSync(file, 0o600);
+  writeSecretJsonAtomic(claudeAuthPath(home), value);
 }
 
 export function saveClaudeAuthFile(home: string, token: string, createdAt = new Date().toISOString()): void {

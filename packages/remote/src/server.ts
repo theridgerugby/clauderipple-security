@@ -1,12 +1,11 @@
-// One HTTP server: the PWA's files, and one WebSocket that carries everything else. Keeping all
-// traffic on the socket is the relay seam: a relay later forwards this one stream (encrypted)
-// and nothing about the app changes.
+// HTTP serves only public assets/liveness. Phone control enters through an authenticated,
+// decrypted RelayHost peer; direct public WebSocket upgrades are deliberately unavailable.
 import fs from "node:fs";
 import http from "node:http";
 import module from "node:module";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { WebSocketServer } from "ws";
+import type { Socket } from "node:net";
 import { tokenMatches } from "./config.ts";
 import { clientEvent, clientFeatures, settingsResponse } from "./client-compat.ts";
 import { chunkFrames } from "./chunks.ts";
@@ -74,15 +73,18 @@ export interface ServerOptions {
   log?: (line: string) => void;
   push?: Pick<Notifier, "subscribe" | "unsubscribe"> & { publicKey: string };
   expoPush?: { subscribe(clientId: string, token: string, lang: "ko" | "en", platform?: "ios" | "android", key?: string): void; unsubscribe(clientId: string): void };
-  local?: { handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> };
+  local?: { listen(publicPort: number): Promise<void>; close(): Promise<void> };
+  /** Runs only after this process owns every public/compatibility listener, before publishing
+   * authenticated control or accepting relay peers. Failure closes the acquired listeners. */
+  beforeLocalControl?: () => void | Promise<void>;
   pushDevices?: () => string[];
   clearPush?: () => void;
   now?: () => number;
 }
 
 /**
- * A phone connection: a `ws` socket on the direct path, or a decrypted channel through the relay
- * (relay.ts). Both carry the same JSON frames, so everything below is the same for either.
+ * A phone connection after the relay's authenticated encryption boundary (relay.ts).
+ * Protocol/state-machine tests may supply an in-memory peer; public HTTP cannot create one.
  */
 export interface Peer {
   readonly readyState: number;
@@ -117,7 +119,6 @@ interface Client {
 export class HostServer {
   private opts: ServerOptions;
   private http: http.Server;
-  private wss: WebSocketServer;
   private clients = new Set<Client>();
   private localHttp: http.Server | null = null;
   private refreshing = false;
@@ -169,6 +170,7 @@ export class HostServer {
    * attached). Push goes out only when nobody looked in the last SEEN_MS (Paseo's
    * agent-attention-policy PRESENCE_THRESHOLD_MS, 180 s). */
   private seenAt = new Map<string, number>();
+  private readonly httpSockets = new Set<Socket>();
 
   constructor(opts: ServerOptions) {
     this.opts = opts;
@@ -177,19 +179,26 @@ export class HostServer {
     this.hostInfo = { name: opts.hostName, version: opts.version, routerOk: true, queue: true,
       capabilities: { sessionFiles: true, folderFiles: true, diffScope: true, slowHeartbeat: true, ...(canWriteAuto ? { effortAuto: true } : {}) },
       ...(desktopProblem ? { desktopProblem } : {}) };
-    this.http = http.createServer((req, res) => this.serve(req, res));
-    this.wss = new WebSocketServer({ noServer: true, maxPayload: FRAME_CAP });
-    this.http.on("upgrade", (req, socket, head) => {
-      if (new URL(req.url ?? "/", "http://x").pathname !== "/ws" || !this.sameOrigin(req)) { socket.destroy(); return; }
-      this.wss.handleUpgrade(req, socket, head, (ws) => this.connected(ws));
-    });
+    this.http = http.createServer({ maxHeaderSize: 16 * 1024, connectionsCheckingInterval: 1000 }, (req, res) => this.serve(req, res));
+    this.configurePublicServer(this.http);
   }
 
-  /** A page on another origin in this machine's browser must not drive the socket, token or not. */
-  private sameOrigin(req: http.IncomingMessage): boolean {
-    const origin = req.headers.origin;
-    if (!origin) return true;
-    try { return new URL(origin).host === req.headers.host; } catch { return false; }
+  private configurePublicServer(server: http.Server): void {
+    server.headersTimeout = 10_000;
+    server.requestTimeout = 15_000;
+    server.keepAliveTimeout = 1000;
+    server.maxConnections = 128;
+    server.on("connection", socket => {
+      this.httpSockets.add(socket);
+      socket.once("close", () => this.httpSockets.delete(socket));
+    });
+    server.on("upgrade", (_req, socket) => {
+      // Refuse before a WebSocket can open and send its hello capability. Origin/Host headers
+      // cannot turn plaintext HTTP into an authenticated host, even on loopback or Tailscale.
+      socket.on("error", () => {});
+      socket.once("finish", () => socket.destroy());
+      socket.end("HTTP/1.1 410 Gone\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    });
   }
 
   /** True while a connected phone reported the app visible within its own window: then nobody needs a push. */
@@ -260,15 +269,17 @@ export class HostServer {
       });
     });
     // A specific LAN/Tailscale/IPv6 bind does not receive 127.0.0.1 traffic. Keep its public
-    // interface unchanged and add only a loopback control listener on the same port.
+    // interface unchanged and add only a local legacy refusal listener on the same port.
     if (this.opts.local && this.opts.listen !== "127.0.0.1" && this.opts.listen !== "localhost" && this.opts.listen !== "0.0.0.0" && this.opts.listen !== "::") {
-      const local = http.createServer((req, res) => {
+      const local = http.createServer({ maxHeaderSize: 16 * 1024, connectionsCheckingInterval: 1000 }, (req, res) => {
+        this.closePublicResponse(res);
         try {
           const pathname = new URL(req.url ?? "/", "http://local").pathname;
           if (!pathname.startsWith("/local/")) { res.writeHead(404).end(); return; }
         } catch { res.writeHead(400).end(); return; }
         this.serve(req, res);
       });
+      this.configurePublicServer(local);
       this.localHttp = local;
       try {
         await new Promise<void>((resolve, reject) => {
@@ -277,6 +288,11 @@ export class HostServer {
         });
       } catch (error) { await this.close(); throw error; }
     }
+    try {
+      await this.opts.beforeLocalControl?.();
+      await this.opts.local?.listen(this.address().port);
+    }
+    catch (error) { await this.close(); throw error; }
   }
 
   close(): Promise<void> {
@@ -291,8 +307,17 @@ export class HostServer {
     }
     for (const c of this.clients) { c.attached.clear(); c.ws.terminate(); }
     this.syncWatches();
-    return Promise.all([this.http, this.localHttp].filter((server): server is http.Server => server !== null)
-      .map(server => new Promise<void>(resolve => server.close(() => resolve())))).then(() => {});
+    const deadline = setTimeout(() => {
+      this.http.closeAllConnections();
+      this.localHttp?.closeAllConnections();
+      for (const socket of this.httpSockets) socket.destroy();
+    }, 250);
+    deadline.unref();
+    return Promise.all([
+      ...[this.http, this.localHttp].filter((server): server is http.Server => server !== null)
+        .map(server => new Promise<void>(resolve => { server.close(() => resolve()); server.closeIdleConnections(); })),
+      this.opts.local?.close(),
+    ]).then(() => {}).finally(() => clearTimeout(deadline));
   }
 
   address(): { port: number } { return this.http.address() as { port: number }; }
@@ -449,7 +474,7 @@ export class HostServer {
 
   // ---- sockets --------------------------------------------------------------------------------
 
-  /** A phone connected, directly or through the relay; it must say hello with the token within 10 s. */
+  /** An authenticated relay peer must still say hello with the current phone token within 10 s. */
   connected(ws: Peer): void {
     const c: Client = { ws, authed: false, clientId: "", visibleAt: 0, lastRx: Date.now(), attached: new Map(), pumping: new Set(), pendingTail: new Set(), retries: new Map(), batches: new Map(), sessionsRetry: null, features: new Set() };
     this.clients.add(c);
@@ -814,6 +839,7 @@ export class HostServer {
 
   /** Never throws: a malformed path is a 400, anything else unexpected a logged 500. */
   private serve(req: http.IncomingMessage, res: http.ServerResponse): void {
+    this.closePublicResponse(res);
     try {
       this.serveInner(req, res);
     } catch (error) {
@@ -822,15 +848,18 @@ export class HostServer {
     }
   }
 
+  private closePublicResponse(res: http.ServerResponse): void {
+    if (res.getHeader("connection") === "close") return;
+    const socket = res.socket;
+    res.setHeader("connection", "close");
+    res.once("finish", () => socket?.destroySoon());
+  }
+
   private serveInner(req: http.IncomingMessage, res: http.ServerResponse): void {
     const url = new URL(req.url ?? "/", "http://x");
     if (url.pathname.startsWith("/local/")) {
-      if (!this.opts.local) { res.writeHead(404).end(); return; }
-      void this.opts.local.handle(req, res).catch(() => {
-        // Never log a local request, body or exception: pairing responses contain credentials.
-        if (!res.headersSent) res.writeHead(500).end();
-        else res.destroy();
-      });
+      res.writeHead(410, { "content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff" });
+      res.end('{"error":"host local control requires the updated pinned TLS client"}');
       return;
     }
     if (url.pathname === "/healthz") { res.writeHead(200, { "content-type": "application/json" }).end(`{"ok":true}`); return; }

@@ -4,6 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { desktopUiGuardSource } from "./ui-native-fixture.ts";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULTS, validate, type Config } from "../src/config.ts";
@@ -108,6 +109,7 @@ function loadSave(stored: Record<string, unknown> = { providers }) {
   };
   const save = new Function("h", `
     let currentConfig = JSON.parse(JSON.stringify(h.stored));
+    ${desktopUiGuardSource(source)}
     const clone = (value) => JSON.parse(JSON.stringify(value)), t = (key) => key, toast = () => {};
     const routeFromTarget = (value) => { if (!value) return null; const [provider, model] = JSON.parse(value); return { provider, model }; };
     const $ = (selector) => {

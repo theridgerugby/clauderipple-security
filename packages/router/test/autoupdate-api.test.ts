@@ -3,13 +3,13 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { startAdmin } from "../src/admin.ts";
-import { AutoUpdater, type AutoUpdateStatus } from "../src/autoupdate.ts";
+import { startAdmin, fetch } from "./admin-client.ts";
+import { AutoUpdater, autoUpdateEnabled, type AutoUpdateStatus } from "../src/autoupdate.ts";
 import { ConfigStore, DEFAULTS, type Config } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
 import { RequestLog } from "../src/requestlog.ts";
 
-test("status, hot config and manual POST share the router's automatic-update coordinator", async (t) => {
+test("personal update routes refuse registry discovery and executable updates without changing configuration", async (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-auto-api-"));
   const oldHome = process.env.CLAUDERIPPLE_HOME;
   const oldSettings = process.env.CLAUDE_SETTINGS_PATH;
@@ -25,12 +25,15 @@ test("status, hot config and manual POST share the router's automatic-update coo
   const store = new ConfigStore(configFile);
   const log = new Logger(null, 1_000_000, 1, false);
   const check = { current: "1.0.0", latest: "1.1.0", newer: true, kind: "npm" };
-  let launches = 0;
-  const runCli = async () => ({ ok: true, output: JSON.stringify(check) });
-  const updater = new AutoUpdater({ home, version: "1.0.0", enabled: () => store.get().autoUpdate !== false,
+  let launches = 0, discoveries = 0, coordinatorCalls = 0;
+  const runCli = async () => { discoveries++; return { ok: true, output: JSON.stringify(check) }; };
+  const updater = new AutoUpdater({ home, version: "1.0.0", enabled: () => autoUpdateEnabled(store.get()),
     activity: () => ({ inFlight: 0 }), log, runCli,
     startCliDetached: () => { launches++; }, alive: () => false,
   });
+  for (const method of ["observe", "running", "install", "status"] as const) {
+    t.mock.method(updater, method, () => { coordinatorCalls++; throw new Error("personal admin must not consult an updater"); });
+  }
   const admin = await startAdmin({ config: () => store.get(), configFile, log,
     stats: () => ({ inFlight: 0, messagesInFlight: 0, started: 0, completed: 0, failed: 0 }),
     health: () => 0, version: "1.0.0", requests: new RequestLog(path.join(home, "requests.jsonl")), runCli, autoUpdater: updater,
@@ -38,20 +41,28 @@ test("status, hot config and manual POST share the router's automatic-update coo
   try {
     const url = `http://127.0.0.1:${admin.port}`;
     const status = async () => ((await (await fetch(`${url}/api/status`)).json()) as { autoUpdate: AutoUpdateStatus }).autoUpdate;
-    assert.equal((await status()).enabled, true);
+    assert.equal((await status()).enabled, false);
     const config = (await (await fetch(`${url}/api/config`)).json()) as Config;
-    const put = await fetch(`${url}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...config, autoUpdate: false }) });
+    const optIn = await fetch(`${url}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...config, autoUpdate: true }) });
+    assert.equal(optIn.status, 400); assert.equal((await status()).enabled, false);
+    const updatedConfig = (await (await fetch(`${url}/api/config`)).json()) as Config;
+    const put = await fetch(`${url}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...updatedConfig, autoUpdate: false }) });
     assert.equal(put.status, 200); assert.equal((await status()).enabled, false);
-    await fetch(`${url}/api/update`);
-    assert.equal((await status()).available, "1.1.0");
-    // Manual updates remain available with autoUpdate off, but concurrent launches are serialized.
-    const requests = await Promise.all([fetch(`${url}/api/update`, { method: "POST" }), fetch(`${url}/api/update`, { method: "POST" })]);
-    assert.deepEqual(requests.map((r) => r.status).sort(), [202, 409]);
-    assert.equal(launches, 1); assert.equal((await status()).running, true);
-    assert.throws(() => updater.install(check), /already running/);
+    const beforeUpdateRequests = fs.readFileSync(configFile);
+    // The complete update surface is unavailable, including read-only registry discovery.
+    const requests = await Promise.all([fetch(`${url}/api/update`), fetch(`${url}/api/update`, { method: "POST" }), fetch(`${url}/api/update`, { method: "POST" })]);
+    assert.deepEqual(requests.map((r) => r.status), [403, 403, 403]);
+    for (const response of requests) assert.match(await response.text(), /disabled in the personal Desktop profile/i);
+    assert.equal(discoveries, 0);
+    assert.equal(launches, 0);
+    assert.equal(coordinatorCalls, 0);
+    assert.deepEqual(fs.readFileSync(configFile), beforeUpdateRequests);
+    assert.equal(fs.existsSync(path.join(home, "auto-update.json")), false);
+    assert.equal((await status()).available, undefined);
+    assert.equal((await status()).running, false);
     assert.equal((await status()).lastUpdatedFrom, undefined, "intent is not a completion notice");
     const successor = new AutoUpdater({ home, version: "1.1.0", enabled: () => false, activity: () => ({ inFlight: 0 }), log, runCli, startCliDetached: () => assert.fail("must not launch") });
-    assert.equal(successor.status().lastUpdatedFrom, "1.0.0");
-    assert.equal(successor.status().lastUpdatedTo, "1.1.0");
+    assert.equal(successor.status().lastUpdatedFrom, undefined);
+    assert.equal(successor.status().lastUpdatedTo, undefined);
   } finally { admin.close(); }
 });

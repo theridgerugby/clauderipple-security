@@ -13,7 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { ConfigStore, adminPort, type Config } from "../../router/src/config.ts";
 import { certPaths } from "./certs.ts";
-import { classifyMode, cliProxyState, desktopProxyState, fetchRouterStatus, proxyUrlFor, repair, type Mode, type RecoveryDeps } from "./doctor.ts";
+import { classifyMode, cliProxyState, desktopProxyState, fetchRouterStatus, proxyUrlFor, repair, sameRecoveryDestination, type Mode, type RecoveryDeps } from "./doctor.ts";
 import { writeJsonAtomic } from "../../router/src/locked-file.ts";
 import { claimedElsewhere, claimsOf, readOwners } from "./owners.ts";
 import type { DesktopServiceDeps } from "./desktop-service.ts";
@@ -137,7 +137,16 @@ export function directOn(home: string, desktopService: DesktopServiceDeps = {}):
       const state: DirectState = { at: previous?.at ?? new Date().toISOString(), cli: { ...removedCli, ...(previous?.cli ?? {}) }, desktop: previous?.desktop ?? desktop };
       fs.mkdirSync(home, { recursive: true });
       writeJsonAtomic(directStatePath(home), state);
-      if (desktop) removeAppProxy(proxyUrl, home);
+      if (desktop) {
+        if (!removeAppProxy(proxyUrl, home)) throw new Error("Desktop proxy ownership changed during recovery; the restoration snapshot was retained");
+        // Removal can preserve native edits made while enabled in a fresh unowned entry.
+        // Remember the actual restoration target rather than the original, inactive entry.
+        const appliedAfter = currentAppProxy().appliedId ?? null;
+        if (state.desktop && state.desktop.appliedAfter !== appliedAfter) {
+          if (JSON.stringify(readState(home)) !== JSON.stringify(state)) throw new Error("Direct restoration snapshot changed during Desktop recovery; review it before resuming");
+          writeJsonAtomic(directStatePath(home), { ...state, desktop: { ...state.desktop, appliedAfter } });
+        }
+      }
     }
     return Object.keys(removedCli).length > 0;
   });
@@ -178,23 +187,33 @@ export async function directOff(deps: RecoveryDeps, opts: { force?: boolean } = 
   const ap = currentAppProxy();
   const desktopChanged = ap.appliedId !== (saved?.desktop?.appliedAfter ?? ap.appliedId);
   if (!opts.force && desktopUrl && ap.egressProxyUrl && ap.egressProxyUrl !== desktopUrl && (desktopChanged || !saved)) {
-    return fail(`Claude Desktop now uses another proxy (${ap.egressProxyUrl}); left everything as it is. Run \`clauderipple direct off --force\` to replace it.`);
+    return fail("Claude Desktop now uses another proxy; existing settings and recovery information were preserved. Review the connection conflict and keep the original connection until it is resolved.");
   }
 
   const notes: string[] = [];
-  if ((await (deps.routerStatus ?? fetchRouterStatus)(`http://127.0.0.1:${adminPort(cfg)}`, 4_000)) === null) {
+  const readStatus = deps.routerStatus ?? ((url: string, ms: number) => fetchRouterStatus(url, ms, deps.home));
+  const adminUrl = `http://127.0.0.1:${adminPort(cfg)}`;
+  let status = await readStatus(adminUrl, 4_000);
+  if (status === null) {
     const fixed = await repair(deps);
-    if (!fixed.doctor.router.responding) {
+    if (!fixed.ok || !fixed.doctor.router.responding || !fixed.doctor.router.runtimeVerified) {
       const failed = fixed.steps.filter((s) => !s.ok).map((s) => `${s.name}: ${s.detail}`).join("; ");
       return fail(`the router is not answering even after a repair (${failed || "no step failed, it just did not come up"}), so Claude stays on its default connection.`);
     }
     notes.push("The router was not answering; repaired it first.");
+    // repair's final diagnostic may await other checks. Do not reuse its earlier proof at this
+    // separate restoration boundary, even if the same version still answers the port.
+    status = await readStatus(adminUrl, 4_000);
+  }
+  if (!status?.runtimeVerified || status.version !== deps.version) {
+    return fail("The router's current source/runtime could not be verified. Claude stays on its default connection; run install from the reviewed checkout before direct off.");
   }
 
   const restoredKeys: string[] = [];
   let desktopApplied = false;
   const edit = editSettingsEnv((current) => {
     // Recheck after the asynchronous health/repair boundary, under the shared settings lock.
+    if (!sameRecoveryDestination(cfg, config(home))) throw new Error("router destination changed while waiting; left untouched");
     if (JSON.stringify(readState(home)) !== JSON.stringify(saved)) throw new Error("direct snapshot changed while waiting; left untouched");
     const record = readOwners(settingsPath());
     if (record.error) throw new Error(record.error);

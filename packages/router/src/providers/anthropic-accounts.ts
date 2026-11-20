@@ -8,7 +8,8 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { withFileLock, writeJsonAtomic } from "../locked-file.ts";
+import { migrateSecretFile, withAccountFileLock, writeSecretJsonAtomic } from "../locked-file.ts";
+import { readPrivateFile } from "../private-file.ts";
 import { readClaudeAuthFile, removeClaudeAuthFile } from "./anthropic-token-file.ts";
 
 export type ClaudeOAuthAccountGrant = {
@@ -45,7 +46,8 @@ export type ClaudeOAuthAccount = {
 type ClaudeAccountsFile = { version: 1; accounts: ClaudeOAuthAccount[] };
 
 function withAccountLock<T>(home: string, mutate: () => T): T {
-  return withFileLock(claudeAccountsPath(home), mutate);
+  migrateSecretFile(claudeAccountsPath(home));
+  return withAccountFileLock(claudeAccountsPath(home), mutate);
 }
 
 export type ClaudeAccountSummary = {
@@ -99,7 +101,7 @@ function validAccount(value: unknown): value is ClaudeOAuthAccount {
 
 function parseClaudeAccountsFile(home: string): ClaudeOAuthAccount[] | null {
   try {
-    const parsed = JSON.parse(fs.readFileSync(claudeAccountsPath(home), "utf8")) as Partial<ClaudeAccountsFile>;
+    const parsed = JSON.parse(readPrivateFile(claudeAccountsPath(home)).toString("utf8")) as Partial<ClaudeAccountsFile>;
     if (parsed.version !== 1 || !Array.isArray(parsed.accounts) || !parsed.accounts.every(validAccount)) return null;
     const seen = new Set<string>();
     return parsed.accounts.filter((account) => !seen.has(account.id) && seen.add(account.id)).map((account) => ({ ...account }));
@@ -110,7 +112,8 @@ function parseClaudeAccountsFile(home: string): ClaudeOAuthAccount[] | null {
 
 /** Read only the multi-account file. Malformed secret storage fails closed as an empty pool. */
 export function readClaudeAccountsFile(home: string): ClaudeOAuthAccount[] {
-  return parseClaudeAccountsFile(home) ?? [];
+  try { migrateSecretFile(claudeAccountsPath(home)); return parseClaudeAccountsFile(home) ?? []; }
+  catch { return []; }
 }
 
 /**
@@ -138,6 +141,7 @@ function withLegacyOAuthAccount(home: string, accounts: ClaudeOAuthAccount[]): C
 }
 
 export function readClaudeOAuthAccounts(home: string): ClaudeOAuthAccount[] {
+  try { migrateSecretFile(claudeAccountsPath(home)); } catch { return []; }
   const accounts = parseClaudeAccountsFile(home);
   if (accounts === null) return [];
   // Once a valid pool file exists it is the single source of truth. A retained legacy file (for
@@ -157,7 +161,7 @@ export function legacyMigrationDurable(directoryDurable: boolean, platform = pro
 }
 
 function writeClaudeAccountsFile(home: string, accounts: ClaudeOAuthAccount[]): void {
-  const { directoryDurable } = writeJsonAtomic(claudeAccountsPath(home), { version: 1, accounts } satisfies ClaudeAccountsFile);
+  const { directoryDurable } = writeSecretJsonAtomic(claudeAccountsPath(home), { version: 1, accounts } satisfies ClaudeAccountsFile);
   // POSIX keeps the legacy refresh token unless the directory entry is durable; Windows has no
   // directory fsync, so the flushed file + rename is its durability boundary and must complete
   // migration rather than resurrect a removed legacy account.

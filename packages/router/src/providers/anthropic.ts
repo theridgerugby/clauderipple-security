@@ -3,6 +3,7 @@
 // logs a token because refresh-token rotation would invalidate Claude Code's own credential.
 
 import { execFileSync } from "node:child_process";
+import { isEgressPolicyError } from "../egress.ts";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -10,6 +11,7 @@ import path from "node:path";
 import type { AnthropicProvider } from "../config.ts";
 import { type ObservedClaudeCodeAuth, type ObservedClaudeCodeAuthSnapshot } from "./anthropic-observed.ts";
 import { readClaudeAuthFile, saveClaudeOAuthFile } from "./anthropic-token-file.ts";
+import { authorizeClaudeLocalAuth, readClaudeLocalAuthState, revokeClaudeLocalAuth, withClaudeLocalAuthAuthorization } from "./anthropic-local-auth.ts";
 import { claudeCliUserAgent, claudeCliVersion, type ClaudeCliVersionSources } from "./claude-cli-version.ts";
 import { CLAUDE_OAUTH, refreshClaudeOAuth, type FetchLike } from "./claude-oauth.ts";
 
@@ -146,6 +148,9 @@ export class ClaudeCodeAuthStore {
   private readonly fetchImpl: FetchLike | undefined;
   private readonly log: (line: string) => void;
   private refreshing: Promise<void> | null = null;
+  private generation = 0;
+  private consentGeneration: string | undefined;
+  private locallyRevoked = false;
 
   constructor(credentials: ClaudeCodeCredentialStore | undefined = undefined, options: ClaudeCodeAuthOptions = {}) {
     this.credentials = credentials ?? new ClaudeCodeCredentialStore(options.credentialReaders, options.now);
@@ -158,6 +163,12 @@ export class ClaudeCodeAuthStore {
   }
 
   get(): ClaudeCodeAuth | Error {
+    if (this.isRevoked()) return new Error("Claude login reuse is disabled locally; explicitly reconnect to authorize it");
+    const auth = this.getAuthorized();
+    return this.isRevoked() ? new Error("Claude login reuse is disabled locally; explicitly reconnect to authorize it") : auth;
+  }
+
+  private getAuthorized(): ClaudeCodeAuth | Error {
     const observed = this.observed?.getFresh(this.now());
     if (observed) return { source: "observed", observed };
     const environment = this.env.CLAUDE_CODE_OAUTH_TOKEN?.trim();
@@ -180,18 +191,29 @@ export class ClaudeCodeAuthStore {
    * get() reports the expiry once it arrives.
    */
   refreshIfNeeded(): Promise<void> {
+    if (this.isRevoked()) return Promise.resolve();
     if (this.refreshing) return this.refreshing;
     // Higher-precedence sources make the file irrelevant; do not touch the network for it.
     if (this.observed?.getFresh(this.now()) || this.env.CLAUDE_CODE_OAUTH_TOKEN?.trim() || !(this.credentials.get() instanceof Error)) return Promise.resolve();
     const tokenFile = readClaudeAuthFile(this.home);
     if (tokenFile?.source !== "oauth" || this.now() < tokenFile.expiresAt - CLAUDE_OAUTH.refreshLeadMs) return Promise.resolve();
+    if (this.isRevoked()) return Promise.resolve();
+    const generation = this.generation;
+    const consentGeneration = this.consentGeneration;
     this.refreshing = refreshClaudeOAuth(tokenFile.refreshToken, { ...(this.fetchImpl ? { fetch: this.fetchImpl } : {}), now: this.now })
       .then(
         (grant) => {
-          saveClaudeOAuthFile(this.home, grant, tokenFile.createdAt);
-          this.log(`claude oauth: access token refreshed, valid until ${new Date(grant.expiresAt).toISOString()}`);
+          if (generation !== this.generation || this.isRevoked()) return;
+          withClaudeLocalAuthAuthorization(this.home, () => {
+            if (generation !== this.generation || this.isRevoked()) return;
+            const current = readClaudeAuthFile(this.home);
+            if (current?.source !== "oauth" || current.refreshToken !== tokenFile.refreshToken || current.token !== tokenFile.token) return;
+            saveClaudeOAuthFile(this.home, grant, tokenFile.createdAt);
+            this.log(`claude oauth: access token refreshed, valid until ${new Date(grant.expiresAt).toISOString()}`);
+          }, consentGeneration);
         },
         (error: Error) => {
+          if (isEgressPolicyError(error)) throw error;
           this.log(`claude oauth: refresh failed: ${error.message}`);
         },
       )
@@ -206,11 +228,43 @@ export class ClaudeCodeAuthStore {
    * tests validity using the same precedence as get(), and does not refresh anything.
    */
   describeSource(): ClaudeCodeAuthSource | null {
+    if (this.isRevoked()) return null;
     if (this.observed?.getFresh(this.now())) return "observed";
     if (this.env.CLAUDE_CODE_OAUTH_TOKEN?.trim()) return "env";
     const stored = this.credentials.describeSource();
     if (stored) return stored;
     return readClaudeAuthFile(this.home) ? "token-file" : null;
+  }
+
+  isRevoked(): boolean {
+    let revoked: boolean;
+    try {
+      const state = readClaudeLocalAuthState(this.home);
+      if (this.consentGeneration !== undefined && this.consentGeneration !== state.generation) { this.credentials.invalidate(); this.generation++; }
+      this.consentGeneration = state.generation;
+      revoked = this.locallyRevoked || !state.allowed || this.observed?.isRevoked() === true;
+    } catch { revoked = true; }
+    if (revoked) this.credentials.invalidate();
+    return revoked;
+  }
+
+  /** Clear cached borrowed authority and prevent an in-flight old refresh from checkpointing. */
+  revoke(): void {
+    this.locallyRevoked = true;
+    this.generation++;
+    this.credentials.invalidate();
+    try { this.observed?.revoke(); } finally { revokeClaudeLocalAuth(this.home); }
+    this.locallyRevoked = false;
+  }
+
+  /** A deliberate local reconnect; automatic observed traffic never calls this. */
+  authorize(): void {
+    this.locallyRevoked = true;
+    this.generation++;
+    this.credentials.invalidate();
+    authorizeClaudeLocalAuth(this.home);
+    this.observed?.authorize();
+    this.locallyRevoked = false;
   }
 
   /** CLI version of the last recent observation, so fallback headers can name it (issue #103). */

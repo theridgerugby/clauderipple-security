@@ -5,6 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { assertNativeAdminFetch, nativeDashboardWindow, nativeAdminBridge, desktopUiGuardSource } from "./ui-native-fixture.ts";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -130,6 +131,8 @@ test("domain editors copy, edit and remove only the selected set's rule; new mod
   };
   const cell = (_label: unknown, controls: Node | Node[], help: unknown) => el('cell', { help }, Array.isArray(controls) ? controls : [controls]);
   const build = new Function('el', 'cell', `
+    const currentConfig = {};
+    ${desktopUiGuardSource(source)}
     const t = key => key, clone = value => JSON.parse(JSON.stringify(value));
     const MOD_EFFORTS = ['low','medium','high','xhigh','max'];
     ${block('const MOD_CLAUDE_MODELS', '// `base` is the router')}
@@ -739,6 +742,8 @@ async function pickerWindowHarness(
   const h = { config, catalogWindows, windows, requests: [] as string[], box: new SaveNode('div'), card: new SaveNode('div'), rows: new SaveNode('div') };
   const ui = new Function('h', 'el', `
     let currentConfig, pickerContextWindows = {catalogWindows:{}}, clientsLoaded, status = {};
+    ${desktopUiGuardSource(dashboardSource)}
+    const applyDesktopUiProfile = () => {};
     let pickerModelsDrawnFor = { key: null }, modelSlotsDrawnFor = { key: null }, pickerSavesOpen = 0;
     const pickerWindowDrafts = new Map();
     const document = { activeElement: null };
@@ -953,6 +958,7 @@ function slotsSaveHarness(config: SavedConfig, rows: SlotItem[], put = async (_n
   const ui = new Function('h', `
     const clone = value => JSON.parse(JSON.stringify(value));
     let currentConfig = h.config, slotsLoaded = true;
+    ${desktopUiGuardSource(dashboardSource)}
     const $all = () => h.rows.map(item => ({_get: () => clone(item)}));
     const $ = () => ({classList:{toggle(){}},textContent:''}), t = key => key, updateSlotSummary = () => {};
     const clearTimeout = () => {}, setTimeout = () => 1, effortLevelsFor = () => ['low','high'];
@@ -999,6 +1005,8 @@ test('a mode conflict retries only that mode, preserving another window\'s edit,
   const base = { modes: [{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }, { id: 'deleted', name: 'Delete' }] };
   const h = { state: { base, settings: { modes: [{ id: 'a', name: 'Local A' }, { id: 'b', name: 'B' }, { id: 'new', name: 'New' }] }, revision: 1 }, writes: [] as { settings: typeof base; revision: number }[] };
   await new Function('h', `
+    const currentConfig = {};
+    ${desktopUiGuardSource(dashboardSource)}
     const clone = value => JSON.parse(JSON.stringify(value));
     const modState = h.state, modNormalize = clone;
     let modSaving = false, modSaveAgain = false, modSaveTimer = null, modWrites = 0;
@@ -1025,19 +1033,21 @@ test('config revision conflicts re-read and reapply only this save; legacy route
     fresh.providers.q = { type: 'openai-compatible', models: [{ id: 'remote' }] };
     fresh.cli.extraModels.push({ model: 'remote', name: 'Remote' });
     const h = { original, fresh, reads: 0, writes: [] as SavedConfig[] };
-    const saved = await new Function('h', `
+    const saved = await new Function('h', 'window', 'assertNativeAdminFetch', 'nativeAdminBridge', `
       const clone = value => JSON.parse(JSON.stringify(value)); let currentConfig;
       const toast = () => {};
       const fetch = async (url, options) => {
+        assertNativeAdminFetch(url, options);
         if (!options || options.method !== 'PUT') { h.reads++; return {ok:true,text:async()=>JSON.stringify(h.reads === 1 ? h.original : h.fresh)}; }
         const next = JSON.parse(options.body); h.writes.push(next);
         if (h.original.configRevision && h.writes.length === 1) return {ok:false,status:409,text:async()=>JSON.stringify({error:'conflict',config:h.fresh})};
         return {ok:true,text:async()=>JSON.stringify(h.original.configRevision ? {configRevision:'revision-3'} : {ok:true})};
       };
+      const APP = { ...window.rippleApp, adminRequest: nativeAdminBridge(fetch) };
       ${mergeBlock}
       ${dashboardBlock('const configSnapshots =', 'function modelsOf(')}
       return (async () => { const next = clone(await latestConfig()); next.autoUpdate = false; next.cli.extraModels[0].name = 'Local one'; next.providers.p.models[0].name = 'Local model'; await configRequest(next); return next; })();
-    `)(h) as SavedConfig;
+    `)(h, nativeDashboardWindow(), assertNativeAdminFetch, nativeAdminBridge) as SavedConfig;
     assert.equal(saved.autoUpdate, false);
     assert.equal(h.writes.length, versioned ? 2 : 1);
     if (versioned) {
@@ -1059,10 +1069,11 @@ function pickerSaveHarness(config: SavedConfig) {
     server: { config: { ...structuredClone(config), configRevision: 'r1' }, revision: 1 } as PickerServer,
     writes: [] as SavedConfig[], errors: [] as string[], selections: [] as string[],
   };
-  const ui = new Function('h', `
+  const ui = new Function('h', 'window', 'assertNativeAdminFetch', 'nativeAdminBridge', `
     const clone = value => JSON.parse(JSON.stringify(value)); let currentConfig;
     const toast = (message, error) => { if (error) h.errors.push(message); };
     const fetch = async (url, options) => {
+      assertNativeAdminFetch(url, options);
       const s = h.server;
       if (url !== '/api/config') return { ok: true, text: async () => '{}' };
       if (!options || options.method !== 'PUT') return { ok: true, text: async () => JSON.stringify(s.config) };
@@ -1078,6 +1089,7 @@ function pickerSaveHarness(config: SavedConfig) {
       return { ok: true, text: async () => JSON.stringify({ configRevision: s.config.configRevision }) };
     };
     ${mergeBlock}
+    const APP = { ...window.rippleApp, adminRequest: nativeAdminBridge(fetch) };
     ${dashboardBlock('const configSnapshots =', 'function modelsOf(')}
     const groupedModels = config => Object.entries(config.providers).map(([name, p]) => ({ name, models: p.models || [] }));
     ${dashboardBlock('function allKnownModelIds(', 'function updateSlotSummary(')}
@@ -1086,7 +1098,7 @@ function pickerSaveHarness(config: SavedConfig) {
     const clientPickerSelections = () => h.selections.map(id => ({ id, name: id, provider: 'p' }));
     ${dashboardBlock('// One picker save at a time', 'function pickerModeOn(')}
     return { save: changed => saveClientPickerModels(changed), load: latestConfig, pend: ids => { pickerOrderPending = ids; }, pending: () => pickerOrderPending };
-  `)(h) as { save(selectionsChanged?: boolean): Promise<void>; load(): Promise<unknown>; pend(ids: string[]): void; pending(): string[] | null };
+  `)(h, nativeDashboardWindow(), assertNativeAdminFetch, nativeAdminBridge) as { save(selectionsChanged?: boolean): Promise<void>; load(): Promise<unknown>; pend(ids: string[]): void; pending(): string[] | null };
   return { h, ...ui };
 }
 function threeModels(): SavedConfig {

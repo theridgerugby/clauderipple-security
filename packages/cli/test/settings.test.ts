@@ -61,6 +61,22 @@ test("applyProxyEnv adds keys, backs up, preserves other settings; remove restor
   assert.deepEqual(after.env, { FOO: "1" });
 });
 
+test("same-second setup and recovery preserve separate original settings backups", t => {
+  t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-11-19T12:00:00.000Z") });
+  const file = process.env.CLAUDE_SETTINGS_PATH!;
+  const original = JSON.stringify({ model: "opus", env: { KEEP: "before" } });
+  fs.writeFileSync(file, original);
+  const opts = { proxyUrl: "http://127.0.0.1:8790", caPath: path.join(dir, "ca.pem"), force: false };
+  const added = applyProxyEnv(opts);
+  const connected = fs.readFileSync(file, "utf8");
+  const removed = removeProxyEnv(opts);
+  assert.ok(added.backup && removed.backup);
+  assert.notEqual(added.backup, removed.backup);
+  assert.equal(fs.readFileSync(added.backup, "utf8"), original);
+  assert.equal(fs.readFileSync(removed.backup, "utf8"), connected);
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).model, "opus");
+});
+
 // `install` writes settings.json only after the probe passes, so the foreign-proxy refusal has to
 // come first on its own: otherwise it would surface only after the supervisor was registered.
 test("checkProxyEnv refuses a foreign proxy up front and writes nothing", () => {

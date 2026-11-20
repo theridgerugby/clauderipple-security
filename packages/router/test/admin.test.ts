@@ -1,13 +1,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { readPrivateFile } from "../src/private-file.ts";
 import http from "node:http";
-import net from "node:net";
+import https from "node:https";
+import tls from "node:tls";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, type Config, type ProviderModel } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
-import { backfillContextWindows, effortLevelsForModel, googleHealth, measureUnsettledModels, parseUpdateCheck, startAdmin, type AdminDeps, type LimitsProvider } from "../src/admin.ts";
+import { backfillContextWindows, effortLevelsForModel, googleHealth, measureUnsettledModels, parseUpdateCheck, type AdminDeps, type LimitsProvider } from "../src/admin.ts";
+import { chatPickerModels, injectPickerModels } from "../src/picker.ts";
+import { startAdmin, fetch, adminTestTlsOptions, adminTestAuthHeaders } from "./admin-client.ts";
 import type { ImageRequest } from "../src/providers/chatgpt/index.ts";
 import type { GoogleAccountStatus } from "../src/providers/google/index.ts";
 import type { QuotaGroup } from "../src/providers/google/usage.ts";
@@ -307,15 +311,15 @@ test("PUT /api/config persists credential control flags and refuses invalid or d
   await withAdmin(cfg, async ({ port, configFile }) => {
     const put = (value: unknown) => fetch(`${base()}:${port}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(value) });
     assert.equal((await put(cfg)).status, 200);
-    const saved = fs.readFileSync(configFile, "utf8");
-    assert.deepEqual((JSON.parse(saved) as Config).providers, cfg.providers);
+    const saved = fs.readFileSync(configFile);
+    assert.deepEqual((JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers, cfg.providers);
     for (const credentials of [
       [{ id: "a", headers: {}, preferred: "yes" }],
       [{ id: "a", headers: {}, paused: 1 }],
       [{ id: "a", headers: {}, preferred: true }, { id: "b", headers: {}, preferred: true }],
     ]) {
       assert.equal((await put({ ...cfg, providers: { p: { type: "openai-compatible", url: "http://127.0.0.1:1", credentials } } })).status, 400);
-      assert.equal(fs.readFileSync(configFile, "utf8"), saved, "invalid edits leave the stored config unchanged");
+      assert.deepEqual(fs.readFileSync(configFile), saved, "invalid edits leave the stored config unchanged");
     }
   });
 });
@@ -961,10 +965,10 @@ test("admin config saves isolate client settings and restore the caller environm
 });
 
 /** fetch()/undici normalize %2e-encoded dot segments client-side before sending; use a raw
- * http.request (path passed through untouched) to actually exercise the server's own guard. */
+ * https.request (path passed through untouched) to actually exercise the server's own guard. */
 function rawGet(port: number, rawPath: string): Promise<{ status: number; body: string }> {
   return new Promise((resolveP, reject) => {
-    const req = http.request({ host: "127.0.0.1", port, path: rawPath, method: "GET" }, (res) => {
+    const req = https.request({ ...adminTestTlsOptions(`${base()}:${port}`), path: rawPath, method: "GET" }, (res) => {
       const chunks: Buffer[] = [];
       res.on("data", (c: Buffer) => chunks.push(c));
       res.on("end", () => resolveP({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
@@ -1280,6 +1284,7 @@ test("a config that failed validation is reported as a problem, with its errors"
     assert.deepEqual(status.config.errors, errors);
     const ready = await fetch(`${base()}:${port}/readyz`);
     assert.equal(ready.status, 503);
+    await ready.arrayBuffer();
   }, { configErrors: () => errors });
 });
 
@@ -1308,22 +1313,45 @@ test("GET /api/status returns a snapshot", async () => {
 // itself dead — while the CSRF check above it had been written to expect HEAD all along.
 test("HEAD answers a read-only route with its headers and no body", async () => {
   await withAdmin(makeCfg(), async ({ port }) => {
+    // Use the native pinned HTTPS client for both methods. Mixing a paused Undici GET
+    // body with a separate HEAD socket can trip Undici's parser on Windows connection close.
+    const requestNative = (method: "GET" | "HEAD", route: string): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer }> =>
+      new Promise((resolve, reject) => {
+        const options = adminTestTlsOptions(`${base()}:${port}`);
+        const request = https.request({ ...options, method, path: route,
+          headers: adminTestAuthHeaders(`${base()}:${port}`) }, response => {
+          const chunks: Buffer[] = [];
+          response.on("data", chunk => chunks.push(Buffer.from(chunk)));
+          response.on("end", () => resolve({ status: response.statusCode ?? 0,
+            headers: response.headers, body: Buffer.concat(chunks) }));
+          response.on("error", reject);
+        });
+        request.on("error", reject);
+        request.end();
+      });
     // The contract is that a HEAD answers exactly as the GET does, whatever that answer is:
     // `/readyz` is a 503 until the proxy reports ready, and a HEAD has to say the same thing.
     for (const route of ["/readyz", "/api/status", "/style.css", "/"]) {
-      const get = await fetch(`${base()}:${port}${route}`);
-      const head = await fetch(`${base()}:${port}${route}`, { method: "HEAD" });
+      const get = await requestNative("GET", route);
+      const head = await requestNative("HEAD", route);
       assert.notEqual(head.status, 404, `HEAD ${route} must reach its route`);
       assert.equal(head.status, get.status, `HEAD ${route} answers as the GET does`);
+      assert.equal(head.body.byteLength, 0);
     }
     // A static file is the same bytes on both calls, so its stated length can be compared exactly;
     // `/api/status` carries live counters and would differ between two reads.
-    const [getCss, headCss] = [await fetch(`${base()}:${port}/style.css`), await fetch(`${base()}:${port}/style.css`, { method: "HEAD" })];
-    assert.ok(Number(getCss.headers.get("content-length")) > 0);
-    assert.equal(headCss.headers.get("content-length"), getCss.headers.get("content-length"), "the length of the body a GET would have sent");
-    // The body is the part a HEAD must not carry, and `fetch` never exposes one — read the wire.
+    const getCss = await requestNative("GET", "/style.css");
+    const headCss = await requestNative("HEAD", "/style.css");
+    assert.ok(Number(getCss.headers["content-length"]) > 0);
+    assert.equal(headCss.headers["content-length"], getCss.headers["content-length"], "the length of the body a GET would have sent");
+    assert.ok(getCss.body.byteLength > 0, "GET serves the static asset bytes");
+    assert.equal(headCss.body.byteLength, 0);
+    // Inspect the raw TLS wire to confirm that no bytes follow HEAD response headers.
     const wire = await new Promise<string>((done, fail) => {
-      const sock = net.connect(port, "127.0.0.1", () => sock.write(`HEAD /style.css HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`));
+      const options = adminTestTlsOptions(`${base()}:${port}`);
+      const sock = tls.connect({ host: "127.0.0.1", port: Number(options.port), ca: options.ca,
+        rejectUnauthorized: true, checkServerIdentity: options.checkServerIdentity },
+      () => sock.write(`HEAD /style.css HTTP/1.1\r\nHost: 127.0.0.1:${options.port}\r\nConnection: close\r\n\r\n`));
       let text = "";
       sock.on("data", (chunk: Buffer) => { text += chunk.toString("latin1"); });
       sock.on("close", () => done(text));
@@ -1540,7 +1568,7 @@ test("PUT /api/config accepts a valid config and saves it atomically", async () 
     const next = makeCfg({ providers: { p: { type: "anthropic-compatible", url: "http://127.0.0.1:9" } }, routes: { "claude-opus-4-8": { provider: "p", model: "m" } } });
     const res = await fetch(`${base()}:${port}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(next) });
     assert.equal(res.status, 200);
-    const onDisk = JSON.parse(fs.readFileSync(configFile, "utf8"));
+    const onDisk = JSON.parse(readPrivateFile(configFile).toString("utf8"));
     assert.deepEqual(onDisk.routes, next.routes);
     // no leftover temp files
     const dir = fs.readdirSync(path.dirname(configFile));
@@ -1577,9 +1605,9 @@ test("config revisions prevent concurrent lost updates and detect external edits
     const secondWindow = await get();
     assert.match(firstWindow.configRevision, /^[a-f0-9]{64}$/);
     assert.deepEqual(secondWindow, firstWindow);
-    const responses = await Promise.all([put({ ...firstWindow, autoUpdate: true }), put({ ...secondWindow, autoUpdate: false })]);
+    const responses = await Promise.all([put({ ...firstWindow, processPriority: "normal" }), put({ ...secondWindow, processPriority: "below-normal" })]);
     assert.deepEqual(responses.map(response => response.status).sort(), [200, 409]);
-    const saved = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+    const saved = JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config;
     const success = await responses.find(response => response.status === 200)!.json() as { ok: boolean; configRevision: string };
     assert.equal(success.ok, true);
     assert.notEqual(success.configRevision, firstWindow.configRevision);
@@ -1594,7 +1622,7 @@ test("config revisions prevent concurrent lost updates and detect external edits
       assert.equal((await put({ ...saved, configRevision })).status, 400);
       assert.equal(fs.readFileSync(configFile, "utf8"), before);
     }
-    const fresh = await put({ ...await get(), autoUpdate: !saved.autoUpdate });
+    const fresh = await put({ ...await get(), processPriority: saved.processPriority === "normal" ? "below-normal" : "normal" });
     assert.equal(fresh.status, 200);
     const { configRevision } = await fresh.json() as { configRevision: string };
     const external = { ...saved, providers: { external: { type: "anthropic-compatible", url: "http://127.0.0.1:9" } } } satisfies Config;
@@ -1616,7 +1644,7 @@ test("PUT /api/config carries a webSearch backend through to the file and GET re
     });
     const res = await fetch(`${base()}:${port}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(next) });
     assert.equal(res.status, 200);
-    const onDisk = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+    const onDisk = JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config;
     assert.deepEqual(onDisk.webSearch, next.webSearch);
     setCfg(next);
     const read = (await (await fetch(`${base()}:${port}/api/config`)).json()) as Config;
@@ -1631,7 +1659,7 @@ test("PUT /api/config carries a chatgpt provider's Fast switches through to the 
     });
     const res = await fetch(`${base()}:${port}/api/config`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(next) });
     assert.equal(res.status, 200);
-    const onDisk = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+    const onDisk = JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config;
     assert.deepEqual((onDisk.providers.gpt as { fast?: unknown }).fast, { main: true, subagent: false });
     setCfg(next);
     const read = (await (await fetch(`${base()}:${port}/api/config`)).json()) as Config;
@@ -2457,10 +2485,12 @@ test("status reports the identity this process captured at start", async () => {
 
 test("admin rejects rebinding Hosts and foreign write Origins but accepts dashboard and tray requests", async () => {
   const cfg = makeCfg({ providers: { p: { type: "anthropic-compatible", url: "http://127.0.0.1:9", headers: { "x-api-key": "test-secret" } } } });
-  await withAdmin(cfg, async ({ port, configFile }) => {
+  await withAdmin(cfg, async ({ port, configFile, home }) => {
+    const options = adminTestTlsOptions(`${base()}:${port}`);
+    const tlsPort = Number(options.port);
     const request = (method: string, pathname: string, host?: string, origin?: string) => new Promise<{ status: number; body: string }>((resolve, reject) => {
-      const req = http.request({ hostname: "127.0.0.1", port, path: pathname, method, setHost: false,
-        headers: { ...(host === undefined ? {} : { host }), ...(origin === undefined ? {} : { origin }) } }, res => {
+      const req = https.request({ ...options, path: pathname, method, setHost: false,
+        headers: { ...adminTestAuthHeaders(`${base()}:${port}`), ...(host === undefined ? {} : { host }), ...(origin === undefined ? {} : { origin }) } }, res => {
         let body = "";
         res.setEncoding("utf8");
         res.on("data", (chunk: string) => { body += chunk; });
@@ -2471,24 +2501,24 @@ test("admin rejects rebinding Hosts and foreign write Origins but accepts dashbo
       req.end(method === "PUT" ? JSON.stringify(cfg) : undefined);
     });
     const before = fs.readFileSync(configFile, "utf8");
-    for (const host of [undefined, "evil.example", `evil.example:${port}`, "127.0.0.1", "localhost:1", "[::1]:1", `127.1:${port}`, `localhost.evil.example:${port}`]) {
+    for (const host of [undefined, "evil.example", `evil.example:${tlsPort}`, "127.0.0.1", "localhost:1", "[::1]:1", `127.1:${tlsPort}`, `localhost.evil.example:${tlsPort}`]) {
       for (const [method, pathname] of [["GET", "/api/config"], ["HEAD", "/api/config"], ["PUT", "/api/config"], ["GET", "/"]]) {
         const response = await request(method!, pathname!, host);
         assert.equal(response.status, host === undefined ? 400 : 403, `${method} ${pathname} Host=${host}`);
         assert.doesNotMatch(response.body, /test-secret/);
       }
     }
-    for (const origin of ["https://evil.example", "null", "", "http://localhost:1", `https://localhost:${port}`, "ripple://app"]) {
-      const response = await request("PUT", "/api/config", `127.0.0.1:${port}`, origin);
+    for (const origin of ["https://evil.example", "null", "", "http://localhost:1", `http://localhost:${tlsPort}`, "ripple://app"]) {
+      const response = await request("PUT", "/api/config", `127.0.0.1:${tlsPort}`, origin);
       assert.equal(response.status, 403, `Origin=${origin}`);
     }
     assert.equal(fs.readFileSync(configFile, "utf8"), before, "rejected requests cannot save");
-    for (const host of [`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]) {
+    for (const host of [`127.0.0.1:${tlsPort}`, `localhost:${tlsPort}`, `[::1]:${tlsPort}`]) {
       assert.equal((await request("GET", "/api/config", host)).status, 200);
-      assert.equal((await request("PUT", "/api/config", host, `http://${host}`)).status, 200);
+      assert.equal((await request("PUT", "/api/config", host, `https://${host}`)).status, 200);
     }
     // ripple://app's main-process forwarder sends the loopback Host and strips Origin.
-    assert.equal((await request("PUT", "/api/config", `127.0.0.1:${port}`)).status, 200);
+    assert.equal((await request("PUT", "/api/config", `127.0.0.1:${tlsPort}`)).status, 200);
   });
 });
 
@@ -2532,9 +2562,9 @@ test("the Origin guard covers the other state-changing endpoints too", async () 
       const res = await fetch(`${base()}:${port}${p}`, { method: "POST", headers: { origin: "http://evil.example" } });
       assert.equal(res.status, 403, `${p} must refuse a cross-site POST`);
     }
-    // Reading is not gated: a cross-site page cannot see the response anyway.
+    // Reads enforce the same browser-origin boundary as writes, even with a valid capability.
     const get = await fetch(`${base()}:${port}/api/status`, { headers: { origin: "http://evil.example" } });
-    assert.equal(get.status, 200);
+    assert.equal(get.status, 403);
   });
 });
 
@@ -2672,7 +2702,7 @@ test("POST /api/providers/probe[chatgpt] falls back to the measured list when th
   );
 });
 
-test("POST /api/providers/probe[google] lists generateContent models across pages and mints effortLevels", async () => {
+test("POST /api/providers/probe[google] lists generateContent models and offers only recognized effort ladders", async () => {
   const seen: { url: string; key: string | null }[] = [];
   const pages: Record<string, unknown> = {
     "": {
@@ -2686,6 +2716,11 @@ test("POST /api/providers/probe[google] lists generateContent models across page
     page2: {
       models: [
         { name: "models/gemini-2.5-pro", displayName: "Gemini 2.5 Pro", inputTokenLimit: 2097152, supportedGenerationMethods: ["generateContent"], thinking: true },
+        { name: "models/gemini-4-carbon", displayName: "Gemini 4 Carbon", inputTokenLimit: 1048576, supportedGenerationMethods: ["generateContent", "countTokens"], thinking: true },
+        { name: "models/gemini-4-argon", displayName: "Gemini 4 Argon", supportedGenerationMethods: ["generateContent"], thinking: true },
+        { name: "models/gemini-4-future", displayName: "Gemini Future", supportedGenerationMethods: ["generateContent"], thinking: true },
+        { name: "models/gemini-4-carbon-unannounced", supportedGenerationMethods: ["generateContent"], thinking: true },
+        { name: "models/gemini-4-carbon-embedding", supportedGenerationMethods: ["embedContent"], thinking: true },
       ],
     },
   };
@@ -2698,15 +2733,35 @@ test("POST /api/providers/probe[google] lists generateContent models across page
         body: JSON.stringify({ type: "google", auth: "api-key", apiKey: "secret-key", url: "https://generativelanguage.googleapis.com" }),
       });
       assert.equal(res.status, 200);
-      assert.deepEqual(await res.json(), {
+      const result = await res.json() as { models: ProviderModel[] };
+      assert.deepEqual(result, {
         ok: true,
         auth: "ok",
         models: [
           { id: "gemini-3-pro-preview", name: "Gemini 3 Pro Preview", contextWindow: 1048576, effortLevels: ["minimal", "low", "medium", "high"] },
           { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash", contextWindow: 1048576 },
           { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro", contextWindow: 2097152, effortLevels: ["minimal", "low", "medium", "high"] },
+          { id: "gemini-4-carbon", name: "Gemini 4 Carbon", contextWindow: 1048576, effortLevels: ["low", "medium", "high"] },
+          { id: "gemini-4-argon", name: "Gemini 4 Argon", effortLevels: ["low", "medium", "high"] },
+          { id: "gemini-4-future", name: "Gemini Future" },
+          { id: "gemini-4-carbon-unannounced" },
         ],
       });
+      // The saved discovery result is the Desktop picker's per-model evidence. Its synthetic
+      // native row stays unchanged; Carbon receives three levels and unknown families receive none.
+      const personal = makeCfg({
+        security: { mode: "personal", approvedOrigins: ["https://generativelanguage.googleapis.com"] },
+        providers: { google: { type: "google", auth: "api-key", apiKey: "test-key", models: result.models } },
+        cli: { ...DEFAULTS.cli, extraModels: [{ model: "gemini-4-carbon", name: "Gemini 4 Carbon" }, { model: "gemini-4-future", name: "Gemini Future" }] },
+      });
+      assert.deepEqual(effortLevelsForModel(personal, "gemini-4-carbon"), ["low", "medium", "high"]);
+      assert.deepEqual(effortLevelsForModel(personal, "gemini-4-future"), []);
+      const native = { id: "claude-opus-5-5", thinking: { effort_options: ["low", "medium", "high", "xhigh", "max"].map(id => ({ id })) } };
+      const picker = { model_selector_config: [{ id: "code", models: [structuredClone(native)] }] };
+      injectPickerModels(picker, chatPickerModels(personal), undefined, id => effortLevelsForModel(personal, id), { codeOnly: true, compatibleCodeSurfaces: ["code"] });
+      assert.deepEqual(picker.model_selector_config[0]!.models[0], native);
+      assert.deepEqual(picker.model_selector_config[0]!.models.find(model => model.id === "gemini-4-carbon")?.thinking.effort_options.map(option => option.id), ["low", "medium", "high"]);
+      assert.equal(picker.model_selector_config[0]!.models.find(model => model.id === "gemini-4-future")?.thinking, undefined);
     },
     {
       probeFetch: async (url, init) => {
@@ -2997,7 +3052,7 @@ test("POST /api/providers/measure runs in the background and polling settles the
     assert.equal(job.done, 1);
     assert.equal(job.total, 1);
     assert.deepEqual(job.results, [{ id: "mimo", wire: "chat", effortLevels: ["none", "low", "medium", "high"] }]);
-    const onDisk = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+    const onDisk = JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config;
     assert.equal(onDisk.providers.oc?.models?.[0]?.wire, "chat");
     // `medium` and `high` are in although the provider declared neither: a measurement corrects the
     // configuration in both directions, or a level the plan really offers stays out of reach.
@@ -3017,7 +3072,7 @@ test("measurement updates only its provider when another provider has the same m
     assert.equal(started.status, 202);
     const job = await pollMeasure(port, ((await started.json()) as { jobId: string }).jobId);
     assert.equal(job.state, "done");
-    const saved = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+    const saved = JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config;
     assert.equal(saved.providers.p?.models?.[0]?.wire, "chat");
     assert.deepEqual(saved.providers.p?.models?.[0]?.effortLevels, ["low"]);
     assert.deepEqual(saved.providers.q, cfg.providers.q, "a shared id does not share measured capabilities");
@@ -3052,7 +3107,7 @@ test("measurement fills blank fields but never overwrites a wire or ladder the u
     });
     assert.equal(started.status, 202);
     await pollMeasure(port, ((await started.json()) as { jobId: string }).jobId);
-    const models = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers.oc!.models!;
+    const models = (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers.oc!.models!;
     const muse = models.find((m) => m.id === "muse")!;
     const fresh = models.find((m) => m.id === "fresh")!;
     assert.equal(muse.wire, "responses", "an explicit wire is the user's, not the measurement's, to change");
@@ -3089,7 +3144,7 @@ test("a preset provider measures across the wires the preset declares, the provi
     });
     await pollMeasure(port, ((await started.json()) as { jobId: string }).jobId);
     assert.equal(seen[0], "https://opencode.ai/zen/go/v1/responses", "the provider's own wire is tried first");
-    const model = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers["opencode-go"]!.models![0]!;
+    const model = (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers["opencode-go"]!.models![0]!;
     assert.equal(model.wire, "chat");
   }, { measureFetch });
 });
@@ -3125,7 +3180,7 @@ test("a model the preset already places is measured on that wire first, even whe
     await pollMeasure(port, ((await started.json()) as { jobId: string }).jobId);
     assert.equal(seen[0], "https://opencode.ai/zen/go/v1/messages", "the preset's own placement is tried before the provider default");
     assert.equal(seen.length, 1, "a wire that answers ends the search");
-    const model = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers["opencode-go"]!.models![0]!;
+    const model = (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers["opencode-go"]!.models![0]!;
     assert.equal(model.wire, "anthropic");
   }, { measureFetch });
 });
@@ -3189,7 +3244,7 @@ test("a model the catalogue describes is measured with one request and takes the
     assert.deepEqual(bunny.map((s) => s.url), ["https://opencode.ai/zen/go/v1/chat/completions"], "the catalogue's wire first, and nothing after it answers");
     assert.equal(seen.filter((s) => s.model === "glm-5.3-flash").length, 1);
     assert.ok(seen.filter((s) => s.model === "unlisted").length > 2, "a model the catalogue lacks is measured as before");
-    const models = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers["opencode-go"]!.models!;
+    const models = (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers["opencode-go"]!.models!;
     assert.deepEqual(models.find((m) => m.id === "space-bunny-free")?.effortLevels, ["low", "medium", "high", "xhigh", "max"]);
     assert.deepEqual(models.find((m) => m.id === "glm-5.3-flash")?.effortLevels, ["low", "high", "max"]);
     assert.equal(models.find((m) => m.id === "glm-5.3-flash")?.wire, "chat");
@@ -3229,7 +3284,7 @@ test("measurement writes the catalogue's context window into a model that has no
     });
     const job = await pollMeasure(port, ((await started.json()) as { jobId: string }).jobId);
     assert.equal(job.state, "done");
-    const models = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers["opencode-go"]!.models!;
+    const models = (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers["opencode-go"]!.models!;
     assert.equal(models.find((m) => m.id === "muse-spark-1.3-contributor")?.contextWindow, 999, "a window already set is not overwritten");
     assert.equal(models.find((m) => m.id === "deepseek-v4.1-flash")?.contextWindow, 1000000);
   }, { measureFetch, modelCatalog });
@@ -3266,7 +3321,7 @@ test("backfillContextWindows fills only models without a window, leaving a set o
     });
     const deps = { config: () => cfg, configFile, log, modelCatalog } as unknown as AdminDeps;
     assert.deepEqual(await backfillContextWindows(deps), ["opencode-go/muse-spark-1.3-contributor"]);
-    const models = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers["opencode-go"]!.models!;
+    const models = (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers["opencode-go"]!.models!;
     assert.equal(models.find((m) => m.id === "muse-spark-1.3-contributor")?.contextWindow, 1048576);
     assert.equal(models.find((m) => m.id === "deepseek-v4.1-flash")?.contextWindow, 123, "the vendor's own window stands");
     assert.equal("contextWindow" in (models.find((m) => m.id === "not-listed") ?? {}), false);
@@ -3307,7 +3362,7 @@ test("backfillContextWindows fills a provider with no catalogue block from the s
     });
     const deps = { config: () => cfg, configFile, log, modelCatalog } as unknown as AdminDeps;
     assert.deepEqual(await backfillContextWindows(deps), ["hive/deepseek-ai/deepseek-v4.1-flash-1017"]);
-    const models = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers.hive!.models!;
+    const models = (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers.hive!.models!;
     assert.equal(models.find((m) => m.id === "deepseek-ai/deepseek-v4.1-flash-1017")?.contextWindow, 256000, "the smallest window the catalogue states");
     assert.equal(models.find((m) => m.id === "zai-org/glm-5.3-flash")?.contextWindow, 111, "the operator's own window stands");
     assert.equal("contextWindow" in (models.find((m) => m.id === "jev-1.13") ?? {}), false, "a model the catalogue does not list stays blank");
@@ -3344,7 +3399,7 @@ test("measurement gives a provider with no catalogue block the window its model 
     });
     const job = await pollMeasure(port, ((await started.json()) as { jobId: string }).jobId);
     assert.equal(job.state, "done");
-    const models = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers.hive!.models!;
+    const models = (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers.hive!.models!;
     assert.equal(models.find((m) => m.id === "deepseek-ai/deepseek-v4.1-flash-1017")?.contextWindow, 256000);
     assert.equal(models.find((m) => m.id === "zai-org/glm-5.3-flash")?.contextWindow, 777, "a window already set is not overwritten");
   }, { measureFetch, modelCatalog });
@@ -3374,7 +3429,7 @@ test("a model the plan refuses is still reported when the catalogue lists it", a
     const [result] = job.results as { error?: string; effortLevels?: string[] }[];
     assert.match(result?.error ?? "", /^not-entitled/);
     assert.equal(result?.effortLevels, undefined, "a model that did not answer is not given the catalogue's ladder");
-    assert.equal("effortLevels" in (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers["opencode-go"]!.models![0]!, false);
+    assert.equal("effortLevels" in (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers["opencode-go"]!.models![0]!, false);
   }, { measureFetch, modelCatalog });
 });
 
@@ -3396,7 +3451,7 @@ test("an auth failure in measurement writes nothing: the wire is not guessed", a
     });
     const job = await pollMeasure(port, ((await started.json()) as { jobId: string }).jobId);
     assert.deepEqual(job.results, [{ id: "bad", error: "auth" }]);
-    const model = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers.oc!.models![0]!;
+    const model = (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers.oc!.models![0]!;
     assert.equal("wire" in model, false);
     assert.equal("effortLevels" in model, false);
   }, { measureFetch });
@@ -3601,7 +3656,7 @@ test("measureUnsettledModels: discovers effort for a ladderless provider's unset
     let onDisk: Config | undefined;
     for (let i = 0; i < 200 && !(onDisk?.providers.kimi?.models?.[0]?.effortLevels && onDisk?.providers.groq?.models?.[0]?.effortLevels); i++) {
       await new Promise((resolveP) => setTimeout(resolveP, 5));
-      onDisk = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+      onDisk = JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config;
     }
     assert.deepEqual(onDisk?.providers.kimi?.models?.[0]?.effortLevels, ["low", "high"], "validated, and these two accepted");
     assert.deepEqual(onDisk?.providers.kimi?.models?.[1]?.effortLevels, [], "a settled model is left as it was");
@@ -3647,7 +3702,7 @@ test("an Ollama model's effort and context come from /api/show, and an empty lad
     assert.equal(job.state, "done");
     assert.deepEqual(calls.filter((c) => c.url === "https://ollama.com/api/show").map((c) => c.body.model), ["gpt-oss:120b", "qwen3:235b"]);
     assert.equal(calls.some((c) => "reasoning_effort" in c.body), false, "no ladder probing: the vendor states it");
-    const models = (JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).providers["ollama-cloud"]!.models!;
+    const models = (JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).providers["ollama-cloud"]!.models!;
     assert.deepEqual(models.find((m) => m.id === "gpt-oss:120b")?.effortLevels, ["low", "medium", "high"], "an empty ladder is a blank on Ollama");
     assert.equal(models.find((m) => m.id === "gpt-oss:120b")?.contextWindow, 1048576);
     assert.deepEqual(models.find((m) => m.id === "qwen3:235b")?.effortLevels, ["low"], "a ladder someone set stands");
@@ -3686,7 +3741,7 @@ test("measureUnsettledModels re-measures Ollama's empty ladders, and leaves an e
     const models = () => onDisk?.providers.ollama?.models ?? [];
     for (let i = 0; i < 200 && !(models().find((m) => m.id === "llama3.3")?.effortLevels?.length && models().find((m) => m.id === "qwen3")?.contextWindow); i++) {
       await new Promise((resolveP) => setTimeout(resolveP, 5));
-      onDisk = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+      onDisk = JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config;
     }
     assert.deepEqual(models().find((m) => m.id === "llama3.3")?.effortLevels, ["low", "high"], "an unset ladder is stated now");
     assert.deepEqual(models().find((m) => m.id === "qwen3")?.effortLevels, ["low", "high"], "the empty ladder is replaced");
@@ -3949,8 +4004,7 @@ test("GET /api/limits lists a MiniMax plan's five-hour and weekly windows", asyn
 });
 
 test("GET /api/limits forecasts a window whose average pace reaches 100% before its reset, and no other", async () => {
-  const now = Date.now();
-  const nowS = Math.floor(now / 1000);
+  let nowS = 0;
   const cfg = makeCfg({ providers: {
     mini: { type: "anthropic-compatible", preset: "minimax", url: "https://api.minimax.io/anthropic", credentials: [{ id: "key-a", label: "A", headers: { "x-api-key": "hidden-a" } }] },
   } });
@@ -3966,17 +4020,22 @@ test("GET /api/limits forecasts a window whose average pace reaches 100% before 
     // ...but it is 54% after 110.4 h of 168, so the week is projected at 82% for its reset.
     assert.equal(weekly!.projected_percent, 82);
   }, {
-    minimaxUsage: async (name: string, credentialId?: string) => name === "mini" && credentialId === "key-a" ? [
-      { kind: "five_hour", used_percent: 60, window_minutes: 300, reset_at: nowS + 4 * 3600 },
-      { kind: "seven_day", used_percent: 54, window_minutes: 10080, reset_at: nowS + Math.round(57.6 * 3600) },
-    ] : [],
+    minimaxUsage: async (name: string, credentialId?: string) => {
+      if (name !== "mini" || credentialId !== "key-a") return [];
+      // This is a fresh usage reading, taken after TLS/ACL fixture setup and client
+      // authentication. Their cold-start cost must not move the window's reference time.
+      nowS = Math.floor(Date.now() / 1000);
+      return [
+        { kind: "five_hour", used_percent: 60, window_minutes: 300, reset_at: nowS + 4 * 3600 },
+        { kind: "seven_day", used_percent: 54, window_minutes: 10080, reset_at: nowS + Math.round(57.6 * 3600) },
+      ];
+    },
   });
 });
 
 test("GET /api/limits judges a cached reading at the time it was taken, so a later poll does not move exhaust_at", async (t) => {
   const start = Date.parse("2026-11-10T00:00:00Z");
   let clock = start;
-  t.mock.method(Date, "now", () => clock);
   const startS = start / 1000;
   // 60% of the five-hour window after one hour: 40 more minutes at that pace, so exhaust_at is 2400 s after the reading.
   const resetS = startS + 4 * 3600;
@@ -4004,6 +4063,9 @@ test("GET /api/limits judges a cached reading at the time it was taken, so a lat
     mini: { type: "anthropic-compatible", preset: "minimax", url: "https://api.minimax.io/anthropic" },
   } });
   await withAdmin(cfg, async ({ port }) => {
+    // Mint/read the real TLS identity before changing the application clock. OpenSSL verifies
+    // certificate validity against the actual clock, independently of this quota-only mock.
+    t.mock.method(Date, "now", () => clock);
     const limits = async () => (await (await fetch(`${base()}:${port}/api/limits`)).json()) as { providers: LimitsProvider[] };
     const exhaustOf = (body: { providers: LimitsProvider[] }) => body.providers.map((p) => [p.provider, p.accounts[0]!.windows[0]!.exhaust_at]);
     const first = await limits();

@@ -120,7 +120,9 @@ test("OAuth native headers follow Claude Code wire requirements", () => {
   assert.equal(CLAUDE_CODE_IDENTITY, "You are Claude Code, Anthropic's official CLI for Claude.");
 });
 
-test("fresh observed CLI headers win and are replayed exactly without non-allowlisted values", () => {
+test("fresh observed CLI headers win and are replayed exactly without non-allowlisted values", t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-claude-observed-source-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const observed = new ObservedClaudeCodeAuth();
   observed.observe([
     "Authorization", "Bearer observed-secret",
@@ -133,7 +135,7 @@ test("fresh observed CLI headers win and are replayed exactly without non-allowl
     "x-not-allowed", "discard-me",
   ], 10_000);
   const stored = new ClaudeCodeCredentialStore(() => JSON.stringify({ claudeAiOauth: { accessToken: "stored-secret", expiresAt: 100_000 } }), () => 10_001);
-  const result = new ClaudeCodeAuthStore(stored, { observed, now: () => 10_001 }).get();
+  const result = new ClaudeCodeAuthStore(stored, { home, env: {}, observed, now: () => 10_001 }).get();
   assert.ok(!(result instanceof Error));
   assert.equal(result.source, "observed");
   if (result.source !== "observed") throw new Error("expected observed auth");
@@ -148,10 +150,11 @@ test("fresh observed CLI headers win and are replayed exactly without non-allowl
   });
 });
 
-test("expired observed header falls through env, stored CLI credential, then 0600 setup-token file", () => {
+test("expired observed header falls through env, stored CLI credential, then 0600 setup-token file", t => {
   const observed = new ObservedClaudeCodeAuth();
   observed.observe(["authorization", "Bearer stale-secret"], 0);
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-claude-auth-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   saveClaudeAuthFile(home, "file-secret", "2026-09-13T00:00:00.000Z");
   if (posixModes) assert.equal(fs.statSync(path.join(home, "claude-auth.json")).mode & 0o777, 0o600);
   const missing = new ClaudeCodeCredentialStore(() => null, () => 12 * 60 * 60 * 1_000 + 1);

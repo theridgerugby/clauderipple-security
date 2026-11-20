@@ -7,6 +7,7 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { retitle, claudePretty, fromMarker, shortName } from "../src/hooks/agent-title.ts";
 import { setAgentTitleHook, agentTitleHookEnabled } from "../src/settings.ts";
+import { writeSecretJsonAtomic } from "../../router/src/locked-file.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const NAMES = { names: { "gpt-5.6-terra": "Terra", "gpt-5.6-sol": "Sol" } };
@@ -55,6 +56,22 @@ test("hook script: stdin → updatedInput JSON, garbage → silence", () => {
   const out = execFileSync(process.execPath, [script], { input, env: { ...process.env, CLAUDERIPPLE_HOME: home } }).toString();
   assert.equal(JSON.parse(out).hookSpecificOutput.updatedInput.description, "Terra·high · Review");
   assert.equal(execFileSync(process.execPath, [script], { input: "not json", env: { ...process.env, CLAUDERIPPLE_HOME: home } }).toString(), "");
+});
+
+test("hook script reads custom aliases from protected config without outputting provider keys", t => {
+  const script = path.resolve(here, "../src/hooks/agent-title.ts");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cr-title-private-config-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const secret = "synthetic-title-school-key", file = path.join(home, "config.json");
+  writeSecretJsonAtomic(file, {
+    aliases: { custom: "my-private-model" }, effortClamp: { ultra: "high" },
+    providers: { school: { apiKey: secret, models: [{ id: "my-private-model", name: "Custom Fixture" }] } },
+  });
+  const input = JSON.stringify({ tool_name: "Agent", tool_input: { description: "Review", prompt: "[[ripple: custom@ultra]]\ngo" } });
+  const output = execFileSync(process.execPath, [script], { input, env: { ...process.env, CLAUDERIPPLE_HOME: home } }).toString();
+  assert.equal(JSON.parse(output).hookSpecificOutput.updatedInput.description, "Fixture·high · Review");
+  assert.equal(output.includes(secret), false);
+  if (process.platform === "win32") assert.equal(fs.readFileSync(file).includes(secret), false);
 });
 
 test("settings: hook entry added/removed by marker only", () => {

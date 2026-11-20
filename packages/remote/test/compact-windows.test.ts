@@ -10,7 +10,7 @@ for (const [source, target, provider, capacity, compactWindow, expected] of [
     const boundary: Fetch = async url => ({ ok: true, status: 200, json: async () => url.includes("/api/requests")
       ? { requests: [{ source, target, provider, ok: true, usage: { input: 300000 } }] }
       : url.includes("/api/context-windows") ? { resolvedWindows: { [source]: { model: target, provider: provider === "anthropic" ? null : provider, contextWindow: capacity, compactWindow } } } : {} });
-    const client = new RouterClient("http://router.test", boundary);
+    const client = new RouterClient("http://127.0.0.1:8792", boundary);
     const figures = await client.figures("session", source, 1000000);
     assert.equal(figures.contextWindow, compactWindow);
     assert.equal(figures.contextPct, expected);
@@ -21,7 +21,7 @@ test("an older router without compactWindow keeps its capacity and provider-boun
   const boundary: Fetch = async url => ({ ok: true, status: 200, json: async () => url.includes("/api/requests")
     ? { requests: [{ source: "claude-opus-5-5", target: "claude-opus-5-5", provider: "anthropic", usage: { input: 300000 } }] }
     : url.includes("/api/context-windows") ? { resolvedWindows: { "claude-opus-5-5": { model: "claude-opus-5-5", provider: null, contextWindow: 1000000 } } } : {} });
-  const figures = await new RouterClient("http://router.test", boundary).figures("session", "claude-opus-5-5", 1000000);
+  const figures = await new RouterClient("http://127.0.0.1:8792", boundary).figures("session", "claude-opus-5-5", 1000000);
   assert.equal(figures.contextWindow, 1000000);
   assert.equal(figures.contextPct, 30);
 });

@@ -9,7 +9,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ConfigStore, adminPort, type Config } from "../../router/src/config.ts";
+import { ConfigStore, adminPort, homeDir, type Config } from "../../router/src/config.ts";
+import { readInstallationId } from "../../router/src/installation-id.ts";
+import { VERSION } from "../../router/src/version.ts";
+import { adminFetch } from "./admin-client.ts";
 import { certPaths } from "./certs.ts";
 import { claudeBinary, claudeCodeLogin, claudeLoginHint, type ClaudeCodeLogin } from "./claude-auth.ts";
 import { applyAppProxy, currentAppProxy } from "./picker.ts";
@@ -17,6 +20,10 @@ import { applyProxyEnv, settingsEnv } from "./settings.ts";
 import type { AgentState } from "./supervisor.ts";
 import type { SupervisorOps, SupervisorView } from "./registration.ts";
 import { sameHome } from "./ownership.ts";
+import { captureRouterCodeIdentity, sameRouterCodeIdentity, statusMatchesRuntime, type InstallRuntimeTarget } from "./install-runtime.ts";
+import { runtime } from "./runtime.ts";
+import { personalMode } from "../../router/src/personal-policy.ts";
+import { auditNativeIndependence, type NativeIndependenceReport } from "./native-independence.ts";
 
 export type Mode = "ripple" | "direct" | "mixed";
 export type ProxyState = "ripple" | "none" | "other";
@@ -24,24 +31,27 @@ export type Problem = { code: string; message: string };
 
 export type DoctorReport = {
   mode: Mode;
-  router: { responding: boolean; version: string | null; pid: number | null; url: string; adminUrl: string };
+  router: { responding: boolean; runtimeVerified: boolean; version: string | null; pid: number | null; url: string; adminUrl: string };
   supervisor: { registered: boolean; program: string | null; programExists: boolean; state: AgentState; installedHome: string | null };
   desktop: { proxy: ProxyState; url: string | null };
   cli: { proxy: ProxyState; url: string | null };
   problems: Problem[];
+  /** Separate from service health: a working router can still couple native clients to itself. */
+  nativeIndependence?: NativeIndependenceReport;
 };
 
 export type RepairStep = { name: string; ok: boolean; detail: string };
 export type RepairReport = { ok: boolean; steps: RepairStep[]; doctor: DoctorReport };
 
-export type RouterStatus = { version: string | null };
+/** runtimeVerified is computed locally; a server-supplied boolean is never trusted. */
+export type RouterStatus = { version: string | null; runtimeVerified: boolean };
 
 export type RecoveryDeps = {
   home: string;
   /** This CLI's version, to compare with the running router's. */
   version: string;
   supervisor: SupervisorOps;
-  /** GET /api/status on the admin port; null when the router does not answer within `timeoutMs`. */
+  /** Pinned GET /api/status, with a locally checked runtime identity; null if unavailable. */
   routerStatus?: (adminUrl: string, timeoutMs: number) => Promise<RouterStatus | null>;
   sleep?: (ms: number) => Promise<void>;
   /** How long repair waits for the router to answer after starting it. */
@@ -50,17 +60,47 @@ export type RecoveryDeps = {
   remoteHostInstalled?: () => boolean | Promise<boolean>;
   /** Whether the Claude Code CLI itself has a login (the phone host's sessions need one). */
   claudeLogin?: () => Promise<ClaudeCodeLogin>;
+  /** Read-only trust inspection seam; tests must not query the user's real certificate store. */
+  nativeCaTrust?: () => Promise<boolean | null>;
 };
 
-export async function fetchRouterStatus(adminUrl: string, timeoutMs: number): Promise<RouterStatus | null> {
+export async function fetchRouterStatus(adminUrl: string, timeoutMs: number, home: string = homeDir()): Promise<RouterStatus | null> {
   try {
-    const res = await fetch(`${adminUrl}/api/status`, { signal: AbortSignal.timeout(timeoutMs) });
-    if (!res.ok) return null;
-    const body = (await res.json()) as { version?: unknown };
-    return { version: typeof body.version === "string" ? body.version : null };
+    const deadline = performance.now() + timeoutMs;
+    let target: InstallRuntimeTarget | undefined;
+    let before: Config | undefined;
+    try {
+      before = new ConfigStore(configFile(home)).get();
+      const rt = runtime();
+      target = { version: VERSION, node: rt.node, router: rt.router, codeIdentity: captureRouterCodeIdentity(rt),
+        listen: before.listen, upstream: before.upstream };
+    } catch { /* A readable status can still diagnose an unverifiable local runtime. */ }
+    const remaining = Math.ceil(deadline - performance.now());
+    if (remaining <= 0) return null;
+    const res = await adminFetch(`${adminUrl}/api/status`, { signal: AbortSignal.timeout(remaining) }, home);
+    if (!res.ok) { await res.body?.cancel(); return null; }
+    const body: unknown = await res.json();
+    const version = body && typeof body === "object" && "version" in body && typeof body.version === "string" ? body.version : null;
+    let runtimeVerified = false;
+    if (target && before) {
+      try {
+        const current = new ConfigStore(configFile(home)).get();
+        runtimeVerified = sameRecoveryDestination(before, current) &&
+          statusMatchesRuntime(body, target, readInstallationId(home)) &&
+          sameRouterCodeIdentity(captureRouterCodeIdentity(), target.codeIdentity);
+      } catch { /* The runtime/config changed or could not be read; never restore clients to it. */ }
+    }
+    if (performance.now() > deadline) return null;
+    return { version, runtimeVerified };
   } catch {
     return null;
   }
+}
+
+/** A config edit during an asynchronous health check must not redirect clients to a stale port. */
+export function sameRecoveryDestination(a: Config, b: Config): boolean {
+  return a.listen.host === b.listen.host && a.listen.port === b.listen.port &&
+    a.upstream === b.upstream && adminPort(a) === adminPort(b);
 }
 
 const sleepDefault = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -138,7 +178,7 @@ async function snapshot(deps: RecoveryDeps): Promise<Snapshot> {
   const proxyUrl = proxyUrlFor(cfg.listen.port);
   const adminUrl = `http://127.0.0.1:${adminPort(cfg)}`;
   const caPath = certPaths(deps.home).caPem;
-  const status = await (deps.routerStatus ?? fetchRouterStatus)(adminUrl, 4_000);
+  const status = await (deps.routerStatus ?? ((url, ms) => fetchRouterStatus(url, ms, deps.home)))(adminUrl, 4_000);
   const view = deps.supervisor.inspect();
   const cli = cliProxyState(settingsEnv(), proxyUrl, caPath);
   const desktop = desktopProxyState(currentAppProxy(), proxyUrl);
@@ -160,10 +200,13 @@ async function snapshot(deps: RecoveryDeps): Promise<Snapshot> {
     else add("supervisor-other-install", `The router's startup entry belongs to another ClaudeRipple installation (${view.program}).`);
   }
   if (!status) {
-    add("router-down", `The router is not answering on ${adminUrl}. ${mode === "direct" ? "Claude is on its default connection, so it is not affected." : "Claude Desktop and Claude Code cannot connect while it is down."}`);
+    add("router-down", `The router is not answering on ${adminUrl}. ${mode === "direct" ? "The inspected shared settings contain no active ClaudeRipple proxy; already-running client connections were not checked." : "Clients using its proxy cannot connect while it is down."}`);
     if (view.registered && view.state !== "running" && view.state !== "unknown") add("supervisor-not-running", "The router's background service is not running.");
   } else if (status.version && status.version !== deps.version) {
     add("router-version-mismatch", `The running router is ${status.version}; this ClaudeRipple is ${deps.version}.`);
+  }
+  if (status && (!status.runtimeVerified || status.version !== deps.version)) {
+    add("router-code-mismatch", "The answering router is not verified as this installation's current source/runtime. Run install from the reviewed checkout before restoring proxy settings.");
   }
   if (cli.stale) add("cli-port-mismatch", `Claude Code is set to a ClaudeRipple port that is no longer used (${cli.url}; the router listens on ${proxyUrl}).`);
   else if (cli.proxy === "other") add("cli-foreign-proxy", `Claude Code goes through another proxy (${cli.url}), not ClaudeRipple.`);
@@ -172,7 +215,9 @@ async function snapshot(deps: RecoveryDeps): Promise<Snapshot> {
   if (mode === "mixed") add("mixed-mode", `Claude Code ${cli.proxy === "ripple" ? "goes" : "does not go"} through ClaudeRipple, Claude Desktop ${desktop.proxy === "ripple" ? "does" : "does not"}.`);
   // The phone host starts Claude Code through the Agent SDK and passes no credential of its own, so
   // without a login of the CLI's own every turn fails at once (issue #71).
-  if (await (deps.remoteHostInstalled ?? remoteHostInstalled)()) {
+  // Personal Desktop recovery needs neither a phone-host scan nor a separate Claude Code
+  // login/keychain inspection. The existing Desktop subscription stays owned by Desktop.
+  if (!personalMode(cfg) && await (deps.remoteHostInstalled ?? remoteHostInstalled)()) {
     const login = await (deps.claudeLogin ?? (() => claudeCodeLogin()))();
     if (!login.ok) add("cli-not-logged-in", `Claude Code has no login on this computer, so the phone host's sessions fail at once. ${claudeLoginHint(claudeBinary())}`);
   }
@@ -180,7 +225,7 @@ async function snapshot(deps: RecoveryDeps): Promise<Snapshot> {
   return {
     report: {
       mode,
-      router: { responding: status !== null, version: status?.version ?? null, pid: view.pid, url: proxyUrl, adminUrl },
+      router: { responding: status !== null, runtimeVerified: status?.runtimeVerified === true && status.version === deps.version, version: status?.version ?? null, pid: view.pid, url: proxyUrl, adminUrl },
       supervisor: { registered: view.registered, program: view.program, programExists: view.programExists, state: view.state, installedHome: view.installedHome },
       desktop: { proxy: desktop.proxy, url: desktop.url },
       cli: { proxy: cli.proxy, url: cli.url },
@@ -196,7 +241,12 @@ async function snapshot(deps: RecoveryDeps): Promise<Snapshot> {
 }
 
 export async function doctor(deps: RecoveryDeps): Promise<DoctorReport> {
-  return (await snapshot(deps)).report;
+  const current = await snapshot(deps);
+  const nativeIndependence = await auditNativeIndependence({
+    home: deps.home, proxyUrl: proxyUrlFor(current.cfg.listen.port), supervisor: current.view,
+    ...(deps.nativeCaTrust ? { trustedCa: deps.nativeCaTrust } : {}),
+  });
+  return { ...current.report, nativeIndependence };
 }
 
 /**
@@ -207,7 +257,7 @@ export async function doctor(deps: RecoveryDeps): Promise<DoctorReport> {
  */
 export async function repair(deps: RecoveryDeps): Promise<RepairReport> {
   const sleep = deps.sleep ?? sleepDefault;
-  const status = deps.routerStatus ?? fetchRouterStatus;
+  const status = deps.routerStatus ?? ((url: string, ms: number) => fetchRouterStatus(url, ms, deps.home));
   const steps: RepairStep[] = [];
   const before = await snapshot(deps);
   if (!before.installed) {
@@ -292,9 +342,21 @@ export async function repair(deps: RecoveryDeps): Promise<RepairReport> {
     }
   }
 
+  // The initial diagnostic can precede registration/start and other asynchronous work. Take a
+  // fresh authenticated proof before either client edit. A liveness response or version match
+  // alone cannot prove that the current security fork is actually serving this installation.
+  let canRestoreClients = false;
+  if (before.cliStale || before.desktopStale) {
+    const fresh = steps.every(step => step.ok) ? await status(before.report.router.adminUrl, 4_000) : null;
+    canRestoreClients = fresh?.runtimeVerified === true && fresh.version === deps.version &&
+      sameRecoveryDestination(before.cfg, new ConfigStore(configFile(deps.home)).get());
+    if (!canRestoreClients) steps.push({ name: "identity", ok: false, detail: "client settings left unchanged: the current router code/destination could not be verified; run install from the reviewed checkout" });
+  }
   const proxyUrl = proxyUrlFor(before.cfg.listen.port);
-  if (before.cliStale) {
+  if (before.cliStale && canRestoreClients) {
     try {
+      const current = cliProxyState(settingsEnv(), proxyUrl, before.caPath);
+      if (!current.stale || current.url !== before.report.cli.url) throw new Error("Claude Code proxy changed while waiting; left untouched");
       // Ours by our CA beside a loopback URL (cliProxyState), so replacing it is not overriding anyone.
       const edit = applyProxyEnv({ proxyUrl, caPath: before.caPath, force: true, home: deps.home });
       steps.push({ name: "cli-proxy", ok: true, detail: `Claude Code now points at ${proxyUrl}${edit.backup ? ` (backup: ${edit.backup})` : ""}` });
@@ -302,8 +364,10 @@ export async function repair(deps: RecoveryDeps): Promise<RepairReport> {
       steps.push({ name: "cli-proxy", ok: false, detail: (e as Error).message });
     }
   }
-  if (before.desktopStale) {
+  if (before.desktopStale && canRestoreClients) {
     try {
+      const current = desktopProxyState(currentAppProxy(), proxyUrl);
+      if (!current.stale || current.url !== before.report.desktop.url) throw new Error("Claude Desktop proxy changed while waiting; left untouched");
       applyAppProxy(proxyUrl, deps.home);
       steps.push({ name: "desktop-proxy", ok: true, detail: `Claude Desktop now points at ${proxyUrl} (quit and reopen it to apply)` });
     } catch (e) {
@@ -312,5 +376,8 @@ export async function repair(deps: RecoveryDeps): Promise<RepairReport> {
   }
 
   const after = await doctor(deps);
-  return { ok: steps.every((s) => s.ok) && after.router.responding, steps, doctor: after };
+  if (after.router.responding && !after.router.runtimeVerified && !steps.some(step => step.name === "identity")) {
+    steps.push({ name: "identity", ok: false, detail: "the answering router's current code could not be verified; run install from the reviewed checkout" });
+  }
+  return { ok: steps.every((s) => s.ok) && after.router.responding && after.router.runtimeVerified, steps, doctor: after };
 }

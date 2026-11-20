@@ -11,9 +11,11 @@ import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
-import { ConfigStore, DEFAULTS, homeDir, configPath } from "../../router/src/config.ts";
+import { ConfigStore, DEFAULTS, homeDir, configPath, normalizeConfig } from "../../router/src/config.ts";
+import { readInstallationId } from "../../router/src/installation-id.ts";
+import { writeSecretJsonAtomic } from "../../router/src/locked-file.ts";
+import { configurePersonalEgressPolicy, personalMode } from "../../router/src/personal-policy.ts";
 import { adminPort } from "../../router/src/admin.ts";
-import { CLI_WINDOW_MAX } from "../../router/src/bootstrap.ts";
 import { certsExist, certPaths, generateCerts } from "./certs.ts";
 import { applyProxyEnv, checkProxyEnv, currentProxyEnv, removeProxyEnv, settingsPath } from "./settings.ts";
 import { agentDefinitionPath, agentState, installAgent, isLinux, isSupported, isWindows, removeAgent, restartAgent, serviceOwnership, startAgent, stopAgent, supervisorName } from "./supervisor.ts";
@@ -22,7 +24,9 @@ import { installTrayAgent, removeTrayAgent, trayLoginItemDecision, trayPlistPath
 import { nativeSupervisor, registration, writePaths } from "./registration.ts";
 import { installLauncher, uninstallLauncher } from "./launcher.ts";
 import type { RecoveryDeps } from "./doctor.ts";
+import { nativeIndependenceSummary } from "./native-independence.ts";
 import { applyAppProxy, caTrusted, CA_NAME, currentAppProxy, migrateLegacyAppProxy, nssDb, removeAppProxy, trustCa, untrustCa } from "./picker.ts";
+import { activateDesktopPicker, checkAppProxyActivation, commitDesktopPicker, readDesktopActivationState } from "./desktop-activation.ts";
 import { removeClientIntegrations, setPickerEnabled } from "./integrations.ts";
 import { withCommandHelp } from "./help-gate.ts";
 import { runtime } from "./runtime.ts";
@@ -34,35 +38,60 @@ import { openBrowser } from "./browser.ts";
 import { electronPath, installTrayRuntime, startTray } from "./tray.ts";
 import { dropPowerShellShim, installKind, isNewer, latestVersion, PACKAGE, runUpdate } from "./update.ts";
 import { ClaudeOAuthSession } from "../../router/src/providers/claude-oauth.ts";
+import { authorizeClaudeLocalAuth } from "../../router/src/providers/anthropic-local-auth.ts";
 import { requestHostUpdate } from "../../remote/src/host-update.ts";
 import { purgeHome } from "./purge.ts";
+import { adminFetch, openAdminDashboard } from "./admin-client.ts";
+import { recordAdminRuntime } from "./admin-runtime.ts";
+import { captureRouterCodeIdentity, verifyAndApplyInstall } from "./install-runtime.ts";
+import { installModelOptions } from "./install-model-options.ts";
+import { assertPersonalCliCommandAllowed, SECURITY_USAGE, updateApprovedOrigin } from "./security-config.ts";
+import { assertPersonalWindowsNodeEnv } from "../../router/src/windows-node-env.ts";
 
 async function pickerOn(): Promise<void> {
   const home = homeDir();
-  const cfg = new ConfigStore(configPath()).get();
+  const file = configPath();
   const caPem = certPaths(home).caPem;
   if (!fs.existsSync(path.join(home, "ca.key"))) throw new Error("ca.key missing; run `clauderipple install` first");
-  // With picker mode on, every byte Claude Desktop sends goes through the router (ARCHITECTURE §5):
-  // pointing the app at one that is not answering leaves it a blank page, so check first.
-  const ready = await probe({ host: cfg.listen.host, port: cfg.listen.port, caPem, upstream: cfg.upstream });
-  if (!ready.ok) throw new Error(`the router is not answering (${ready.detail}); picker mode not enabled. Start it with \`clauderipple start\` and try again.`);
-  console.log("Picker mode makes Claude Desktop's own claude.ai traffic go through ClaudeRipple so the model picker can list your GPT models.");
-  console.log(
-    isWindows
-      ? "Step 1/3: trusting the ClaudeRipple CA for your Windows user account. Windows will show a confirmation dialog with the certificate fingerprint — answer Yes. No administrator rights are needed."
-      : isLinux
-        ? `Step 1/3: trusting the ClaudeRipple CA in your NSS database (${nssDb()}), which Chromium and so Claude Desktop reads. Your user only; no password, no sudo.`
-        : "Step 1/3: trusting the ClaudeRipple CA in your login keychain. macOS will ask for your password (ClaudeRipple never sees it).",
-  );
-  trustCa(caPem);
-  if (!caTrusted(caPem)) throw new Error("CA is not trusted; picker mode not enabled");
-  console.log(isWindows || isLinux ? "✓ CA trusted (current user only)" : "✓ CA trusted (login keychain only)");
+  const cfg = readDesktopActivationState(file, home, caPem).config;
   const proxyUrl = proxyUrlFor(cfg.listen.port);
-  const r = applyAppProxy(proxyUrl);
+  console.log("Desktop picker mode adds your separately selected API models to the Code menu and preserves native Claude model choices.");
+  console.log("It installs a current-user CA and makes Claude Desktop depend on this local proxy. Only approved destinations are allowed; additional Desktop connections may need separate approval.");
+  console.log("Recovery: use the dashboard's default-connection switch or `clauderipple direct on`, then fully quit and reopen Claude Desktop.");
+  const r = await activateDesktopPicker({
+    target: { version: VERSION, node: installedRuntime.node, router: installedRuntime.router,
+      codeIdentity: captureRouterCodeIdentity(installedRuntime), listen: cfg.listen, upstream: cfg.upstream },
+    runtime: {
+      status: async signal => {
+        const response = await adminFetch(`http://127.0.0.1:${adminPort(cfg)}/api/status`, { signal }, home);
+        if (!response.ok) { await response.body?.cancel(); throw new Error("Secure router status was refused"); }
+        return response.json();
+      },
+      installationId: () => readInstallationId(home),
+      captureIdentity: () => captureRouterCodeIdentity(installedRuntime),
+      // Activation must not unexpectedly interrupt an existing Desktop session to update code.
+      restart: () => { throw new Error("The live router uses different code. Finish current work, restart this installation, then retry picker activation"); },
+    },
+    proxyUrl, caPem,
+    readState: () => readDesktopActivationState(file, home, caPem),
+    checkDesktop: () => checkAppProxyActivation(proxyUrl, home),
+    probe: () => probe({ host: cfg.listen.host, port: cfg.listen.port, caPem, upstream: cfg.upstream }),
+    trusted: () => caTrusted(caPem, { strict: true }),
+    trust: () => {
+      console.log(isWindows
+        ? "Windows will show the exact local CA fingerprint for your current-user certificate store. Review it before confirming; no administrator rights are needed."
+        : isLinux ? `Trusting the local CA in your user NSS database (${nssDb()}).`
+          : "macOS will ask to trust this local CA in your login keychain.");
+      trustCa(caPem);
+    },
+    untrust: () => untrustCa(caPem, { sweep: false }),
+    apply: state => commitDesktopPicker(file, state.config, () =>
+      applyAppProxy(proxyUrl, home, state.desktop, {}, state.desktopFingerprint)),
+  });
+  console.log("✓ current runtime, connection, configuration and CA verified");
   console.log(`✓ Claude Desktop config library entry applied (${r.id}${r.replaced ? `, previous entry ${r.replaced} remembered` : ""}): egressProxyUrl=${proxyUrl}`);
-  setPickerEnabled(true);
   console.log("✓ picker.enabled = true (the router picks it up live; no restart)");
-  console.log("\nStep 3/3 is yours: quit and reopen Claude Desktop. The app reads its proxy setting at start.");
+  console.log("\nQuit and reopen Claude Desktop. The app reads its proxy setting at start.");
   console.log("Then open the Code tab picker: entries from cli.extraModels should be there. `clauderipple status` shows the last injection.");
 }
 
@@ -142,16 +171,7 @@ function starterConfig(port: number): string {
   return JSON.stringify(
     {
       $docs: "https://github.com/PBJ-2/clauderipple/blob/main/docs/ARCHITECTURE.md",
-      listen: { host: "127.0.0.1", port },
-      upstream: DEFAULTS.upstream,
-      providers: {},
-      routes: {},
-      direct: [],
-      aliases: {},
-      effortClamp: DEFAULTS.effortClamp,
-      cli: { extraModels: [] },
-      health: DEFAULTS.health,
-      log: DEFAULTS.log,
+      ...normalizeConfig({ ...DEFAULTS, listen: { host: "127.0.0.1", port }, providers: {}, routes: {}, direct: [], aliases: {}, cli: { extraModels: [] } }),
     },
     null,
     2,
@@ -187,7 +207,7 @@ async function image(): Promise<void> {
   const headers = { "content-type": "application/json", ...(session && /^[\w-]{1,128}$/.test(session) ? { "x-claude-code-session-id": session } : {}) };
   let res: Response;
   try {
-    res = await fetch(`http://127.0.0.1:${port}/api/image`, { method: "POST", headers, body: JSON.stringify(body) });
+    res = await adminFetch(`http://127.0.0.1:${port}/api/image`, { method: "POST", headers, body: JSON.stringify(body) }, path.dirname(configPath()));
   } catch {
     throw new Error(`the router is not answering on 127.0.0.1:${port}; start it with: clauderipple start`);
   }
@@ -198,17 +218,6 @@ async function image(): Promise<void> {
   fs.mkdirSync(path.dirname(out), { recursive: true });
   fs.writeFileSync(out, Buffer.from(await res.arrayBuffer()));
   console.log(out);
-}
-
-/** The version the router on this admin port reports, or null when it does not answer. */
-async function runningVersion(port: number): Promise<string | null> {
-  try {
-    const res = await fetch(`http://127.0.0.1:${port}/api/status`, { signal: AbortSignal.timeout(10_000) });
-    const version = res.ok ? ((await res.json()) as { version?: unknown }).version : null;
-    return typeof version === "string" ? version : null;
-  } catch {
-    return null;
-  }
 }
 
 function proxyUrlFor(port: number): string {
@@ -227,23 +236,27 @@ async function install(): Promise<void> {
   } else console.log("✓ certificates already present");
 
   if (!fs.existsSync(configPath())) {
-    fs.writeFileSync(configPath(), starterConfig(port), { mode: 0o600 });
+    writeSecretJsonAtomic(configPath(), JSON.parse(starterConfig(port)));
     console.log(`✓ starter config written: ${configPath()}`);
   } else console.log(`✓ config kept: ${configPath()}`);
 
   const cfg = new ConfigStore(configPath()).get();
   const proxyUrl = proxyUrlFor(cfg.listen.port);
   const caPath = certPaths(home).caPem;
-  const maxCtx = opt("max-context-tokens");
+  const modelOptions = installModelOptions(cfg, opt("max-context-tokens"));
   // settings.json is written last, after the probe: from that write on, every new Claude Code
   // session sends everything to this router, so it must not point at one that never came up.
   // A foreign proxy is still refused here, before anything is registered.
   const direct = fs.existsSync(path.join(home, "direct.json"));
   if (!direct) checkProxyEnv({ proxyUrl, force: flag("force") });
+  // Captured before registration/start, then checked against the live process and read again
+  // before settings change. The version is shared with upstream and cannot identify this code.
+  const expectedCodeIdentity = captureRouterCodeIdentity(installedRuntime);
 
   // Persist the single execution contract so the GUI, admin API, hooks, and supervisor all use
   // this installation's runtime rather than any Node installation on the user's PATH.
   writePaths(installedRuntime, home);
+  recordAdminRuntime(home, installedRuntime);
   const shim = dropPowerShellShim(installKind(installedRuntime));
   if (shim) console.log(`✓ removed ${shim}: PowerShell's default policy refuses it, and clauderipple.cmd runs instead`);
   // Windows and Linux register node + the router script directly (schtasks.ts writes its own .cmd
@@ -262,7 +275,7 @@ async function install(): Promise<void> {
   // and believe it only once the router's process exists (supervisor.startRouter).
   // Durable before the successor router starts: its own completion does not imply host application.
   try {
-    requestHostUpdate(home, VERSION);
+    if (!personalMode(cfg)) requestHostUpdate(home, VERSION);
   } catch (error) {
     // Bookkeeping for the phone host must never abort an install (issue #125: one refused rename
     // skipped the router restart, the probe and settings). The router retries it once the record
@@ -273,38 +286,55 @@ async function install(): Promise<void> {
   console.log(
     started === "failed" ? `✗ could not start the router (${supervisorName()})`
     : started === "started-directly" ? `! router started without the ${supervisorName()}. ${resupervise()}`
-    : `✓ router ${started === "already-running" ? "already running" : "started"}`,
+    : started === "already-running" || started === "started" ? `✓ router ${started === "already-running" ? "already running" : "started"}`
+    : describeOwnership(started),
   );
-  // Running the installer again is how an update arrives, and it replaces files, not the process:
-  // a router left alone keeps serving the old code until the next login. Restart one that
-  // answers with another version.
-  if (started === "already-running") {
-    const running = await runningVersion(adminPort(cfg));
-    if (running && running !== VERSION) {
-      console.log(`  the running router is ${running}; restarting it on ${VERSION}`);
-      const restarted = restartAgent({ onProgress: (m) => console.log(`  ${m}`) });
-      console.log(describeRestart(restarted));
-      if (restarted === "failed") {
-        // The old router may still be answering, so the probe below would pass and the installer
-        // would report a version it never switched to — what the tray showed as "updated" while
-        // the version stayed old until `repair` (#62, #80).
-        process.exitCode = 1;
-        console.log(`${settingsPath()} was left as it was: the router was not switched to ${VERSION}. Run \`clauderipple restart\`, then install again.`);
-        return;
-      }
-    }
-  }
-
-  const p = await probeWithRetry({ host: cfg.listen.host, port: cfg.listen.port, caPem: caPath, upstream: cfg.upstream });
-  console.log(p.ok ? `✓ end-to-end probe passed (${p.detail}, ${p.ms}ms)` : `✗ probe failed: ${p.detail}`);
-  if (!p.ok) {
+  let edit: ReturnType<typeof applyProxyEnv>;
+  let applyingSettings = false;
+  try {
+    edit = await verifyAndApplyInstall({
+      started,
+      target: { version: VERSION, node: installedRuntime.node, router: installedRuntime.router,
+        codeIdentity: expectedCodeIdentity, listen: cfg.listen, upstream: cfg.upstream },
+      deps: {
+        status: async signal => {
+          const response = await adminFetch(`http://127.0.0.1:${adminPort(cfg)}/api/status`, { signal }, home);
+          if (!response.ok) { await response.body?.cancel(); throw new Error("Secure router status was refused"); }
+          return response.json();
+        },
+        installationId: () => readInstallationId(home),
+        captureIdentity: () => captureRouterCodeIdentity(installedRuntime),
+        restart: () => {
+          console.log("  the authenticated router is running different code; requesting an ownership-checked restart");
+          return restartAgent({ onProgress: m => console.log(`  ${m}`), home });
+        },
+        onRestart: result => console.log(describeRestart(result)),
+      },
+      probe: () => probeWithRetry({ host: cfg.listen.host, port: cfg.listen.port, caPem: caPath, upstream: cfg.upstream }),
+      onProbe: result => console.log(result.ok ? `✓ end-to-end probe passed (${result.detail}, ${result.ms}ms)` : `✗ probe failed: ${result.detail}`),
+      // Personal Desktop owns only its proxy keys: model defaults and global context caps stay
+      // unchanged. No client state changes before the identity survives the data-plane probe.
+      apply: () => {
+        applyingSettings = true;
+        return applyProxyEnv({ proxyUrl, caPath, force: flag("force"), ...modelOptions, respectDirect: true, home });
+      },
+    });
+  } catch (error) {
     process.exitCode = 1;
-    console.log(`${settingsPath()} was left as it was, so Claude Code does not depend on a router that is not answering. Fix the router, then run install again.`);
+    console.error(`✗ installation verification failed: ${(error as Error).message}`);
+    console.log(applyingSettings
+      ? `The verified router is running, but the client settings update failed. Inspect ${settingsPath()} and its backup before retrying; a completed settings write has not been rolled back automatically.`
+      : `${settingsPath()} was left as it was. Private setup files or a service registration may have been created; no client proxy change was applied. Confirm the fixed source, stop only a known older installation using its own controls, then retry.`);
     return;
   }
-  // The cap sits at Claude Code's ceiling for a per-model window, so each routed model compacts at
-  // its own window from the bootstrap (CLI_WINDOW_MAX); a flag still sets another.
-  const edit = applyProxyEnv({ proxyUrl, caPath, force: flag("force"), maxContextTokens: maxCtx ? Number(maxCtx) : CLI_WINDOW_MAX, models: cfg.cli.models ?? {}, respectDirect: true, home });
+  console.log(`✓ authenticated router code verified (${expectedCodeIdentity.sha256.slice(0, 12)})`);
+  const installedProxy = currentProxyEnv();
+  if (!direct && (installedProxy.HTTPS_PROXY !== proxyUrl || installedProxy.NODE_EXTRA_CA_CERTS !== caPath)) {
+    process.exitCode = 1;
+    console.error(`✗ the verified router is running, but ${settingsPath()} does not point at it; installation is incomplete`);
+    for (const note of edit.notes) console.log(`  note: ${note}`);
+    return;
+  }
   console.log(edit.changed ? `✓ ${settingsPath()} updated (backup: ${edit.backup ?? "none"})` : `✓ ${settingsPath()} already correct`);
   for (const n of edit.notes) console.log(`  note: ${n}`);
   // Something to double-click for the menu-bar app, which is what offers repair when the router is
@@ -319,7 +349,7 @@ async function install(): Promise<void> {
   // The phone host has the same problem as the router above: new files, old process. The host
   // decides whether it is ours and idle (remote host-service refreshPlan). Never fatal.
   try {
-    execFileSync(installedRuntime.node, [installedRuntime.cli, "remote", "refresh"], { env: { ...process.env, ...installedRuntime.env }, stdio: "inherit" });
+    if (!personalMode(cfg)) execFileSync(installedRuntime.node, [installedRuntime.cli, "remote", "refresh"], { env: { ...process.env, ...installedRuntime.env }, stdio: "inherit" });
   } catch {
     console.log("  호스트 적용 대기: 진행 중인 작업을 유지하며 자동으로 다시 시도합니다.");
   }
@@ -508,12 +538,11 @@ function cliVersions(): string {
   return "none cached";
 }
 
-function ui(): void {
+async function ui(): Promise<void> {
   const cfg = new ConfigStore(configPath()).get();
   const port = adminPort(cfg);
   const url = `http://127.0.0.1:${port}/`;
-  if (openBrowser(url)) console.log(`opened ${url}`);
-  else console.log(`could not open a browser automatically; open this URL yourself: ${url}`);
+  if (!await openAdminDashboard(url, path.dirname(configPath()))) process.exitCode = 1;
 }
 
 function logs(): void {
@@ -555,7 +584,7 @@ function logs(): void {
  */
 async function update(): Promise<void> {
   const kind = installKind(installedRuntime);
-  // CLAUDERIPPLE_PACKAGE names what to install instead of the registry's latest (a tarball, say).
+  // CLAUDERIPPLE_PACKAGE can select an exact clauderipple@x.y.z version instead of registry latest.
   const override = process.env.CLAUDERIPPLE_PACKAGE;
   const latest = override ? null : await latestVersion();
   const newer = latest ? isNewer(latest, VERSION) : true;
@@ -608,6 +637,7 @@ function recoveryDeps(): RecoveryDeps {
       // paths.json is part of what install registers: the GUI and hooks run what it names.
       register: () => {
         writePaths(installedRuntime, home);
+        recordAdminRuntime(home, installedRuntime);
         return ops.register();
       },
       start: () => ops.start(),
@@ -626,7 +656,8 @@ function printDoctor(d: Awaited<ReturnType<typeof import("./doctor.ts").doctor>>
   ];
   const w = Math.max(...rows.map((r) => r[0].length));
   for (const [k, v] of rows) console.log(`${k.padEnd(w)}  ${v}`);
-  if (d.problems.length === 0) console.log("\n✓ no problems found");
+  if (d.nativeIndependence) console.log(`\nnative independence: ${nativeIndependenceSummary(d.nativeIndependence)}`);
+  if (d.problems.length === 0) console.log("\n✓ no operational-health problems found");
   else {
     console.log("\nproblems:");
     for (const p of d.problems) console.log(`  ✗ ${p.message} [${p.code}]`);
@@ -715,9 +746,13 @@ function help(): void {
   remote remove <ssh-host>   undo "remote add" on that host and stop its tunnel
   remote hosts      list remote (SSH) hosts and their tunnels (also shown by "remote status")
   config            print the config file path
-  ui                open the dashboard in your browser
+  ui                open the installed native dashboard (no browser fallback)
   tray [--install]  start the menu-bar / tray app (--install fetches Electron, ~270MB, once)
-  update [--check]  install the latest version the way this one was installed (--check only reports)
+  update --check   report available versions (executable updates are disabled in personal mode)
+  security approve-origin <https-origin> --acknowledge-data-sharing
+                   explicitly allow sensitive data to one exact HTTPS origin before first install
+  security revoke-origin <https-origin>
+                   block future outbound attempts to that origin
   login             add a ChatGPT account (opens your browser; run again to add another — they take turns when one runs out)
   logout            forget every ChatGPT account added with "login" (the Codex CLI's own login is left alone)
   claude-login      connect a Claude subscription in the browser (--setup-token: via \`claude setup-token\`; --manual: paste the code)
@@ -744,7 +779,31 @@ Home directory: ${homeDir()}  (override with CLAUDERIPPLE_HOME)`);
 }
 
 async function dispatchCommand(): Promise<void> {
+  // withCommandHelp has already returned for --help/-h. Plain help also reads no private state.
+  if (cmd !== "help") {
+    const policyStore = new ConfigStore(configPath());
+    configurePersonalEgressPolicy(() => policyStore.get().security);
+    assertPersonalCliCommandAllowed(policyStore.get(), args);
+    // The high-value operations below may launch a router, authenticate, approve an egress
+    // destination or send a prompt. Keep read-only diagnostics and safe rollback available.
+    if (isWindows && personalMode(policyStore.get()) &&
+        !["doctor", "direct", "stop", "uninstall", "help", "repair"].includes(cmd) &&
+        !(cmd === "security" && args[1] === "revoke-origin")) {
+      assertPersonalWindowsNodeEnv();
+    }
+  }
   switch (cmd) {
+    case "security": {
+      const action = args[1], origin = args[2];
+      if ((action !== "approve-origin" && action !== "revoke-origin") || !origin ||
+          args.slice(3).some(argument => argument !== "--acknowledge-data-sharing")) throw new Error(SECURITY_USAGE);
+      const result = updateApprovedOrigin({ file: configPath(), action, origin,
+        acknowledgeDataSharing: flag("acknowledge-data-sharing") });
+      console.log(action === "approve-origin"
+        ? `${result.changed ? "Approved" : "Already approved"}: ${result.origin}. Requests to this origin may carry model inputs and credentials.`
+        : `${result.changed ? "Revoked" : "Not approved"}: ${result.origin}. Future outbound attempts to this origin are blocked.`);
+      break;
+    }
     case "remote": {
       const sub = args[1];
       // Remote (SSH) hosts for Claude Desktop sessions; every other `remote` verb is the phone host's.
@@ -793,6 +852,7 @@ async function dispatchCommand(): Promise<void> {
       await recovery();
       break;
     case "start": {
+      recordAdminRuntime(homeDir(), installedRuntime);
       const r = startAgent({ onProgress: (m) => console.log(`  ${m}`) });
       console.log(
         r === "already-running" ? "already running"
@@ -805,6 +865,7 @@ async function dispatchCommand(): Promise<void> {
       break;
     }
     case "restart": {
+      recordAdminRuntime(homeDir(), installedRuntime);
       const r = restartAgent({ onProgress: (m) => console.log(`  ${m}`) });
       console.log(describeRestart(r));
       if (r === "failed" || r === "other-installation" || r === "ownership-unknown" || r === "identity-unknown") process.exitCode = 1;
@@ -867,6 +928,7 @@ async function dispatchCommand(): Promise<void> {
       const sub = args[1];
       const { setStatusMod, statusModEnabled } = await import("./settings.ts");
       if (sub === "on" || sub === "off") {
+        if (sub === "on") recordAdminRuntime(homeDir(), installedRuntime);
         const r = setStatusMod(sub === "on", installedRuntime.modDir);
         for (const n of r.notes) console.log(`✓ ${n}`);
         if (!r.changed) console.log(`✓ already ${sub}`);
@@ -906,6 +968,7 @@ async function dispatchCommand(): Promise<void> {
       }
       // Our own browser sign-in (PKCE). No terminal interaction unless the loopback port is taken,
       // in which case the code from Anthropic's page is pasted here.
+      authorizeClaudeLocalAuth(homeDir());
       const session = new ClaudeOAuthSession({ home: homeDir(), manual: flag("manual") });
       const { url, manual } = await session.start();
       console.log(manual ? "Opening your browser to sign in to Claude. Paste the code it shows below." : "Opening your browser to sign in to Claude. This window waits up to 5 minutes.");
@@ -959,7 +1022,7 @@ async function dispatchCommand(): Promise<void> {
       const { execRunner } = await import("../../router/src/awake.ts");
       const run = execRunner();
       process.exitCode = await powerCli(args, {
-        call: adminPowerCall(adminPort(new ConfigStore(configPath()).get())),
+        call: adminPowerCall(adminPort(new ConfigStore(configPath()).get()), path.dirname(configPath())),
         configFile: configPath(),
         rippleHome: homeDir(),
         run,
@@ -970,7 +1033,7 @@ async function dispatchCommand(): Promise<void> {
       break;
     }
     case "ui":
-      ui();
+      await ui();
       break;
     case "update":
       await update();

@@ -17,6 +17,63 @@ function currentLogin(getToken: () => string): { credentials(): Promise<Credenti
   };
 }
 
+test("disabled identity access does not inspect credentials, contact upstream or return a previously cached identity", async () => {
+  let enabled = true, credentials = 0, calls = 0;
+  const identity = new ClaudeCurrentIdentity({ credentials: async () => {
+    credentials++;
+    return [{ id: "current:synthetic", ownerId: "current", headers: { authorization: "Bearer synthetic-identity-token" } }];
+  } }, {
+    upstream: () => "api.example.test", enabled: () => enabled,
+    fetch: async () => { calls++; return Response.json(PROFILE); },
+  });
+  assert.equal((await identity.identify())?.email, PROFILE.account.email);
+  enabled = false;
+  assert.equal(await identity.identify(), null);
+  assert.equal(await identity.identifyWith({ authorization: "Bearer synthetic-identity-token" }), null);
+  assert.equal(credentials, 1);
+  assert.equal(calls, 1);
+  enabled = true;
+  assert.equal((await identity.identify())?.email, PROFILE.account.email);
+  assert.equal(calls, 2, "the old cache was discarded, not merely hidden");
+});
+
+test("discard cancels a pending profile and a late response cannot repopulate the identity cache", async () => {
+  let calls = 0, release!: (response: Response) => void;
+  let pendingSignal: AbortSignal | null | undefined;
+  const identity = new ClaudeCurrentIdentity(currentLogin(() => "synthetic-token"), {
+    upstream: () => "api.example.test",
+    fetch: async (_url, init) => {
+      calls++;
+      if (calls > 1) return Response.json(PROFILE);
+      pendingSignal = init.signal;
+      return await new Promise<Response>(resolve => { release = resolve; });
+    },
+  });
+  const lookup = identity.identifyWith({ authorization: "Bearer synthetic-token" });
+  assert.ok(pendingSignal);
+  identity.discard();
+  assert.equal(pendingSignal.aborted, true);
+  // This synthetic transport deliberately ignores the abort to exercise the publication guard.
+  release(Response.json(PROFILE));
+  assert.equal(await lookup, null);
+  assert.equal((await identity.identifyWith({ authorization: "Bearer synthetic-token" }))?.email, PROFILE.account.email);
+  assert.equal(calls, 2);
+});
+
+test("a mode change while credentials are pending prevents the later profile request", async () => {
+  let enabled = true, calls = 0, release!: (value: Credential[]) => void;
+  const identity = new ClaudeCurrentIdentity({ credentials: () => new Promise(resolve => { release = resolve; }) }, {
+    upstream: () => "api.example.test", enabled: () => enabled,
+    fetch: async () => { calls++; return Response.json(PROFILE); },
+  });
+  const lookup = identity.identify();
+  enabled = false;
+  identity.discard();
+  release([{ id: "current:synthetic", ownerId: "current", headers: { authorization: "Bearer synthetic-late-token" } }]);
+  assert.equal(await lookup, null);
+  assert.equal(calls, 0);
+});
+
 test("the profile body reduces to the email and the pool's own subject hash", () => {
   assert.deepEqual(claudeIdentityFromBody(PROFILE), {
     email: "Person@example.test",

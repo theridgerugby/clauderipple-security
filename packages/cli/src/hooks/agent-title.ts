@@ -13,7 +13,8 @@
 // marker at the very top of the prompt, else the agent definition's frontmatter `model:`, else the
 // explicit `model` argument, else the parent session's model from the transcript tail. Depth = the
 // marker's level, else the agent file's `@level`, else the hook input's effort.level, after the
-// router's `effortClamp`. Runs in <50ms, never fails the tool call (empty output = no-op).
+// router's `effortClamp`. Reads the private config with a bounded native decrypt on Windows;
+// never fails the tool call (empty output = no-op).
 //
 // Installed by `clauderipple agent-title on` into ~/.claude/settings.json; the router ships no
 // Python, so this is TypeScript run by the Node recorded in <home>/paths.json.
@@ -22,6 +23,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readPrivateFile } from "../../../router/src/private-file.ts";
 
 type HookInput = {
   tool_name?: string;
@@ -54,7 +56,7 @@ function titleConfig(): TitleConfig {
   const names: Record<string, string> = { "gpt-5.6-terra": "Terra", "gpt-5.6-sol": "Sol", "gpt-5.6-luna": "Luna", "gpt-6-astra": "Astra", "gpt-6-sol": "Sol", "gpt-6-luna": "Luna" };
   const home = process.env.CLAUDERIPPLE_HOME ?? path.join(os.homedir(), ".clauderipple");
   try {
-    const cfg = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8")) as {
+    const cfg = JSON.parse(readPrivateFile(path.join(home, "config.json")).toString("utf8")) as {
       cli?: { extraModels?: { model: string; name?: string }[] };
       providers?: Record<string, { models?: { id: string; name?: string }[] }>;
       aliases?: Record<string, string>;

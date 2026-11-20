@@ -1,3 +1,9 @@
+> **Personal security fork.** Use the [fixed-source Windows installation guide](docs/personal-windows-install.md). This fork denies unapproved data destinations and disables remote features and executable auto-updates. The upstream install commands, npm package, store links and feature claims retained below do not describe this personal build. Bootstrap installers are disabled; do not overwrite it with an upstream installation.
+>
+> Before connecting real accounts or research data, verify the test results for the exact full commit and complete the guide's local acceptance checks.
+>
+> **Native-independence work:** the existing installer still uses shared proxy settings, a local CA and a supervised router. The separate [no-proxy Desktop plugin proof](docs/native-desktop-plugin.md) is default-off, builds without npm runtime dependencies, and has not passed real Desktop acceptance. Its engine-update compatibility uses a passive same-step native traffic contract, with no version pin or extra model probe. It does not migrate or activate an installed client. See the [security profile](docs/personal-security-profile.md) for remaining coupling and the read-only independence audit.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="brand/mark-dark.svg">
@@ -446,8 +452,10 @@ after an npm-only install, `clauderipple tray --install` adds it. Everything els
 clauderipple update
 ```
 
-It updates the way you installed — the install script again, or npm — and restarts the router
-on the new version. The tray's Electron is kept across updates.
+It updates through a copy of the installer bundled with the current installation, or an
+exact-version npm package, and restarts the router on the new version. Automatic installation
+requires explicit `autoUpdate: true`. Older installations without bundled installers need one
+verified manual installation. The tray remains installed and its runtime is refreshed when needed.
 
 Optional, for real names in the Desktop picker: **Clients → Claude Desktop → Model
 picker → on**, then quit and reopen Claude Desktop. To trust the local certificate
@@ -543,8 +551,8 @@ clauderipple image "a red paper boat, flat illustration" -o boat.png --aspect sq
 repeatable) are optional. One image takes about 30 seconds. The subscription
 backend picks the resolution and quality itself, so the shape is asked for in
 words (`--aspect`). The command is a client of `POST /api/image` on the admin
-port, which answers with the image bytes. Generated workers are told the `curl`
-form of it, so a worker with only Bash can make an image and read it back.
+port, which answers with the image bytes. Generated workers use the same CLI
+command, which authenticates locally without putting the admin credential in a prompt.
 
 Claude Code runs `WebSearch` as a separate small-model request. To keep a
 ChatGPT-routed setup from spending Anthropic quota for that request, select the
@@ -704,10 +712,18 @@ Details with sources: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Privacy
 
-Everything runs on 127.0.0.1. API keys live in `~/.clauderipple/config.json`
-and added Claude OAuth grants in `~/.clauderipple/claude-accounts.json` (both
-0600). Admin APIs and logs expose neither tokens nor upstream account ids. The only
-network destinations are the providers you configure. There is no telemetry.
+The admin server listens on 127.0.0.1 and requires a local installation credential
+for administrative reads and writes. Open the dashboard through the tray or
+`clauderipple ui`; an unauthenticated browser tab cannot read its configuration.
+`GET /api/config` and conflict responses mask provider API-key and header fields,
+and a saved-key probe is bound to its saved provider's destination.
+
+API keys remain in `~/.clauderipple/config.json` and added Claude OAuth grants in
+`~/.clauderipple/claude-accounts.json`, with owner-only POSIX permissions. Windows
+storage still depends on the profile/custom-directory ACL. This does not isolate
+credentials from other programs running as the same OS user. Optional Remote has
+its own network access controls. See [security boundaries and validation](docs/security-hardening.md)
+before enabling it or changing trust settings.
 
 ## Status: alpha
 

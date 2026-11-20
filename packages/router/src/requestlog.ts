@@ -2,6 +2,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import zlib from "node:zlib";
 import path from "node:path";
+import { appendPrivateFile, assertPrivateTarget, ensureStorageDirectory, readPrivateFile } from "./private-file.ts";
+import { redactErrorText } from "./redact.ts";
 import type { ThinkingBlock } from "./thinking.ts";
 import { loadAaPricesFrom } from "./prices.ts";
 import { UsageHistory, addConversations, emptyConversations, finishConversations, modelRowOf, recordConversations, addTotals, emptyTotals, finishTotals, recordTotals, sortByVolume, type BucketTotals, type SummaryBucket, type UsageSummary } from "./usage-history.ts";
@@ -109,12 +111,19 @@ export class RequestLog {
   private readonly max: number;
   private readonly maxBytes: number;
   private records: RequestRecord[];
-  private readonly history: UsageHistory;
+  private readonly history: UsageHistory | null;
+  private readonly memoryOnly: boolean;
 
-  constructor(file: string, max = 2000, maxBytes = DEFAULT_MAX_BYTES) {
+  constructor(file: string, max = 2000, maxBytes = DEFAULT_MAX_BYTES, memoryOnly = false) {
     this.file = file;
     this.max = max;
     this.maxBytes = maxBytes;
+    this.memoryOnly = memoryOnly;
+    if (memoryOnly) {
+      this.records = [];
+      this.history = null;
+      return;
+    }
     const persisted = this.readRecords(this.file);
     this.records = persisted.slice(-this.max);
     this.history = new UsageHistory(path.join(path.dirname(file), "usage-hourly.jsonl"));
@@ -133,12 +142,15 @@ export class RequestLog {
   }
 
   add(record: RequestRecord): void {
-    this.history.add(record);
+    if (record.note) record = { ...record, note: redactErrorText(record.note, [], 2_000) };
+    this.history?.add(record);
     this.records.push(record);
     if (this.records.length > this.max) this.records.splice(0, this.records.length - this.max);
+    if (this.memoryOnly) return;
     const line = JSON.stringify(record) + "\n";
     try {
-      fs.mkdirSync(path.dirname(this.file), { recursive: true });
+      ensureStorageDirectory(path.dirname(this.file));
+      assertPrivateTarget(this.file);
       const bytes = Buffer.byteLength(line);
       const size = fs.existsSync(this.file) ? fs.statSync(this.file).size : 0;
       if (size > 0 && size + bytes > this.maxBytes) {
@@ -146,7 +158,7 @@ export class RequestLog {
         fs.rmSync(previous, { force: true });
         fs.renameSync(this.file, previous);
       }
-      fs.appendFileSync(this.file, line, "utf8");
+      appendPrivateFile(this.file, line);
     } catch {
       // Request logging must never alter the proxy response path.
     }
@@ -167,7 +179,7 @@ export class RequestLog {
   }
 
   /** Summarise records at or after an epoch timestamp in milliseconds. */
-  summary(sinceMs: number): RequestSummary {
+  summary(sinceMs: number, untilMs = Infinity): RequestSummary {
     const total = emptyTotals();
     const conversations = emptyConversations();
     const providerConversations = new Map<string, ReturnType<typeof emptyConversations>>();
@@ -175,7 +187,7 @@ export class RequestLog {
     const models = new Map<string, { totals: BucketTotals; provider: string; model: string; purpose?: "web-search" }>();
     for (const record of this.records) {
       const at = Date.parse(record.at);
-      if (!Number.isFinite(at) || at < sinceMs) continue;
+      if (!Number.isFinite(at) || at < sinceMs || at >= untilMs) continue;
       const accounting = recordConversations(record);
       addConversations(conversations, accounting);
       const perProvider = providerConversations.get(record.provider) ?? emptyConversations();
@@ -199,12 +211,15 @@ export class RequestLog {
 
   /** Durable hourly usage over [fromMs, toMs), beyond the in-memory ring. */
   usage(fromMs: number, toMs: number): UsageSummary {
-    return this.history.summary(fromMs, toMs);
+    return this.history?.summary(fromMs, toMs) ?? { ...this.summary(fromMs, toMs), earliest: this.records[0]?.at ?? null };
   }
 
   private readRecords(file: string): RequestRecord[] {
     try {
-      return fs.readFileSync(file, "utf8")
+      // Both the active and rotated log get the same descriptor/owner checks at startup.
+      // A record can cross the configured rotation boundary, so allow up to the global
+      // private-read ceiling rather than rejecting a legitimate last record at maxBytes.
+      return readPrivateFile(file, 64 * 1024 * 1024).toString("utf8")
         .split("\n")
         .flatMap((line) => {
           try {
@@ -225,9 +240,9 @@ export class RequestLog {
  * constructor replays the hours the history has not written yet, and a replayed record is priced as it
  * is added, so loading the prices after this would persist those non-Claude requests as unpriced.
  */
-export function openRequestLog(home: string): RequestLog {
+export function openRequestLog(home: string, memoryOnly = false): RequestLog {
   loadAaPricesFrom(path.join(home, "aa-models.json"));
-  return new RequestLog(path.join(home, "logs", "requests.jsonl"));
+  return new RequestLog(path.join(home, "logs", "requests.jsonl"), 2000, DEFAULT_MAX_BYTES, memoryOnly);
 }
 
 /** The hour of a file's last write, or null when it does not exist. */

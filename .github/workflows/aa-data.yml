@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: aa-data
@@ -17,9 +17,14 @@ jobs:
   dataset:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    outputs:
+      publish: ${{ steps.compare.outputs.publish }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
           node-version: 24
           package-manager-cache: false
@@ -52,15 +57,47 @@ jobs:
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `publish=${changed || weekly}\n`);
           JS
 
-      - name: Replace data branch with one commit
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        id: upload
         if: steps.compare.outputs.publish == 'true'
+        with:
+          name: aa-model-data
+          path: ${{ runner.temp }}/aa-models.json
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: dataset
+    if: needs.dataset.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      # This write-enabled job never checks out or executes the dataset fetcher's source and has
+      # no AA API key. Its input is a data-only artifact from this same successful workflow run.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.dataset.outputs.artifact-id }}
+          path: dataset
+          merge-multiple: true
+          digest-mismatch: error
+      - name: Replace data branch with one commit
+        env:
+          PUSH_TOKEN: ${{ github.token }}
         run: |
-          git switch --orphan aa-data-publish
-          git rm -rf --ignore-unmatch .
-          git clean -fd
-          cp "$RUNNER_TEMP/aa-models.json" aa-models.json
+          set -euo pipefail
+          publication="$(mktemp -d "$RUNNER_TEMP/aa-publish.XXXXXX")"
+          cp dataset/aa-models.json "$publication/aa-models.json"
+          cd "$publication"
+          git init -b data
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add aa-models.json
           git commit -m "data: refresh Artificial Analysis model scores" -m "Keep measured intelligence and USD cost per task current without growing dataset history." -m "Co-Authored-By: Claude Code <noreply@anthropic.com>"
-          git push --force origin HEAD:refs/heads/data
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          authorization="$(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$authorization"
+          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $authorization" \
+            git push --force origin HEAD:refs/heads/data

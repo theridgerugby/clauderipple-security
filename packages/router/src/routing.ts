@@ -15,6 +15,7 @@ import { bareOwners, claudePoolProvider, ingressOnly, qualifiedModel, rawDeclare
 export { qualifiedModel, declaredBy, pinnedModel } from "./targets.ts";
 import { isWebFetchRequest } from "./webfetch.ts";
 import { webSearchQuery } from "./websearch.ts";
+import { preserveNativeDesktopModel } from "./desktop-policy.ts";
 
 /** What a request is, decided once from its body and path. The order below is the precedence. */
 export type RequestKind = "web-search" | "web-fetch" | "auto-mode-classifier" | "compaction" | "turn";
@@ -196,15 +197,19 @@ function resolveMarker(hit: ReturnType<typeof scanMarker>, aliases: Record<strin
  */
 export function decide(model: unknown, body: unknown, cfg: Config, kind: RequestKind, claudePool = false): Decision {
   if (typeof model !== "string") return { route: null, refusal: null };
-  const routed = (route: Omit<Resolved, "kind" | "asked">): Decision => ({
-    route: { ...route, kind, asked: model },
-    refusal: null,
-  });
+  if (preserveNativeDesktopModel(cfg, model)) return { route: null, refusal: null };
+  const desktopOnly = cfg.security?.mode === "personal" && cfg.picker?.enabled === true;
+  const routed = (route: Omit<Resolved, "kind" | "asked">): Decision => {
+    // The personal Desktop menu names the primary explicitly. A saved worker/route ladder
+    // must not silently choose another model or another provider when that primary is busy.
+    const { fallbacks, ...primary } = route;
+    return { route: { ...(desktopOnly ? primary : route), kind, asked: model }, refusal: null };
+  };
 
   // The engine's own AUTO_MODE_MODEL env var refuses Sonnet 5.5, Opus 5.5 and Opus 5 (CLI 2.1.310),
   // so the target is chosen here. The request kind was matched against the classifier's system
   // prompt before routing; its decision and wire format remain the engine's.
-  if (cfg.autoModeClassifier && kind === "auto-mode-classifier") {
+  if (!desktopOnly && cfg.autoModeClassifier && kind === "auto-mode-classifier") {
     const settings = cfg.autoModeClassifier;
     const stage1 = settings.stage1 !== undefined && isClassifierStage1(body);
     const target = stage1 ? settings.stage1 : settings;
@@ -228,7 +233,8 @@ export function decide(model: unknown, body: unknown, cfg: Config, kind: Request
     effort = model.slice(at + 1) || undefined;
   }
 
-  const marker = scanMarker(body);
+  // In Desktop-only mode prompt text is content, including legacy worker markers.
+  const marker = desktopOnly ? null : scanMarker(body);
   const aliased = marker ? cfg.aliases[marker.name] : undefined;
   const ov = resolveMarker(marker, cfg.aliases);
   // The model the request names in the end: the marker's (through its alias), else the requested one.

@@ -10,6 +10,8 @@ export type Doctor = {
   desktop?: { proxy?: "ripple" | "none" | "other"; url?: string | null };
   cli?: { proxy?: "ripple" | "none" | "other"; url?: string | null };
   problems?: { code?: string; message?: string }[];
+  /** Read-only persisted-state audit, separate from router health; never proves live independence. */
+  nativeIndependence?: { schemaVersion?: number; scope?: string; originalIndependent?: boolean | null; knownCouplingsAbsent?: boolean | null };
 };
 
 /** `clauderipple repair --json`. */
@@ -34,7 +36,8 @@ export type AppState = {
   result: ActionResult | null;
   /** A switch was made and Claude Desktop has not been reopened since. */
   restartClaude: boolean;
-  loginItem: boolean;
+  /** null: the personal setup window is on-demand and has no login-item feature. */
+  loginItem: boolean | null;
   appVersion: string;
   platform: string;
 };

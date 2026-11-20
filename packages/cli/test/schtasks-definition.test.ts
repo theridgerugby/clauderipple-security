@@ -76,16 +76,16 @@ test("launcher waits on the router process alone, never with -Wait (#131)", () =
   const start = lines.findIndex(line => line.includes("Start-Process -FilePath"));
   assert.ok(start >= 0);
   assert.doesNotMatch(launcher, /-Wait\b/);
-  assert.match(lines[start]!, /-PassThru -RedirectStandardOutput \$out -RedirectStandardError \$err$/);
+  assert.match(lines[start]!, /-PassThru$/);
   assert.equal(lines[start + 1]!.trim(), "$null = $p.Handle");
   assert.equal(lines[start + 2]!.trim(), "$p.WaitForExit()");
   // Exit-code handling is unchanged: 0 ends the loop, anything else relaunches after the backoff.
   assert.equal(lines[start + 3]!.trim(), "if ($p.ExitCode -eq 0) { break }");
   assert.ok(lines.slice(start + 4, start + 8).some(line => line.includes("$quickFailures++")));
   assert.ok(lines.some(line => line.trim() === "Start-Sleep -Seconds $(if ($quickFailures -ge 5) { 60 } else { 2 })"));
-  // Redirection to the same log files as before.
-  assert.ok(lines.includes(`$out = '${path.join("C:\\home", "logs", "launcher.log")}'`));
-  assert.ok(lines.includes(`$err = '${path.join("C:\\home", "logs", "launcher.err.log")}'`));
+  // Personal-mode diagnostics stay in the router's bounded RAM history. Unexpected process
+  // stdout/stderr cannot be copied into persistent files by the task launcher.
+  assert.doesNotMatch(launcher, /RedirectStandard(?:Output|Error)|launcher\.err\.log|launcher\.log/);
 });
 
 // #159: a router that is alive but frozen was never restarted, because the launcher only waited for
@@ -113,11 +113,14 @@ test("the router's launcher probes /api/ping and ends only its own child after f
   assert.ok(lines.includes("try { $p.Kill() } catch {}"));
   assert.ok(lines.includes("if (Test-RouterAnswers $adminPort) { $answered = $true; $failures = 0 }"), "one answer clears the count");
   assert.doesNotMatch(launcher, /Stop-Process|taskkill|Get-Process|Get-CimInstance/, "no other process is looked up or touched");
-  assert.equal((launcher.match(/\.Kill\(\)/g) ?? []).length, 1);
-  // The port is the router's: config.admin.port, else listen.port + 1; unreadable config = no probing.
-  assert.ok(lines.includes("if ($cfg.admin -and $cfg.admin.port) { return [int]$cfg.admin.port }"));
-  assert.ok(lines.includes("if ($cfg.listen -and $cfg.listen.port) { return [int]$cfg.listen.port + 1 }"));
-  assert.ok(lines.includes("} catch { return 0 }"));
+  assert.equal((launcher.match(/\.Kill\(\)/g) ?? []).length, 2, "only the owned router and a stuck owned port-reader child can be ended");
+  // The fixed native helper reads encrypted/private config. PowerShell never parses credentials.
+  assert.doesNotMatch(launcher, /Get-Content|ConvertFrom-Json/);
+  assert.match(launcher, /watchdog-port\.ts/);
+  assert.ok(lines.includes("$info.FileName = 'C:\\node.exe'"));
+  assert.ok(lines.includes("if (-not $readerProcess.WaitForExit(30000)) { return 0 }"));
+  assert.ok(lines.includes("$reading = $readerProcess.StandardOutput.ReadBlockAsync($buffer, 0, 6)"));
+  assert.ok(lines.includes("} catch { return 0 } finally {"));
   assert.ok(lines.includes("if ($adminPort -le 0) { continue }"));
   assert.ok(lines.includes(`$watchdogLog = '${path.join("C:\\home", "logs", "launcher-watchdog.log")}'`));
   assert.equal(launcher.charCodeAt(0), 0xFEFF);

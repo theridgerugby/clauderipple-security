@@ -1,11 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import crypto from "node:crypto";
+import { readPrivateFile } from "../src/private-file.ts";
+import { writePrivateFileAtomic, writeSecretJsonAtomic } from "../src/locked-file.ts";
+import { SECRET_FILE_PREFIX, type SecretProtector } from "../src/secret-storage.ts";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, awakeSettings, ssidProblem, tetherSettings, validate, type Config } from "../src/config.ts";
 import { Logger } from "../src/log.ts";
-import { startAdmin } from "../src/admin.ts";
+import { startAdmin, fetch } from "./admin-client.ts";
 import { RequestLog } from "../src/requestlog.ts";
 import { parsePowerChange, persistPowerChange, type PowerApi, type PowerStatus } from "../src/power.ts";
 
@@ -75,7 +79,7 @@ test("PUT /api/power saves mode/until/enabled into the file as it is on disk, pi
       body: JSON.stringify({ awake: { mode: "on", until: "2026-10-20T18:30:00+09:00" }, tether: { enabled: true, pin: true } }),
     });
     assert.equal(res.status, 200);
-    const saved = JSON.parse(fs.readFileSync(configFile, "utf8")) as Config;
+    const saved = JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config;
     assert.deepEqual(saved.awake, { mode: "on", until: "2026-10-20T09:30:00.000Z" });
     assert.deepEqual(saved.tether, { hotspotSsid: "PBJ", enabled: true }, "other tether fields are kept");
     assert.deepEqual(saved.routes, { keep: { provider: "x", model: "y" } }, "the rest of the file is untouched");
@@ -83,7 +87,7 @@ test("PUT /api/power saves mode/until/enabled into the file as it is on disk, pi
     assert.deepEqual(p.log, ["pin true", "poke"]);
     // until: null clears it.
     await fetch(`http://127.0.0.1:${port}/api/power`, { method: "PUT", body: JSON.stringify({ awake: { until: null } }) });
-    assert.deepEqual((JSON.parse(fs.readFileSync(configFile, "utf8")) as Config).awake, { mode: "on" });
+    assert.deepEqual((JSON.parse(readPrivateFile(configFile).toString("utf8")) as Config).awake, { mode: "on" });
   });
 });
 
@@ -179,7 +183,53 @@ test("persistPowerChange writes only what changed and nothing for a pin", () => 
   fs.writeFileSync(file, JSON.stringify({ awake: { batteryFloorPercent: 30 } }));
   assert.equal(persistPowerChange(file, { tether: { pin: true } }), false);
   assert.equal(persistPowerChange(file, { awake: { mode: "working" }, tether: { hotspotSsid: "PBJ" } }), true);
-  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { awake: { batteryFloorPercent: 30, mode: "working" }, tether: { hotspotSsid: "PBJ" } });
+  assert.deepEqual(JSON.parse(readPrivateFile(file).toString("utf8")), { awake: { batteryFloorPercent: 30, mode: "working" }, tether: { hotspotSsid: "PBJ" } });
+});
+
+test("power changes preserve encrypted config and never reserialize provider secrets in plaintext", t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-power-secrets-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "config.json"), key = crypto.randomBytes(32);
+  const protector: SecretProtector = {
+    kind: "test-only-power-ephemeral-aes-gcm",
+    protect(bytes, entropy) {
+      const iv = crypto.randomBytes(12), cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+      cipher.setAAD(entropy);
+      return Buffer.concat([iv, cipher.update(bytes), cipher.final(), cipher.getAuthTag()]);
+    },
+    unprotect(bytes, entropy) {
+      const cipher = crypto.createDecipheriv("aes-256-gcm", key, bytes.subarray(0, 12));
+      cipher.setAAD(entropy); cipher.setAuthTag(bytes.subarray(-16));
+      return Buffer.concat([cipher.update(bytes.subarray(12, -16)), cipher.final()]);
+    },
+  };
+  const provider = { school: { apiKey: "synthetic-school-secret-for-power" } };
+  writeSecretJsonAtomic(file, { providers: provider, awake: { mode: "off" } }, { protector });
+  assert.equal(persistPowerChange(file, { awake: { mode: "working" } }, { protector }), true);
+  const raw = fs.readFileSync(file);
+  assert.ok(raw.toString().startsWith(SECRET_FILE_PREFIX));
+  assert.equal(raw.includes(provider.school.apiKey), false);
+  assert.deepEqual(JSON.parse(readPrivateFile(file, undefined, { protector }).toString()), { providers: provider, awake: { mode: "working" } });
+  assert.deepEqual(fs.readdirSync(dir), ["config.json"], "no plaintext backup or leftover lock exists");
+  // Corruption must not turn a settings save into an empty/plaintext replacement.
+  const envelope = JSON.parse(raw.subarray(SECRET_FILE_PREFIX.length).toString());
+  const cipher = Buffer.from(envelope.ciphertext, "base64"); cipher[20] = cipher[20]! ^ 1;
+  const damaged = Buffer.from(SECRET_FILE_PREFIX + JSON.stringify({ ...envelope, ciphertext: cipher.toString("base64") }));
+  writePrivateFileAtomic(file, damaged);
+  assert.throws(() => persistPowerChange(file, { awake: { mode: "off" } }, { protector }), /could not safely read/);
+  assert.deepEqual(fs.readFileSync(file), damaged);
+});
+
+test("Windows power changes retain native DPAPI protection on ordinary config writes", { skip: process.platform !== "win32" }, t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-power-native-secrets-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "config.json"), secret = "synthetic-native-power-api-key";
+  writeSecretJsonAtomic(file, { providers: { school: { apiKey: secret } } });
+  persistPowerChange(file, { awake: { mode: "working" } });
+  assert.equal(fs.readFileSync(file).includes(secret), false);
+  const saved = JSON.parse(readPrivateFile(file).toString());
+  assert.equal(saved.providers.school.apiKey, secret);
+  assert.equal(saved.awake.mode, "working");
 });
 
 test("config: off by default, validated when present", () => {

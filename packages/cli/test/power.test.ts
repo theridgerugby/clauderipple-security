@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { readPrivateFile } from "../../router/src/private-file.ts";
 import os from "node:os";
 import path from "node:path";
 import { formatPower, parseUntil, powerCli, type PowerCall, type PowerCliDeps } from "../src/power.ts";
@@ -88,11 +89,11 @@ test("with no router: saved to config.json, and awake off clears a bit the route
   fs.writeFileSync(path.join(r.dir, "awake.json"), JSON.stringify({ applied: true, since: "x", reason: "on" }));
   // Only darwin clears the bit; elsewhere releaseAwake reports nothing held.
   assert.equal(await powerCli(["awake", "off"], r.d), 0);
-  assert.deepEqual(JSON.parse(fs.readFileSync(r.configFile, "utf8")).awake, { mode: "off" });
+  assert.deepEqual(JSON.parse(readPrivateFile(r.configFile).toString("utf8")).awake, { mode: "off" });
   if (process.platform === "darwin") assert.deepEqual(r.runs, ["/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0"]);
   else assert.deepEqual(r.runs, []);
   assert.equal(await powerCli(["tether", "on"], r.d), 0);
-  assert.deepEqual(JSON.parse(fs.readFileSync(r.configFile, "utf8")).tether, { enabled: true });
+  assert.deepEqual(JSON.parse(readPrivateFile(r.configFile).toString("utf8")).tether, { enabled: true });
   assert.equal(await powerCli(["power"], r.d), 1, "status needs the router");
 });
 
@@ -110,6 +111,6 @@ test("awake setup --ssid saves the hotspot name after a successful setup", async
   };
   r.d.setupDeps = () => setup;
   assert.equal(await powerCli(["awake", "setup", "--ssid", "PBJ"], r.d), 0);
-  assert.deepEqual(JSON.parse(fs.readFileSync(r.configFile, "utf8")).tether, { hotspotSsid: "PBJ" });
+  assert.deepEqual(JSON.parse(readPrivateFile(r.configFile).toString("utf8")).tether, { hotspotSsid: "PBJ" });
   assert.equal(await powerCli(["awake", "setup", "--ssid"], r.d), 1);
 });

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { AutoUpdater, UPDATE_TIMING as T, type AutoUpdateDeps, type UpdateClock } from "../src/autoupdate.ts";
+import { AutoUpdater, autoUpdateEnabled, UPDATE_TIMING as T, type AutoUpdateDeps, type UpdateClock } from "../src/autoupdate.ts";
 import { ConfigStore, DEFAULTS, validate, type Config } from "../src/config.ts";
 import type { Activity } from "../src/awake.ts";
 import type { CliResult, UpdateCheck } from "../src/cli-control.ts";
@@ -276,7 +276,7 @@ test("stopping or opting out during a pending check prevents automatic installat
   resolve({ ok: true, output: JSON.stringify(f.check) }); await f.clock.flush();
   assert.equal(f.launches, 0); assert.equal(f.clock.tasks.length, 0);
 });
-test("autoUpdate validates booleans and hot-reloads with default-on omission", (t) => {
+test("library update flags validate booleans, while personal ConfigStore never activates executable updates", (t) => {
   const { f } = fixture(t);
   for (const autoUpdate of [true, false]) assert.deepEqual(validate({ ...DEFAULTS, autoUpdate }), []);
   for (const autoUpdate of [null, 0, "false", {}]) {
@@ -284,9 +284,12 @@ test("autoUpdate validates booleans and hot-reloads with default-on omission", (
     assert.ok(validate(config).includes("autoUpdate must be true or false"));
   }
   const file = path.join(f.home, "config.json"); fs.writeFileSync(file, "{}");
-  const store = new ConfigStore(file); assert.notEqual(store.get().autoUpdate, false);
+  const store = new ConfigStore(file); assert.equal(autoUpdateEnabled(store.get()), false);
+  fs.writeFileSync(file, '{"autoUpdate":true}'); fs.utimesSync(file, 4000, 4000);
+  assert.equal(autoUpdateEnabled(store.get()), false);
+  assert.deepEqual(store.get().security, { mode: "personal", approvedOrigins: [] });
   fs.writeFileSync(file, '{"autoUpdate":false}'); fs.utimesSync(file, 5000, 5000);
-  assert.equal(store.get().autoUpdate, false);
+  assert.equal(autoUpdateEnabled(store.get()), false);
   fs.writeFileSync(file, '{}'); fs.utimesSync(file, 6000, 6000);
-  assert.notEqual(store.get().autoUpdate, false);
+  assert.equal(autoUpdateEnabled(store.get()), false);
 });

@@ -24,6 +24,7 @@ import { Sessions } from "../src/sessions.ts";
 import type { QueryFn, SdkUserMessage } from "../src/sessions.ts";
 import { bridgeFixture, bridgeId, tick } from "./bridge-fixture.ts";
 import { claudeAppData } from "./app-data.ts";
+import { peerFixtureUrl } from "./peer-fixture.ts";
 
 // Limits for a stalled test, not for a slow one: a passing test never waits them out. 4.5 s and 2 s
 // ran out on a loaded Windows CI runner while the host was still answering (2026-10-29, #98).
@@ -156,8 +157,9 @@ async function fixture(t: TestContext, extra: Partial<ServerOptions> = {}, deskt
   });
   await server.listen();
   const port = server.address().port;
+  const peerUrl = await peerFixtureUrl(t, server);
   const connect = async () => {
-    const peer = new Peer(`ws://127.0.0.1:${port}/ws`);
+    const peer = new Peer(peerUrl);
     peers.push(peer);
     await peer.open();
     return peer;
@@ -570,7 +572,7 @@ test("legacy clients get an error for partial settings; negotiated clients retai
   const peers: Peer[] = [];
   t.after(() => peers.forEach(p => p.ws.terminate()));
   for (const features of [undefined, ["settingsResult"]]) {
-    const peer = new Peer(`ws://127.0.0.1:${server.address().port}/ws`);
+    const peer = new Peer(await peerFixtureUrl(t, server));
     peers.push(peer); await peer.open();
     peer.ws.send(JSON.stringify({ t: "hello", token, clientId: "compat", features }));
     await peer.take("ready");
@@ -1112,19 +1114,19 @@ test("a session read on a visible phone loses the app's unread dot in the next l
   assert.equal(unread(), true, "a background seen cannot mark the app's dot read");
 });
 
-test("WebSocket upgrade refuses an evil Origin", { timeout: TEST_TIMEOUT }, async t => {
+test("public WebSocket upgrade refuses all origins before any phone credential or session can be sent", { timeout: TEST_TIMEOUT }, async t => {
   const f = await fixture(t);
-  await new Promise<void>((resolve, reject) => {
+  for (const origin of [undefined, "http://evil.example", `http://127.0.0.1:${f.port}`]) await new Promise<void>((resolve, reject) => {
     const req = http.request({ hostname: "127.0.0.1", port: f.port, path: "/ws", agent: false,
-      headers: { Origin: "http://evil.example", Connection: "Upgrade", Upgrade: "websocket", "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": Buffer.alloc(16).toString("base64") },
+      headers: { ...(origin ? { Origin: origin } : {}), Connection: "Upgrade", Upgrade: "websocket", "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": Buffer.alloc(16).toString("base64") },
     });
     t.after(() => req.destroy());
-    req.on("upgrade", (_res, socket) => { socket.destroy(); reject(new Error("Cross-origin upgrade was accepted")); });
-    req.on("response", res => { res.resume(); reject(new Error(`Expected refused upgrade, received HTTP ${res.statusCode}`)); });
-    req.on("error", error => {
-      if ((error as NodeJS.ErrnoException).code !== "ECONNRESET") { reject(error); return; }
-      resolve();
-    });
+    req.on("upgrade", (_res, socket) => { socket.destroy(); reject(new Error("Unsafe public upgrade was accepted")); });
+    req.on("response", res => { res.resume(); res.on("end", () => {
+      try { assert.equal(res.statusCode, 410); assert.equal(res.headers.connection, "close"); resolve(); }
+      catch (error) { reject(error); }
+    }); });
+    req.on("error", reject);
     req.setTimeout(2000, () => req.destroy(new Error("Upgrade test timed out")));
     req.end();
   });
@@ -1746,7 +1748,7 @@ test("a send orphaned by a host restart answers outcome_unknown over the socket 
   sessions = new Sessions({ dir, router, permissions: PermissionQueue.open(permissionsFile), queryFn: fake.queryFn, coalesceMs: 5, onEvent: () => {}, onSessions: () => {} });
   server = new HostServer({ listen: "127.0.0.1", port: 0, token, webDir, sessions, router, hostName: "test-host", version: "test-version", recentCli: async () => [], log: () => {} });
   await server.listen();
-  const peer = new Peer(`ws://127.0.0.1:${server.address().port}/ws`);
+  const peer = new Peer(await peerFixtureUrl(t, server));
   peers.push(peer);
   await peer.open();
   peer.send({ t: "hello", token, clientId: "restart-client" });

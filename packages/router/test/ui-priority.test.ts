@@ -3,6 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { desktopUiGuardSource } from "./ui-native-fixture.ts";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PROCESS_PRIORITIES, validate, DEFAULTS } from "../src/config.ts";
@@ -26,7 +27,8 @@ function loadRow(state: State | undefined, answers: { confirm?: boolean } = {}) 
     confirms: [] as string[],
   };
   const run = new Function("h", `
-    let status = h.status, currentConfig = null;
+    let status = h.status, currentConfig = {};
+    ${desktopUiGuardSource(source)}
     const t = (key, vars) => vars ? key + JSON.stringify(vars) : key;
     const el = (tag, attrs) => ({ tag, ...attrs });
     const cell = (label, value, sub) => ({ label, value, sub });

@@ -13,12 +13,14 @@
 // again as the same pair replaces that account instead of adding a duplicate.
 
 import crypto from "node:crypto";
+import { guardEgressFetch, isEgressPolicyError } from "../../egress.ts";
 import fs from "node:fs";
 import path from "node:path";
 import type { Logger } from "../../log.ts";
 import type { Credential } from "../../pool.ts";
 import { redactErrorText } from "../../redact.ts";
-import { withFileLock, writeJsonAtomic } from "../../locked-file.ts";
+import { migrateSecretFile, withFileLock, writeSecretJsonAtomic } from "../../locked-file.ts";
+import { readPrivateFile } from "../../private-file.ts";
 import { legacyMigrationDurable } from "../anthropic-accounts.ts";
 import { OAUTH, identityFromTokens, ownAuthPath, readBorrowed, readOwn, type Tokens } from "./auth.ts";
 
@@ -84,7 +86,7 @@ function validAccount(value: unknown): value is ChatGptAccount {
 /** The file's accounts; [] when absent, null when unreadable (so a mutation refuses to overwrite it). */
 function parseAccountsFile(home: string): ChatGptAccount[] | null {
   try {
-    const parsed = JSON.parse(fs.readFileSync(chatgptAccountsPath(home), "utf8")) as Partial<AccountsFile>;
+    const parsed = JSON.parse(readPrivateFile(chatgptAccountsPath(home)).toString("utf8")) as Partial<AccountsFile>;
     if (parsed.version !== 1 || !Array.isArray(parsed.accounts) || !parsed.accounts.every(validAccount)) return null;
     const seen = new Set<string>();
     return parsed.accounts.filter((account) => !seen.has(account.id) && seen.add(account.id)).map((account) => ({ ...account }));
@@ -124,6 +126,7 @@ function withLegacy(home: string, accounts: ChatGptAccount[]): ChatGptAccount[] 
 
 /** Every stored account. Once the pool file exists it is the only source: a stale legacy file cannot resurrect a removed login. */
 export function readChatGptAccounts(home: string): ChatGptAccount[] {
+  try { migrateSecretFile(chatgptAccountsPath(home)); } catch { return []; }
   const accounts = parseAccountsFile(home);
   if (accounts === null) return [];
   return fs.existsSync(chatgptAccountsPath(home)) ? accounts : withLegacy(home, accounts);
@@ -136,11 +139,12 @@ function readForMutation(home: string): ChatGptAccount[] {
 }
 
 function write(home: string, accounts: ChatGptAccount[]): void {
-  const { directoryDurable } = writeJsonAtomic(chatgptAccountsPath(home), { version: 1, accounts } satisfies AccountsFile);
+  const { directoryDurable } = writeSecretJsonAtomic(chatgptAccountsPath(home), { version: 1, accounts } satisfies AccountsFile);
   if (legacyMigrationDurable(directoryDurable) && fs.existsSync(ownAuthPath(home))) fs.rmSync(ownAuthPath(home), { force: true });
 }
 
 function mutate<T>(home: string, change: (accounts: ChatGptAccount[]) => { accounts?: ChatGptAccount[]; result: T }): T {
+  migrateSecretFile(chatgptAccountsPath(home));
   return withFileLock(chatgptAccountsPath(home), () => {
     const { accounts, result } = change(readForMutation(home));
     if (accounts) write(home, accounts);
@@ -305,13 +309,14 @@ export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
 export async function refreshChatGptGrant(refreshToken: string, previous: { accountId: string }, fetchImpl: FetchLike = fetch, now = Date.now): Promise<ChatGptGrant> {
   let res: Response;
   try {
-    res = await fetchImpl(OAUTH.tokenUrl, {
+    res = await guardEgressFetch(fetchImpl)(OAUTH.tokenUrl, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: OAUTH.clientId }),
       signal: AbortSignal.timeout(30_000),
     });
   } catch (error) {
+    if (isEgressPolicyError(error)) throw error;
     throw new ChatGptRefreshError(`token refresh unreachable: ${(error as Error).message}`, false);
   }
   const text = await res.text().catch(() => "");
@@ -457,6 +462,7 @@ export class ChatGptAccountPool {
         }
       },
       (error: Error) => {
+        if (isEgressPolicyError(error)) throw error;
         if (error instanceof ChatGptRefreshError && error.terminal) {
           markChatGptNeedsReauth(this.home, account.id, account.accessToken);
           this.log.warn(`chatgpt account ${account.id.slice(0, 8)}: refresh rejected; sign-in required`);

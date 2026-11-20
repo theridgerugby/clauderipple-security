@@ -16,6 +16,7 @@ import os from "node:os";
 import path from "node:path";
 import { adminPort, homeDir, type Config, type Provider } from "./config.ts";
 import { withFileLock } from "./locked-file.ts";
+import { ensurePrivateDirectory } from "./private-file.ts";
 import { accountPinFor, declaredBy, pinnedModel, qualifiedModel } from "./routing.ts";
 import { storedAccountsFor, storedAccountsSignature, type PinnedAccount } from "./pinned-accounts.ts";
 import { bareOwners, isTargetProvider, namedOnly } from "./targets.ts";
@@ -58,15 +59,15 @@ const BODY = [
 
 /**
  * Added to the body when a ChatGPT provider is configured: how a worker makes an image. A worker has
- * no image tool, and `clauderipple` is not on PATH for everyone (a checkout runs from source), so
- * the instruction is the admin endpoint itself, which curl reaches on every platform. A GPT main
+ * no image tool. The CLI reads the local admin credential without putting it in the generated
+ * agent file or a shell command. A source checkout needs its CLI launcher on PATH. A GPT main
  * session gets the same lines in its instructions (proxy.ts).
  */
-export function imageLine(port: number): string {
+export function imageLine(_port: number): string {
   return [
     "이미지가 필요하면 ChatGPT 구독으로 만든다(한 장 30초~수 분):",
-    `\`curl -sS --fail-with-body -o <절대경로>.png -H 'content-type: application/json' -d '{"prompt":"…"}' http://127.0.0.1:${port}/api/image\``,
-    "선택 키: aspect(square·landscape·portrait), background(transparent), format(png·jpeg·webp), images(참고 이미지 data: URL 목록). 해상도·품질은 지정할 수 없다. 실패하면 그 파일에 오류 JSON이 담긴다. 만든 뒤 Read로 확인한다.",
+    "`clauderipple image '…' -o <절대경로>.png`",
+    "선택 옵션: --aspect square|landscape|portrait, --transparent, --format png|jpeg|webp, --ref <참고 이미지 경로>(반복 가능). 해상도·품질은 지정할 수 없다. CLI가 로컬 인증을 처리하므로 토큰을 명령줄에 넣지 않는다. 만든 뒤 Read로 확인한다.",
   ].join("\n");
 }
 
@@ -481,11 +482,16 @@ function readManifest(file: string, strict = false): Manifest {
  * The shared worker folder's lock. The manifest is per home, but the files are one folder for every
  * installation on the account, so two routers or an install and a router would otherwise write the
  * same name over each other (2026-10-25 lock audit). The lock lives outside the folder so Claude
- * Code's watcher never sees it.
+ * Code's watcher never sees it. The shared system temp directory is commonly root-owned on
+ * Linux; own only a private per-user child, never change or trust the shared parent's ownership.
  */
 function agentDirLock(dir: string): string {
   const key = crypto.createHash("sha256").update(path.resolve(dir)).digest("hex").slice(0, 16);
-  return path.join(os.tmpdir(), `clauderipple-agents-${key}`);
+  const user = typeof process.getuid === "function" ? `uid-${process.getuid()}`
+    : crypto.createHash("sha256").update(os.homedir()).digest("hex").slice(0, 16);
+  const locks = path.join(os.tmpdir(), `clauderipple-agent-locks-${user}`);
+  ensurePrivateDirectory(locks);
+  return path.join(locks, `agents-${key}`);
 }
 
 /**

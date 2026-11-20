@@ -1,0 +1,29 @@
+{
+  "name": "gemini-native-experimental",
+  "displayName": "Gemini Carbon isolation proof (experimental)",
+  "version": "0.0.1",
+  "description": "Default-off Desktop Code main-loop isolation proof. Adds a separate selector above the input. Gemini replies are buffered; native subagents/background requests still use Claude. The original model menu is unchanged. Uses passive native contract checks on each engine version instead of manual per-release pins.",
+  "author": { "name": "ClaudeRipple" },
+  "license": "GPL-3.0-only",
+  "engines": { "claude-code": ">=2.1.323" },
+  "userConfig": {
+    "consent": {
+      "type": "boolean",
+      "title": "Enable the experimental Desktop selector",
+      "description": "Opt in to an AbovePrompt selector and buffered Gemini main-loop responses sent to Google AI Studio. Gemini becomes available after an ordinary native Claude turn confirms the engine interface in this session. Subagents/background inference remains native and may use Claude subscription quota. Real Windows/Desktop acceptance is pending.",
+      "default": false
+    },
+    "api_key": {
+      "type": "string",
+      "title": "Google AI Studio API key",
+      "description": "Optional while using native Claude. Stored as a sensitive plugin option. Used only after explicitly selecting Gemini.",
+      "sensitive": true
+    },
+    "node_path": {
+      "type": "string",
+      "title": "Absolute path to a trusted Node.js 24 executable",
+      "description": "Used only for a selected Gemini request. No shell, PATH lookup, background listener, or watchdog is used.",
+      "default": ""
+    }
+  }
+}

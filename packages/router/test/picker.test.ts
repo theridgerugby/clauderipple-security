@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { injectPickerModels, isBootstrapPath } from "../src/picker.ts";
+import { chatPickerModels, DESKTOP_PICKER_ROW_LIMIT, injectPickerModels, isBootstrapPath, personalPickerModelProblem } from "../src/picker.ts";
+import { DEFAULTS, type Config } from "../src/config.ts";
 
 const bootstrap = () => ({
   account: { uuid: "x" },
@@ -103,6 +104,12 @@ test("no-ops on unexpected shapes", () => {
   assert.equal(injectPickerModels({}, [{ model: "m", name: "M" }]).injected, 0);
   assert.equal(injectPickerModels({ model_selector_config: "nope" }, [{ model: "m", name: "M" }]).injected, 0);
   assert.equal(injectPickerModels({ model_selector_config: [{ id: "code", models: [{ id: "other-model" }] }] }, [{ model: "m", name: "M" }]).injected, 0, "no Claude template → skip");
+  for (const malformed of [null, "future-format", 42, ["nested"]]) {
+    const json = { model_selector_config: [{ id: "code", models: [{ id: "claude-opus-5-5" }, malformed] }] };
+    const before = JSON.stringify(json);
+    assert.equal(injectPickerModels(json, [{ model: "m", name: "M" }], undefined, undefined, { codeOnly: true, compatibleCodeSurfaces: ["code"] }).injected, 0);
+    assert.equal(JSON.stringify(json), before, "unknown model-list shape stays unchanged");
+  }
 });
 
 // The app builds each entry's effort menu from its own `thinking.effort_options` (Code tab bundle,
@@ -128,4 +135,149 @@ test("a routed model's effort menu is narrowed to the levels it takes, with high
   assert.deepEqual(by["gpt-x@medium"]!.thinking?.effort_options.map((o) => o.id), ["low", "medium"], "looked up by the id without its @effort");
   assert.equal(by["claude-opus-5-5"]!.thinking?.effort_options.length, 5, "the Claude entry itself is untouched");
   assert.equal(by["claude-opus-5-5"]!.thinking?.effort_options.find((o) => o.id === "xhigh")?.recommended, true);
+});
+
+test("personal Desktop scope appends only to known Code surfaces and preserves native entries exactly", () => {
+  // This is a synthetic bootstrap-shape regression, not a live Desktop/account compatibility test.
+  const native = [
+    { id: "claude-opus-5-5", name: "Opus 5.5", section: "main", is_default: true, context_window: 1_000_000,
+      thinking: { effort_options: [{ id: "medium", recommended: true }, { id: "high" }, { id: "max" }] }, unknown_native_flag: { keep: [1, 2] } },
+    { id: "claude-sonnet-5-5", name: "Sonnet 5.5", section: "main", context_window: 200_000 },
+    { id: "claude-fable-5-2", name: "Fable 5.2", section: "main", notice: "Requires usage credits" },
+    { id: "claude-haiku-5-5", name: "Haiku 5.5", section: "main" },
+  ];
+  const j = {
+    account: { uuid: "synthetic-account", plan: "unchanged-subscription" },
+    model_selector_config: ["chat", "code", "ccd", "ccr", "cowork", "design", "office_agent", "voice", "cc", "future-surface"].map(id => ({
+      id, models: structuredClone(native),
+      context_window_by_model: { "claude-opus-5-5": 1_000_000 },
+      contextWindowByModel: { "claude-sonnet-5-5": 200_000 },
+    })),
+  };
+  const before = structuredClone(j);
+  const extra = [{ model: "gemini-4-carbon", name: "Gemini 4 Carbon", contextWindow: 1_000_000 }];
+  const result = injectPickerModels(j, extra, undefined, () => ["medium", "high"], { codeOnly: true, compatibleCodeSurfaces: ["code", "ccd"] });
+  assert.equal(result.injected, 2);
+  assert.deepEqual(j.account, before.account, "account/plan data is never rewritten");
+  for (const [i, surface] of j.model_selector_config.entries()) {
+    const old = before.model_selector_config[i]!;
+    if (!["code", "ccd"].includes(surface.id)) {
+      assert.equal(JSON.stringify(surface), JSON.stringify(old), `${surface.id} remains byte-for-byte unchanged after JSON encoding`);
+      continue;
+    }
+    assert.equal(JSON.stringify(surface.models.slice(0, native.length)), JSON.stringify(old.models));
+    assert.equal(surface.context_window_by_model["claude-opus-5-5"], old.context_window_by_model["claude-opus-5-5"]);
+    assert.equal(surface.contextWindowByModel["claude-sonnet-5-5"], old.contextWindowByModel["claude-sonnet-5-5"]);
+    const added = surface.models.at(-1)!;
+    assert.equal(added.id, "gemini-4-carbon");
+    assert.equal(added.name, "Gemini 4 Carbon");
+    assert.equal("is_default" in added, false);
+    assert.deepEqual(added.thinking, { effort_options: [{ id: "medium" }, { id: "high", recommended: true }] });
+  }
+  const first = JSON.stringify(j);
+  assert.equal(injectPickerModels(j, extra, undefined, undefined, { codeOnly: true, compatibleCodeSurfaces: ["code", "ccd"] }).injected, 0);
+  assert.equal(JSON.stringify(j), first, "repeated injection is a full no-op");
+});
+
+test("personal menu additions require explicit per-surface selection compatibility", () => {
+  const json = { model_selector_config: ["code", "ccd", "future-code"].map(id => ({
+    id, models: [{ id: "claude-opus-5-5", name: "Native Opus" }], metadata: { preserve: true },
+  })) };
+  const before = structuredClone(json);
+  const extra = [{ model: "gemini-fixture", name: "Fixture Gemini" }];
+  assert.equal(injectPickerModels(json, extra, undefined, undefined, { codeOnly: true }).injected, 0);
+  assert.deepEqual(json, before, "a missing capability result is a complete native no-op");
+  assert.equal(injectPickerModels(json, extra, undefined, undefined, { codeOnly: true, compatibleCodeSurfaces: [] }).injected, 0);
+  const result = injectPickerModels(json, extra, undefined, undefined, { codeOnly: true, compatibleCodeSurfaces: ["ccd"] });
+  assert.equal(result.injected, 1);
+  assert.deepEqual(json.model_selector_config[0], before.model_selector_config[0]);
+  assert.deepEqual(json.model_selector_config[2], before.model_selector_config[2]);
+  assert.equal(json.model_selector_config[1]!.models.at(-1)!.id, "gemini-fixture");
+});
+
+test("personal additions reserve bounded menu capacity and preserve every native row", () => {
+  const json = { model_selector_config: [{ id: "code", models: Array.from({ length: DESKTOP_PICKER_ROW_LIMIT - 2 }, (_, i) => ({ id: `claude-native-${i}`, name: `Native ${i}` })) }] };
+  const native = structuredClone(json.model_selector_config[0]!.models);
+  const extras = Array.from({ length: DESKTOP_PICKER_ROW_LIMIT * 2 }, (_, i) => ({ model: `gemini-fixture-${i}`, name: `Fixture ${i}` }));
+  const options = { codeOnly: true, compatibleCodeSurfaces: ["code"] as const };
+  assert.equal(injectPickerModels(json, extras, undefined, undefined, options).injected, 2);
+  assert.equal(json.model_selector_config[0]!.models.length, DESKTOP_PICKER_ROW_LIMIT);
+  assert.deepEqual(json.model_selector_config[0]!.models.slice(0, native.length), native);
+  assert.deepEqual(json.model_selector_config[0]!.models.slice(native.length).map(model => model.id), ["gemini-fixture-0", "gemini-fixture-1"]);
+  const before = JSON.stringify(json);
+  assert.equal(injectPickerModels(json, extras, undefined, undefined, options).injected, 0);
+  assert.equal(JSON.stringify(json), before);
+});
+
+test("a repeated/native extra id cannot overwrite native entry or either context-window map", () => {
+  const j = {
+    model_selector_config: [{ id: "code", models: [{ id: "claude-opus-5-5", name: "Native Opus", context_window: 1_000_000 }],
+      context_window_by_model: { "claude-opus-5-5": 1_000_000 } as Record<string, number>,
+      contextWindowByModel: { "claude-opus-5-5": 1_000_000 } as Record<string, number> }],
+  };
+  const before = JSON.stringify(j);
+  assert.equal(injectPickerModels(j, [{ model: "claude-opus-5-5", name: "Renamed", contextWindow: 1 }], 2).injected, 0);
+  assert.equal(JSON.stringify(j), before);
+  injectPickerModels(j, [{ model: "gemini-4-carbon", name: "First", contextWindow: 1_000_000 },
+    { model: "gemini-4-carbon", name: "Duplicate", contextWindow: 2 }]);
+  for (const key of ["context_window_by_model", "contextWindowByModel"] as const) {
+    assert.equal(j.model_selector_config[0]![key]["gemini-4-carbon"], 1_000_000, "duplicate metadata follows the first actual entry");
+  }
+});
+
+const personalPickerConfig = (): Config => ({
+  ...DEFAULTS,
+  security: { mode: "personal", approvedOrigins: ["https://api.anthropic.com", "https://generativelanguage.googleapis.com"] },
+  providers: { google: { type: "google", auth: "api-key", apiKey: "synthetic-google-key", models: [{ id: "gemini-4-carbon", contextWindow: 1_000_000 }] } },
+  routes: {}, direct: [], aliases: {},
+  cli: { ...DEFAULTS.cli, extraModels: [{ model: "gemini-4-carbon", name: "Gemini 4 Carbon" }] },
+});
+
+test("personal picker accepts an approved uniquely declared Google API model and its explicit provider spelling", () => {
+  const cfg = personalPickerConfig();
+  assert.equal(personalPickerModelProblem(cfg, "gemini-4-carbon"), null);
+  assert.equal(personalPickerModelProblem(cfg, "google:gemini-4-carbon@high"), null);
+  assert.deepEqual(chatPickerModels(cfg), [{ model: "gemini-4-carbon", name: "Gemini 4 Carbon", contextWindow: 1_000_000 }]);
+});
+
+test("revocation removes the personal extra immediately without touching the configured selection", () => {
+  const cfg = personalPickerConfig();
+  cfg.security!.approvedOrigins = ["https://api.anthropic.com"];
+  assert.match(personalPickerModelProblem(cfg, "gemini-4-carbon")!, /not approved/);
+  assert.deepEqual(chatPickerModels(cfg), []);
+  assert.equal(cfg.cli.extraModels.length, 1, "selection can return after explicit reapproval");
+  cfg.security!.approvedOrigins.push("https://generativelanguage.googleapis.com");
+  assert.equal(chatPickerModels(cfg).length, 1);
+});
+
+test("personal picker refuses missing, ambiguous, ingress-only, native-alias and fully paused targets", () => {
+  const cfg = personalPickerConfig();
+  assert.match(personalPickerModelProblem(cfg, "missing-model")!, /no unique routable/);
+  cfg.providers.second = { type: "google", auth: "api-key", apiKey: "other-synthetic-key", models: [{ id: "gemini-4-carbon" }] };
+  assert.match(personalPickerModelProblem(cfg, "gemini-4-carbon")!, /no unique routable/);
+  assert.equal(personalPickerModelProblem(cfg, "google:gemini-4-carbon"), null, "explicit ownership resolves the ambiguity");
+  cfg.providers.ingress = { type: "anthropic", auth: "claude-code", accountPool: false, models: [{ id: "ingress-only-model" }] };
+  assert.match(personalPickerModelProblem(cfg, "ingress:ingress-only-model")!, /no unique routable/);
+  cfg.routes["claude-opus-5-5"] = { provider: "google", model: "gemini-4-carbon" };
+  assert.match(personalPickerModelProblem(cfg, "claude-opus-5-5")!, /Native Claude/);
+  cfg.providers.google = { type: "google", auth: "api-key", apiKey: "synthetic", models: [{ id: "gemini-4-carbon" }],
+    credentials: [{ id: "paused", headers: { "x-goog-api-key": "synthetic-paused-key" }, paused: true }] };
+  assert.match(personalPickerModelProblem(cfg, "google:gemini-4-carbon")!, /paused/);
+});
+
+test("personal picker checks the actual per-model endpoint and never approves plain HTTP", () => {
+  const cfg = personalPickerConfig();
+  const google = cfg.providers.google!;
+  google.models = [{ id: "gemini-4-carbon", url: "https://unapproved.example.invalid/v1beta" }];
+  assert.match(personalPickerModelProblem(cfg, "gemini-4-carbon")!, /not approved/);
+  google.models = [{ id: "gemini-4-carbon", url: "http://generativelanguage.googleapis.com" }];
+  assert.match(personalPickerModelProblem(cfg, "gemini-4-carbon")!, /not approved/);
+});
+
+test("generic picker configuration retains the previous filtering behavior", () => {
+  const cfg = personalPickerConfig();
+  delete cfg.security;
+  cfg.cli.extraModels = [{ model: "missing-model", name: "Custom" }];
+  assert.equal(personalPickerModelProblem(cfg, "missing-model"), null);
+  assert.deepEqual(chatPickerModels(cfg), cfg.cli.extraModels);
 });

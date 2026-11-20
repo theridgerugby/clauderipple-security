@@ -1,31 +1,49 @@
-// The real App at its own boundaries: a fake WebSocket (what actually goes out), the browser storage
+// The real App at its own boundaries: a fake relay socket using the production E2EE handshake,
+// the browser storage
 // it writes to (including the writes it refuses), and the public methods its buttons call. Nothing
 // here re-implements the app's decisions, and nothing reaches into its internals.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createSend, outboxKey, tokenFingerprint, writeOutbox } from "../web/outbox.ts";
+import nacl from "tweetnacl";
+import { createSend, outboxKey, writeOutbox } from "../web/outbox.ts";
+import { hostAccept, toB64u } from "../src/e2ee.ts";
+import type { Channel } from "../src/e2ee.ts";
 import type { OutboxEntry } from "../web/outbox.ts";
 import type { QuestionDraft } from "../web/question-answers.ts";
 import { ORIGIN, Storage, TOKEN, install } from "./fake-dom.ts";
 import type { Element } from "./fake-dom.ts";
 
-/** The one socket the app opens; `frames` are the JSON text it actually sent. */
+const HOST_KEY = nacl.box.keyPair();
+const PAIRING = { url: ORIGIN, server: "server-fixture-0123456789", hpk: toB64u(HOST_KEY.publicKey) };
+
+/** A fixture host proves the QR's key before it can read phone frames. `frames` are the decrypted
+ * application messages. These App/state tests exercise crypto but do not claim real relay auth. */
 class Socket {
   static latest: Socket | null = null;
   static respond: ((op: Record<string, unknown>) => unknown | Promise<unknown>) | null = null;
   readyState = 0;
   frames: string[] = [];
   url: string;
+  binaryType = "arraybuffer";
+  private channel: Channel | null = null;
   onopen: (() => void) | null = null;
   onmessage: ((ev: { data: unknown }) => void) | null = null;
   onclose: (() => void) | null = null;
   onerror: (() => void) | null = null;
   constructor(url: string) { this.url = url; Socket.latest = this; }
-  send(data: string): void {
-    this.frames.push(data);
+  send(data: string | Uint8Array): void {
+    if (typeof data === "string") {
+      const accepted = hostAccept(nacl, HOST_KEY, data);
+      this.channel = accepted.channel;
+      this.onmessage?.({ data: accepted.text });
+      return;
+    }
+    assert.ok(this.channel, "phone application frames follow the host-authenticated handshake");
+    const plain = this.channel.open(data);
+    this.frames.push(plain);
     // Answer the host's request/response calls the app makes on connect, so their timers are cleared
     // and the test process is not held open by them (only the model list has a known answer here).
-    const msg = JSON.parse(data) as { t?: string; reqId?: string; op?: Record<string, unknown> };
+    const msg = JSON.parse(plain) as { t?: string; reqId?: string; op?: Record<string, unknown> };
     if ((msg.t === "req" || msg.t === "decide") && msg.reqId) {
       const reqId = msg.reqId;
       const op = msg.t === "decide" ? { ...msg, op: "decide" } : msg.op ?? {};
@@ -35,15 +53,20 @@ class Socket {
       );
     }
   }
-  open(): void { this.readyState = 1; this.onopen?.(); }
-  deliver(msg: unknown): void { this.onmessage?.({ data: JSON.stringify(msg) }); }
+  open(): void { this.readyState = 1; this.onopen?.(); this.onmessage?.({ data: '{"relay":"open"}' }); }
+  deliver(msg: unknown): void {
+    assert.ok(this.channel);
+    this.onmessage?.({ data: this.channel.seal(JSON.stringify(msg)).slice().buffer });
+  }
   close(): void { this.readyState = 3; this.onclose?.(); }
 }
 
 /** The socket the app opens, wired into the shared fake browser. */
 function installSocket(storage: Storage): ReturnType<typeof install> {
   const browser = install(storage);
+  Socket.latest = null;
   Object.defineProperty(globalThis, "WebSocket", { value: Socket, configurable: true, writable: true });
+  Object.defineProperty(globalThis, "nacl", { value: nacl, configurable: true, writable: true });
   return browser;
 }
 
@@ -75,6 +98,18 @@ interface AppBoundary {
 type AppCtor = new (status: unknown) => AppBoundary;
 let AppClass: AppCtor | null = null;
 
+async function appClass(storage: Storage): Promise<AppCtor> {
+  if (AppClass === null) {
+    const token = storage.getItem("rr.token");
+    if (token !== null) storage.setItem("rr.token", JSON.stringify(""));
+    const specifier = "../web/app.ts";
+    const module: { App: AppCtor } = await import(specifier);
+    AppClass = module.App;
+    if (token !== null) storage.setItem("rr.token", token);
+  }
+  return AppClass;
+}
+
 interface Running {
   app: AppBoundary;
   socket: Socket;
@@ -91,23 +126,17 @@ interface Running {
 async function launch(storage: Storage, entries: OutboxEntry[] = []): Promise<Running> {
   const elements = installSocket(storage);
   Socket.respond = null;
-  const key = outboxKey({ kind: "direct", origin: ORIGIN, fingerprint: await tokenFingerprint(TOKEN) });
+  const key = outboxKey({ kind: "relay", relay: ORIGIN, server: PAIRING.server, key: PAIRING.hpk });
   if (entries.length) writeOutbox(storage, key, entries);
   storage.setItem("rr.token", JSON.stringify(TOKEN));
-  if (AppClass === null) {
-    // app.ts boots an App of its own as a side effect of being imported. Import it while the stored
-    // token is blank, so that one shows the pairing screen and never opens a socket; then pair.
-    storage.setItem("rr.token", JSON.stringify(""));
-    const specifier = "../web/app.ts";
-    const module: { App: AppCtor } = await import(specifier);
-    AppClass = module.App;
-    storage.setItem("rr.token", JSON.stringify(TOKEN));
-  }
-  const app = new AppClass({ state: "connecting", attempt: 0, nextAt: null, lastRx: null, downSince: null });
+  storage.setItem("rr.relay", JSON.stringify(PAIRING));
+  const Ctor = await appClass(storage);
+  const app = new Ctor({ state: "connecting", attempt: 0, nextAt: null, lastRx: null, downSince: null });
   app.ui.models = [{ provider: "test", label: "Test", usable: true, models: [{ model: "m", name: "M", provider: "test", efforts: ["high"], usable: true }] }];
   await app.start();
   const socket = Socket.latest;
   assert.ok(socket, "the app opened its socket");
+  assert.equal(socket.url, `wss://phone.example/ws/client?server=${PAIRING.server}`);
   socket.open();
   socket.deliver({ t: "ready", host: { name: "Mac", version: "t", routerOk: true }, sessions: [] });
   return { app, socket, storage, sheet: elements.sheet, body: elements.body, main: elements.main, list: elements.list, fire: elements.fire, key };
@@ -122,6 +151,53 @@ const entry = (over: Partial<OutboxEntry> = {}): OutboxEntry => ({
   clientMsgId: "a", text: "A 지시", at: 1_700_000_000_000, state: "pending", session: "s1", ...over,
 });
 const twoWaiting = (): OutboxEntry[] => [entry({ clientMsgId: "a" }), entry({ clientMsgId: "b", text: "B 지시", error: "no such session" })];
+
+test("legacy/direct, HTTP, and mismatched-origin pairings open no socket and preserve old queued messages", async () => {
+  for (const pairing of [null, { ...PAIRING, url: "http://127.0.0.1:8797" }, { ...PAIRING, url: "https://other.example" }, { ...PAIRING, hpk: "invalid" }]) {
+    const storage = new Storage();
+    installSocket(storage);
+    storage.setItem("rr.token", JSON.stringify(TOKEN));
+    if (pairing) storage.setItem("rr.relay", JSON.stringify(pairing));
+    const oldKey = "rr.outbox.direct-old-computer";
+    const queued = JSON.stringify([entry()]);
+    storage.setItem(oldKey, queued);
+    const Ctor = await appClass(storage);
+    const app = new Ctor({ state: "connecting", attempt: 0, nextAt: null, lastRx: null, downSince: null });
+    await app.start();
+    assert.equal(Socket.latest, null, "no transport sees the old phone capability");
+    assert.equal(app.link, null);
+    assert.equal(storage.getItem(oldKey), queued);
+    assert.equal(storage.getItem("rr.token"), JSON.stringify(TOKEN));
+  }
+});
+
+test("an old direct pairing fragment is scrubbed without persisting or sending its capability", async () => {
+  const storage = new Storage();
+  installSocket(storage);
+  const Ctor = await appClass(storage);
+  const globals = globalThis as unknown as { location: { hash: string }; history: { replaceState: (state: unknown, title: string, url: string) => void } };
+  globals.location.hash = `#pair=${TOKEN}`;
+  let cleanUrl = "";
+  globals.history.replaceState = (_state, _title, url) => { cleanUrl = url; };
+  const app = new Ctor({ state: "connecting", attempt: 0, nextAt: null, lastRx: null, downSince: null });
+  await app.start();
+  assert.equal(cleanUrl, "/");
+  assert.equal(storage.getItem("rr.token"), null);
+  assert.equal(Socket.latest, null);
+});
+
+test("a complete relay QR on an HTTP page is refused before storage or socket creation", async () => {
+  const storage = new Storage();
+  installSocket(storage);
+  const Ctor = await appClass(storage);
+  const globals = globalThis as unknown as { location: { hash: string; origin: string; protocol: string } };
+  Object.assign(globals.location, { origin: "http://127.0.0.1:8797", protocol: "http:", hash: `#pair=${TOKEN}&server=${PAIRING.server}&hpk=${PAIRING.hpk}` });
+  const app = new Ctor({ state: "connecting", attempt: 0, nextAt: null, lastRx: null, downSince: null });
+  await app.start();
+  assert.equal(storage.getItem("rr.token"), null);
+  assert.equal(storage.getItem("rr.relay"), null);
+  assert.equal(Socket.latest, null);
+});
 
 test("question drafts are isolated by session and epoch even when request IDs repeat", async () => {
   const running = await launch(new Storage());

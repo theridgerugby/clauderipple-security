@@ -7,6 +7,8 @@ const { contextBridge, ipcRenderer } = require("electron") as typeof import("ele
 
 contextBridge.exposeInMainWorld("rippleApp", {
   platform: process.platform,
+  adminRequest: (request: import("./admin-ipc").AdminIpcRequest): Promise<import("./admin-ipc").AdminIpcResponse> =>
+    ipcRenderer.invoke("ripple-app:admin-request", request),
   state: (): Promise<unknown> => ipcRenderer.invoke("ripple-app:state"),
   onState: (callback: (state: unknown) => void): void => {
     ipcRenderer.on("ripple-app:state", (_event, state: unknown) => callback(state));
